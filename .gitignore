@@ -1,0 +1,14 @@
+# Planning scratch (wayfinder map, research assets) — local working record
+.scratch/
+
+# Agent-managed linked worktrees and session state
+.claude/
+
+# Compiled binary
+/ben
+
+# Release artifacts written by `make dist`
+/bin/
+
+# Coverage profile written by `make cover`
+/coverage.out

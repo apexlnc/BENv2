@@ -1,0 +1,175 @@
+# A sample systemd unit for BEN. Copy it, review every EDIT marker, install to
+# /etc/systemd/system/ben.service.
+#
+# SPEC §11: single static binary, systemd (or equivalent) as the supervisor.
+# §10.3: the supervisor owns log sinks and rotation — BEN writes slog JSON to
+# stdout and nothing else, so journald is the sink and `journalctl -u ben` is
+# the reader.
+#
+# Two settings below are load-bearing rather than conventional. They are
+# KillMode and TimeoutStopSec, and both exist because of how BEN stops.
+
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE RUNNING IT UNATTENDED (SPEC §10.1, normative)
+#
+# A daemon that dispatches with no human present MUST be in one of two modes,
+# **by deliberate choice**. §10.1 says a deployment MUST NOT arrive in the
+# weaker one by default or by omission — so this unit states which one it is
+# rather than leaving you to infer it.
+#
+# As written, this unit is **risk-accepted mode**. It satisfies two of protected
+# mode's three requirements and not the third:
+#
+#   1. Dedicated OS account — SATISFIED below (User=ben, and not root). Its
+#      $HOME MUST hold no credentials beyond this daemon's own. That part is
+#      yours to check, not the unit's to assert.
+#
+#   2. The run cannot reach the daemon — **NOT SATISFIED.** The agent inherits
+#      this service's process identity (§6.7), so it runs as `ben`, and `ben` is
+#      what reads /etc/ben/env. A run can therefore read the tracker credential
+#      and inspect this process. §10.1 endorses no mechanism for fixing that and
+#      requires a deployment to verify its own — a separate run identity, a
+#      whole-process sandbox, or a container. The adapters' per-command
+#      sandboxing does not establish it: a boundary around the agent's
+#      subprocesses is not a boundary around the agent.
+#
+#   3. The forge enforces review — NOT A UNIT SETTING, and load-bearing
+#      precisely because 2 is relaxed. Require review on the default branch,
+#      bind the approval to the commit that merges, and make the agent's publish
+#      identity unable to complete the merge even once every requirement is met.
+#
+# What accepting 2 means, in §10.1's own terms: **the agent is trusted with the
+# daemon's tracker authority.** The `ben-queue` label becomes routing rather
+# than a security boundary, because a subverted run can apply it itself, and PR
+# review is then the only remaining gate (§3.4).
+#
+# The acknowledgement is enforced rather than requested: the ExecStartPre in
+# [Service] below refuses to start this unit until you remove it. A comment
+# asking you to read something is exactly the omission §10.1 forbids.
+# ---------------------------------------------------------------------------
+
+[Unit]
+Description=BEN — works GitHub Issues with coding agents
+Documentation=https://github.com/srhg-ai-7cef3f93/ben
+# The agents clone and push; without the network up this only fails later and
+# less clearly.
+After=network-online.target
+Wants=network-online.target
+
+# BEN refuses to start on a bad configuration or an unready adapter (§5.7), and
+# those refusals do not fix themselves. Without a rate limit a typo in
+# WORKFLOW.md becomes a restart loop that fills the journal.
+#
+# These two belong in [Unit], not [Service]. systemd moved them in v229; left in
+# [Service] they are logged as an unknown key and ignored, which is a rate limit
+# that silently is not one.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# EDIT: the user BEN runs as, and where its WORKFLOW.md lives.
+User=ben
+Group=ben
+WorkingDirectory=/srv/ben
+
+# EDIT: **remove this line** only once the unattended readiness gate named in
+# README.md is complete, you have read the §10.1 block at the top, and you hold
+# requirements 1 and 3. Until then the unit refuses to start.
+#
+# B10 startup recovery was the other prerequisite and has landed, so a SIGKILL's
+# leftovers are reconstructed rather than stranded (see TimeoutStopSec). What is
+# left is the forge control, which is requirement 3 itself: in risk-accepted mode
+# PR review is the only remaining gate, and it is not yet a control. Branch
+# protection is applied and read back; what is missing is that BEN publishes as
+# whoever runs the daemon, so the identity that pushes is the identity that
+# approves. Requirement 3 is unmet until those differ.
+#
+# This is the "deliberate choice" §10.1 requires, made unskippable. Every other
+# EDIT here fails loudly when it is wrong — a missing binary, a bad path, an
+# unreadable credential. Running unattended without the run/daemon boundary
+# fails *nowhere*: it works perfectly, and is a different security posture from
+# the one an operator who never read this file would assume they had.
+ExecStartPre=/bin/false
+
+# EDIT: the path to the binary and to the workflow.
+ExecStart=/usr/local/bin/ben run /srv/ben/WORKFLOW.md
+
+# EDIT: credentials. An EnvironmentFile rather than Environment= lines: the
+# latter are readable by any local user through `systemctl show ben`, and the
+# whole point of §5.5's `$VAR` indirection is that the secret is not in the
+# file that names it. 0600, owned by the service user.
+EnvironmentFile=/etc/ben/env
+
+# **KillMode=mixed, and this is the one setting not to change.**
+#
+# systemd's default is control-group: SIGTERM to *every* process in the unit's
+# cgroup at once — which is BEN and every agent it has launched, simultaneously.
+# That is precisely what §9.8's shutdown exists to avoid. BEN interrupts each
+# run itself, through the §7.5 signal ladder, and waits for a confirmed
+# termination before it releases a claim or reuses a worktree; a signal that
+# reaches the agents behind its back turns an orderly drain into a race with it.
+#
+# mixed sends SIGTERM to the main process only and leaves the rest to BEN, then
+# SIGKILLs whatever is still in the cgroup once TimeoutStopSec expires. That is
+# the correct division: BEN owns the graceful path, systemd owns the deadline.
+KillMode=mixed
+
+# **TimeoutStopSec is the only bound on BEN's drain, deliberately.**
+#
+# §9.8 waits for a confirmed termination wherever a run handle exists, and BEN
+# invents no deadline for that: exiting on one would mean leaving while a
+# process may still hold a worktree. So this number is the bound, and it should
+# exceed the longest interrupt an agent of yours plausibly takes to wind down —
+# not the longest a run takes, since the run is being interrupted rather than
+# awaited. Ten minutes is a starting point, not a measurement.
+#
+# When it expires, the SIGKILL leaves claims and `ben:*` labels standing for
+# §9.10 recovery to reconstruct on the next start. That is the specified
+# outcome, not corruption, and B10 has landed, so it is now what actually
+# happens rather than what is planned. The ExecStartPre gate above stays for the
+# other reason README.md names — the forge control — not for this one.
+TimeoutStopSec=600
+
+Restart=on-failure
+RestartSec=10s
+
+# The §10.3 state dir. BEN resolves $XDG_STATE_HOME/ben/<workflow key>, and a
+# system service inherits no XDG variables — so it is named here rather than
+# left to the ~/.local/state fallback, which for a service account is a home
+# directory that may not exist. StateDirectory has systemd create and own it.
+StateDirectory=ben
+Environment=XDG_STATE_HOME=/var/lib
+
+# Hardening. Deliberately moderate: BEN's whole job is to run *other people's*
+# code — agents, and the §6.5 hook scripts an operator writes — so a lockdown
+# tight enough to be interesting is also tight enough to break a hook, and it
+# will break it at the least convenient moment. These are the ones that do not.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+# **ProtectHome is deliberately not set, and this is the reason.**
+#
+# Coding agents keep their resumable session state under the service user's
+# home: Claude Code writes transcripts to `~/.claude/projects/<project>/<session
+# id>.jsonl` continuously as it works, and codex keeps thread state of its own.
+# A read-only home does not fail loudly — the agent runs, the run completes, and
+# the *continuation token* it minted then resumes nothing. §9.6's continuation
+# track is exactly that resume, so `ProtectHome=read-only` here would have
+# quietly disabled a documented half of BEN's retry behaviour.
+#
+# To reinstate it, relocate the agent's state first rather than only forbidding
+# the default. For claude-code that is CLAUDE_CONFIG_DIR; check your adapter's
+# own variable before assuming it is the same one:
+#
+#     ProtectHome=read-only
+#     Environment=CLAUDE_CONFIG_DIR=/var/lib/ben/agent
+# ReadWritePaths must include the workspace root from WORKFLOW.md, since
+# ProtectSystem=full makes /usr, /boot and /efi read-only and the agents write
+# worktrees. EDIT if your workspace root is elsewhere.
+ReadWritePaths=/srv/ben
+
+[Install]
+WantedBy=multi-user.target

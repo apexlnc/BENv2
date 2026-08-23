@@ -1,0 +1,160 @@
+name: Publish daemon image
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-daemon-main
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  ECR_ROLE_ARN: arn:aws:iam::844479804508:role/ben-w
+  IMAGE_REPOSITORY: 844479804508.dkr.ecr.us-east-2.amazonaws.com/ben/daemon
+
+jobs:
+  publish:
+    name: Build, smoke, and publish
+    timeout-minutes: 60
+    runs-on:
+      group: common-medium
+      labels: ai-runner-common-medium-dind
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Pin third-party actions to reviewed commits. The trailing version is
+      # for dependency tooling and human review; it is not what Actions runs.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ env.ECR_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@19d944daaa35f0fa1d3f7f8af1d3f2e5de25c5b7 # v2.1.4
+
+      - name: Get Docker Hub credentials
+        uses: aws-actions/aws-secretsmanager-get-secrets@a9a7eb4e2f2871d30dc5b892576fde60a2ecc802 # v2
+        with:
+          secret-ids: |
+            DOCKER_USERNAME, arn:aws:secretsmanager:us-east-2:844479804508:secret:codeservices-cicd/nonprod/docker/username-h7y6iF
+            DOCKER_TOKEN, arn:aws:secretsmanager:us-east-2:844479804508:secret:codeservices-cicd/nonprod/docker/password-SRKYKy
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build the smoke image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          tags: ben:smoke
+          build-args: |
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha,scope=ben-daemon
+          cache-to: type=gha,scope=ben-daemon,mode=max
+
+      - name: Smoke the image
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' ben:smoke)" = "$SOURCE_REVISION"
+          test "$(docker image inspect --format '{{ .Config.User }}' ben:smoke)" = "10001:10001"
+          test "$(docker image inspect --format '{{ json .Config.Entrypoint }}' ben:smoke)" = '["/usr/bin/tini","--","/usr/local/bin/ben"]'
+          docker run --rm ben:smoke --help
+
+          # BEN's coding agent runs this repository's make check in the image.
+          # Its process-discipline suite needs the exact ps query below to tell
+          # a live process from a zombie (#186).
+          docker run --rm --entrypoint /bin/sh ben:smoke -eu -c '
+            ps -o stat= -p 1 | grep -Eq "[^[:space:]]"
+          '
+
+          # A short-lived grandchild whose parent exits is adopted by PID 1.
+          # Once it exits, no zombie may remain for BEN's liveness probes to
+          # conservatively read as a live process (#184).
+          docker run --rm --entrypoint /usr/bin/tini ben:smoke -- /bin/sh -eu -c '
+            /bin/sh -c "sleep 0.1 &"
+            sleep 1
+            for status in /proc/[0-9]*/status; do
+              if grep -Eq "^State:[[:space:]]+Z" "$status"; then
+                echo "unreaped descendant at $status" >&2
+                exit 1
+              fi
+            done
+          '
+
+          # PID 1 must forward the supervisor signal to BEN's position in the
+          # process tree. A trapped shell stands in for BEN and makes delivery
+          # observable without credentials or a live workflow.
+          cid="$(docker run --detach --entrypoint /usr/bin/tini ben:smoke -- /bin/sh -c \
+            'trap "exit 42" TERM; echo ready; while :; do sleep 1; done')"
+          cleanup() { docker rm --force "$cid" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          ready=false
+          for _ in {1..50}; do
+            if docker logs "$cid" 2>&1 | grep -qx ready; then
+              ready=true
+              break
+            fi
+            sleep 0.1
+          done
+          test "$ready" = true
+          docker kill --signal TERM "$cid" >/dev/null
+          test "$(docker wait "$cid")" = 42
+          docker rm "$cid" >/dev/null
+          cid=""
+          trap - EXIT
+
+      - name: Publish the multi-architecture image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ github.sha }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha,scope=ben-daemon
+          cache-to: type=gha,scope=ben-daemon,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Summarize publication
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          {
+            echo "### BEN daemon image"
+            echo
+            echo "- Image: \`$IMAGE_REPOSITORY:$SOURCE_REVISION\`"
+            echo "- Digest: \`$DIGEST\`"
+            echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
+          } >> "$GITHUB_STEP_SUMMARY"

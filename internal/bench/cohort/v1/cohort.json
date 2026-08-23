@@ -1,0 +1,109 @@
+{
+  "version": "v1",
+  "source_repo": "srhg-ai-7cef3f93/ben",
+  "notes": "Historical BEN tickets with merged, known-good solutions. Each base commit is the first parent of the commit that solved it, so the tree a cell starts from is the tree the historical author started from. A canary repository is a mirror of source_repo whose default branch is pinned at the case's base_commit; every check runs by `bash -c` in the root of the published head and must exit 0.",
+  "cases": [
+    {
+      "id": "ben-159-regression-split",
+      "title": "Redistribute regression_test.go into the topic files that already exist",
+      "tier": "easy",
+      "task_file": "ben-159-regression-split.task.md",
+      "task_sha256": "a5c33f10c2c4b90e22dc0ab1a6e8449e0b68d84b7d8c88372f4f191e87b0c72e",
+      "definition_sha256": "bff64208bb7524c7792cb0db43e2ded6eb5d486fbc289765cffe0f156132646d",
+      "base_commit": "bd77c4ab8487df3c7a60bc7e9f5105276532a4b5",
+      "known_good": {
+        "commit": "fb92813c118f177a8a1797ad26a4db11bd9093da",
+        "pr": 165,
+        "summary": "Deleted internal/orchestrator/regression_test.go and redistributed its 53 tests across topic files, four of them new, moving bodies unchanged. Measured: the sorted set of Test names in internal/orchestrator is 337 names at the base and the same 337 afterwards."
+      },
+      "checks": [
+        {
+          "id": "landfill-gone",
+          "run": "[ ! -e internal/orchestrator/regression_test.go ]",
+          "why": "acceptance bullet 1: the pile is deleted, not shrunk and not left as a stub",
+          "fails_at_base": true
+        },
+        {
+          "id": "test-set-preserved",
+          "run": "names() { for f in $(git ls-tree -r --name-only \"$1\" internal/orchestrator); do git show \"$1:$f\" | grep -o \"^func Test[A-Za-z0-9_]*\"; done | sort; }; diff <(names bd77c4ab8487df3c7a60bc7e9f5105276532a4b5) <(grep -ho \"^func Test[A-Za-z0-9_]*\" internal/orchestrator/*_test.go | sort)",
+          "why": "acceptance bullet 2: the sorted set of Test names is byte-identical to the base's, so the redistribution dropped none. A count would pass with one test lost and another added, which is why this diffs the names",
+          "fails_at_base": false
+        },
+        {
+          "id": "repo-check",
+          "run": "make check",
+          "why": "the ticket's last bullet, and this repository's definition of green",
+          "fails_at_base": false
+        }
+      ]
+    },
+    {
+      "id": "ben-134-notfound-classification",
+      "title": "Tracker adapter: only Get and the content read classify a 404 as ErrIssueNotFound",
+      "tier": "medium",
+      "task_file": "ben-134-notfound-classification.task.md",
+      "task_sha256": "52adf089383b28687e38f2d856e4ceb4ed24758cd3e20d5edef84e2d6518f69d",
+      "definition_sha256": "4426e433cccd7350c5d45073c4c8d03479289d49025da7614948e34fc2e63756",
+      "base_commit": "f3d885858147e10e47cce2c100fb7ee14b9b6bc6",
+      "known_good": {
+        "commit": "02d90c0ead284785d72d7a5f6f6b085c1882df44",
+        "pr": 140,
+        "summary": "Decided reads classify absence and writes do not, documented the sentinel on exactly those methods, and mapped 404 there in the GitHub adapter. Measured against the base: mentions of ErrIssueNotFound go 3 to 6 in internal/core/core.go and 1 to 5 in the adapter — while internal/fake's go 5 to 4, because the fake had been classifying where the adapter does not. That is why no check here counts the fake: the known-good direction there is down."
+      },
+      "checks": [
+        {
+          "id": "sentinel-documented-wider",
+          "run": "base=$(git show f3d885858147e10e47cce2c100fb7ee14b9b6bc6:internal/core/core.go | grep -c ErrIssueNotFound); [ \"$(grep -c ErrIssueNotFound internal/core/core.go)\" -gt \"$base\" ]",
+          "why": "acceptance bullet 2: core.TrackerAdapter names the sentinel on more methods than the two that carried it at the base. Compared against the base rather than against a number, because the base is not zero",
+          "fails_at_base": true
+        },
+        {
+          "id": "adapter-maps-wider",
+          "run": "base=$(git show f3d885858147e10e47cce2c100fb7ee14b9b6bc6:internal/tracker/github/adapter.go | grep -c ErrIssueNotFound); [ \"$(grep -c ErrIssueNotFound internal/tracker/github/adapter.go)\" -gt \"$base\" ]",
+          "why": "acceptance bullet 3: the adapter maps 404 to the sentinel somewhere it did not at the base",
+          "fails_at_base": true
+        },
+        {
+          "id": "repo-check",
+          "run": "make check",
+          "why": "the ticket's last bullet, and where bullet 4 has to land: 'a test asserts the classification and its absence' is a test in the tree, so make check is what runs it",
+          "fails_at_base": false
+        }
+      ]
+    },
+    {
+      "id": "ben-58-request-budget",
+      "title": "Bound and report the per-tick API request budget",
+      "tier": "hard",
+      "task_file": "ben-58-request-budget.task.md",
+      "task_sha256": "633d35de950e122d6c4b4928791e47b34875c0495fe7abd114a9732a33d597ca",
+      "definition_sha256": "0291cb400d5979f148fc5c5d39f7e2f7c6148adcead793a11f58b8cbe83eac89",
+      "base_commit": "92cc85c6a30255cd0c1eaa6fa5f9aa913f12d00b",
+      "known_good": {
+        "commit": "4bcde4f32f721b6d5a8f407218ddaef806c8d8c6",
+        "pr": 115,
+        "summary": "A per-tick budget the transport meters and the adapter enforces at two points, 40 billed requests per tick, opened per tick through core.RequestBudget; and a cache that evicts least-recently-used under an entry and byte bound instead of flushing. Measured against the base: `clear(c.entries)` and `maxCacheEntries = 512` are gone from internal/tracker/github, and adapter.go's mentions of a budget go 2 to 31."
+      },
+      "checks": [
+        {
+          "id": "no-total-flush",
+          "run": "[ -d internal/tracker/github ] && ! grep -rq \"clear(c.entries)\" internal/tracker/github",
+          "why": "acceptance bullet 2: overflow no longer flushes the whole cache. The directory test is not decoration — a grep for something absent from a directory that is also absent would pass while measuring nothing",
+          "fails_at_base": true
+        },
+        {
+          "id": "budget-reported",
+          "run": "base=$(git show 92cc85c6a30255cd0c1eaa6fa5f9aa913f12d00b:internal/tracker/github/adapter.go | grep -ic budget); [ \"$(grep -ic budget internal/tracker/github/adapter.go)\" -gt \"$base\" ]",
+          "why": "acceptance bullet 1: the adapter says more about a request budget than it did at the base — a necessary condition of enforcing and reporting one, and the base already says it twice",
+          "fails_at_base": true
+        },
+        {
+          "id": "repo-check",
+          "run": "make check",
+          "why": "the ticket's last bullet, and this repository's definition of green",
+          "fails_at_base": false
+        }
+      ]
+    }
+  ]
+}

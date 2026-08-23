@@ -1,0 +1,48 @@
+{
+  "filesystem": {
+    "allowRead": [
+      "/home/ben/.local/bin/claude",
+      "/home/ben/.local/share/ben/wf/base.git",
+      "/home/ben/.local/share/ben/wf/issues/issue-7",
+      "/home/ben/.local/share/ben/wf/private/issue-7",
+      "/home/ben/.local/share/claude/versions",
+      "/home/ben/.local/share/claude/versions/2.1.221",
+      "/srv/shared"
+    ],
+    "denyRead": [
+      "/home/ben"
+    ],
+    "allowWrite": [
+      "/home/ben/.local/share/ben/wf/base.git",
+      "/home/ben/.local/share/ben/wf/issues/issue-7",
+      "/home/ben/.local/share/ben/wf/private/issue-7",
+      "/srv/shared"
+    ],
+    "denyWrite": [
+      "/home/ben/.local/share/ben/wf/base.git/config",
+      "/home/ben/.local/share/ben/wf/base.git/hooks",
+      "/home/ben/.local/share/ben/wf/issues/issue-7/.git",
+      "/home/ben/.local/share/ben/wf/private/issue-7/sandbox"
+    ],
+    "allowGitConfig": false,
+    "disabled": false
+  },
+  "network": {
+    "allowedDomains": [
+      "api.anthropic.com",
+      "api.github.com",
+      "github.com",
+      "proxy.internal"
+    ],
+    "deniedDomains": [],
+    "strictAllowlist": true,
+    "allowLocalBinding": false,
+    "allowAllUnixSockets": false,
+    "allowUnixSockets": [],
+    "allowMachLookup": []
+  },
+  "enableWeakerNetworkIsolation": true,
+  "allowAppleEvents": false,
+  "allowPty": false,
+  "enableWeakerNestedSandbox": false
+}

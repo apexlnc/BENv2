@@ -1,0 +1,31 @@
+# Every path has human owners, and no agent is among them directly or through
+# team membership.
+#
+# This file is a security control, not routing convenience (SPEC §10.1
+# requirement 3). BEN's agents publish with a credential holding pull-request
+# write, which is the permission needed to *open* a pull request — and the same
+# permission lets that identity submit an approving review on a pull request it
+# did not open. Such an approval counts toward `required_approving_review_count`,
+# and satisfies `require_last_push_approval` too, because the agent was not the
+# pusher. On a human-authored or second-agent-authored PR, that is a merge with
+# nothing human-reviewed about it.
+#
+# Paired with the branch rule's `require_code_owner_reviews`, this file is what
+# makes the required approval one no agent credential can produce: the agent is
+# neither an owner of any path nor a member of an owner team, so its approval
+# never satisfies the requirement no matter whose pull request it lands on.
+#
+# Two consequences worth knowing before editing:
+#
+#   * The wildcard must stay comprehensive. Code-owner review is only required
+#     for paths that HAVE an owner, so any path this file does not cover is a
+#     path an agent's own approval can carry. Narrowing `*` re-opens the hole
+#     for whatever falls outside it.
+#   * Never add a machine account or an App here or to an owner team. Team
+#     membership is part of this control: every owner must be a principal BEN
+#     cannot authenticate as.
+#
+# GitHub evaluates CODEOWNERS from the *base* branch, so a pull request that
+# edits this file is still gated by the version already on `main`.
+
+*       @yhwang-nydig @srhg-ai-7cef3f93/codeservices

@@ -1,0 +1,21 @@
+# CI runs exactly `make check` — the same target agents and humans run
+# locally, so green means the same thing everywhere (AGENTS.md).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make check
