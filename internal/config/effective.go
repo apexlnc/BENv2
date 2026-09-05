@@ -96,6 +96,11 @@ func EffectiveText(def *WorkflowDefinition) string {
 
 	b.WriteString("workspace:\n")
 	w(1, "root", fmt.Sprint(red.value("workspace.root", cfg.Workspace.Root)), "workspace.root")
+	baseBranch := cfg.Workspace.BaseBranch
+	if baseBranch == "" {
+		baseBranch = "<repository-default>"
+	}
+	w(1, "base_branch", baseBranch, "workspace.base_branch")
 
 	b.WriteString("hooks:\n")
 	w(1, "after_create", renderScript(cfg.Hooks.AfterCreate), "hooks.after_create")
@@ -141,7 +146,144 @@ func EffectiveText(def *WorkflowDefinition) string {
 	w(1, "mode", string(cfg.Deployment.Mode), "deployment.mode")
 	w(1, "accepted_because", orUnset(cfg.Deployment.AcceptedBecause), "deployment.accepted_because")
 
+	// substrate: never redacted either, and for a stronger reason than
+	// deployment's. Every field is a name, a keyword or a number, the one
+	// credential is named indirectly through `credential_sources`, and the base
+	// URL is refused at load if it carries so much as userinfo — so there is
+	// nothing here that could be a secret, and hiding an endpoint would conceal
+	// exactly what an operator needs when the backend is unreachable.
+	b.WriteString("substrate:\n")
+	w(1, "kind", cfg.Substrate.Kind, "substrate.kind")
+	if cfg.Substrate.Remote() {
+		a := cfg.Substrate.Airlock
+		b.WriteString("  airlock:\n")
+		w(2, "base_url", a.BaseURL, "substrate.airlock.base_url")
+		w(2, "profile", a.Profile, "substrate.airlock.profile")
+		w(2, "auth_source", a.AuthSource, "substrate.airlock.auth_source")
+		w(2, "tls_ca_file", orUnset(a.TLSCAFile), "substrate.airlock.tls_ca_file")
+		w(2, "request_timeout_ms", fmt.Sprint(a.RequestTimeoutMS), "substrate.airlock.request_timeout_ms")
+		w(2, "poll_timeout_ms", fmt.Sprint(a.PollTimeoutMS), "substrate.airlock.poll_timeout_ms")
+		w(2, "poll_wait_ms", fmt.Sprint(a.PollWaitMS), "substrate.airlock.poll_wait_ms")
+		w(2, "settle_timeout_ms", fmt.Sprint(a.SettleTimeoutMS), "substrate.airlock.settle_timeout_ms")
+		w(2, "max_retries", fmt.Sprint(a.MaxRetries), "substrate.airlock.max_retries")
+		w(2, "idle_suspend_ms", renderWindow(a.IdleSuspendMS), "substrate.airlock.idle_suspend_ms")
+		w(2, "delete_after_idle_ms", renderWindow(a.DeleteAfterIdleMS), "substrate.airlock.delete_after_idle_ms")
+		w(2, "on_success", a.OnSuccess, "substrate.airlock.on_success")
+		w(2, "on_failure", a.OnFailure, "substrate.airlock.on_failure")
+		w(2, "on_revoked", a.OnRevoked, "substrate.airlock.on_revoked")
+		w(2, "on_shutdown", a.OnShutdown, "substrate.airlock.on_shutdown")
+	}
+
+	// review: never redacted, for substrate's reason — three logins, a label, an
+	// argv, some numbers, and a credential named indirectly. The logins in
+	// particular are the thing an operator most needs to read back: a value that
+	// is close but not the API login makes every author check fail silently, and
+	// this rendering is where that is caught (docs/REVIEW.md).
+	b.WriteString("review:\n")
+	w(1, "enabled", fmt.Sprint(cfg.Review.Enabled), "review.enabled")
+	if cfg.Review.Enabled {
+		r := cfg.Review
+		w(1, "principal", r.Principal, "review.principal")
+		w(1, "tracker_author", r.TrackerAuthor, "review.tracker_author")
+		w(1, "controller", r.Controller, "review.controller")
+		w(1, "allow_shared_tracker_controller", fmt.Sprint(r.AllowSharedTrackerController), "review.allow_shared_tracker_controller")
+		w(1, "auth_source", r.AuthSource, "review.auth_source")
+		w(1, "api_base_url", orUnset(r.APIBaseURL), "review.api_base_url")
+		w(1, "queue_label", r.QueueLabel, "review.queue_label")
+		w(1, "add_human_review_label", fmt.Sprint(r.AddHumanReviewLabel), "review.add_human_review_label")
+		w(1, "round_cap", fmt.Sprint(r.RoundCap), "review.round_cap")
+		if len(r.ReviewerProfiles) == 0 {
+			w(1, "reviewer_argv", renderList(r.ReviewerArgv), "review.reviewer_argv")
+		} else {
+			w(1, "reviewer_default_profile", r.ReviewerDefaultProfile, "review.reviewer_default_profile")
+			b.WriteString("  reviewer_profiles:\n")
+			names := make([]string, 0, len(r.ReviewerProfiles))
+			for name := range r.ReviewerProfiles {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				w(2, name, renderList(r.ReviewerProfiles[name]), "review.reviewer_profiles."+name)
+			}
+		}
+		w(1, "reviewer_env", renderList(r.ReviewerEnv), "review.reviewer_env")
+		w(1, "guidance_file", orUnset(r.GuidanceFile), "review.guidance_file")
+		w(1, "interval_ms", fmt.Sprint(r.IntervalMS), "review.interval_ms")
+		w(1, "timeout_ms", fmt.Sprint(r.TimeoutMS), "review.timeout_ms")
+		w(1, "request_timeout_ms", fmt.Sprint(r.RequestTimeoutMS), "review.request_timeout_ms")
+		w(1, "max_diff_bytes", fmt.Sprint(r.MaxDiffBytes), "review.max_diff_bytes")
+	}
+
 	return b.String()
+}
+
+// reviewJSON is the same view for the machine-readable output. Rendered whether
+// or not the controller is enabled, so a consumer reads one shape either way.
+func reviewJSON(cfg Config) map[string]any {
+	out := map[string]any{"enabled": cfg.Review.Enabled, "controller": nil}
+	if !cfg.Review.Enabled {
+		return out
+	}
+	r := cfg.Review
+	out["controller"] = map[string]any{
+		"principal":                       r.Principal,
+		"tracker_author":                  r.TrackerAuthor,
+		"controller":                      r.Controller,
+		"allow_shared_tracker_controller": r.AllowSharedTrackerController,
+		"auth_source":                     r.AuthSource,
+		"api_base_url":                    r.APIBaseURL,
+		"queue_label":                     r.QueueLabel,
+		"add_human_review_label":          r.AddHumanReviewLabel,
+		"round_cap":                       r.RoundCap,
+		"reviewer_argv":                   r.ReviewerArgv,
+		"reviewer_profiles":               r.ReviewerProfiles,
+		"reviewer_default_profile":        r.ReviewerDefaultProfile,
+		"reviewer_env":                    r.ReviewerEnv,
+		"guidance_file":                   r.GuidanceFile,
+		"interval_ms":                     r.IntervalMS,
+		"timeout_ms":                      r.TimeoutMS,
+		"request_timeout_ms":              r.RequestTimeoutMS,
+		"max_diff_bytes":                  r.MaxDiffBytes,
+	}
+	return out
+}
+
+// renderWindow spells an idle window, and says what zero means rather than
+// printing a number that reads as "immediately".
+func renderWindow(ms int) string {
+	if ms == 0 {
+		return "(profile default)"
+	}
+	return fmt.Sprint(ms)
+}
+
+// substrateJSON is the same view for the machine-readable output. Rendered
+// whether or not the substrate is remote, and with an explicit null for an
+// unconfigured backend, so a consumer reads one shape either way.
+func substrateJSON(cfg Config) map[string]any {
+	out := map[string]any{"kind": cfg.Substrate.Kind, "airlock": nil}
+	if !cfg.Substrate.Remote() {
+		return out
+	}
+	a := cfg.Substrate.Airlock
+	out["airlock"] = map[string]any{
+		"base_url":             a.BaseURL,
+		"profile":              a.Profile,
+		"auth_source":          a.AuthSource,
+		"tls_ca_file":          a.TLSCAFile,
+		"request_timeout_ms":   a.RequestTimeoutMS,
+		"poll_timeout_ms":      a.PollTimeoutMS,
+		"poll_wait_ms":         a.PollWaitMS,
+		"settle_timeout_ms":    a.SettleTimeoutMS,
+		"max_retries":          a.MaxRetries,
+		"idle_suspend_ms":      a.IdleSuspendMS,
+		"delete_after_idle_ms": a.DeleteAfterIdleMS,
+		"on_success":           a.OnSuccess,
+		"on_failure":           a.OnFailure,
+		"on_revoked":           a.OnRevoked,
+		"on_shutdown":          a.OnShutdown,
+	}
+	return out
 }
 
 // EffectiveJSON renders the same view as JSON: redacted config values plus a
@@ -171,8 +313,11 @@ func EffectiveJSON(def *WorkflowDefinition) ([]byte, error) {
 				"active_states":   cfg.Tracker.ActiveStates,
 				"terminal_states": cfg.Tracker.TerminalStates,
 			},
-			"polling":   map[string]any{"interval_ms": cfg.Polling.IntervalMS},
-			"workspace": map[string]any{"root": red.value("workspace.root", cfg.Workspace.Root)},
+			"polling": map[string]any{"interval_ms": cfg.Polling.IntervalMS},
+			"workspace": map[string]any{
+				"root":        red.value("workspace.root", cfg.Workspace.Root),
+				"base_branch": nullableString(cfg.Workspace.BaseBranch),
+			},
 			"hooks": map[string]any{
 				"after_create":  cfg.Hooks.AfterCreate,
 				"before_run":    cfg.Hooks.BeforeRun,
@@ -201,6 +346,9 @@ func EffectiveJSON(def *WorkflowDefinition) ([]byte, error) {
 				"mode":             string(cfg.Deployment.Mode),
 				"accepted_because": cfg.Deployment.AcceptedBecause,
 			},
+			// Names, keywords and numbers only — see EffectiveText.
+			"substrate": substrateJSON(cfg),
+			"review":    reviewJSON(cfg),
 			"limits": map[string]any{
 				"max_concurrent_agents": cfg.Limits.MaxConcurrentAgents,
 				"max_turns":             cfg.Limits.MaxTurns,

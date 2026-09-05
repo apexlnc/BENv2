@@ -32,7 +32,7 @@ func TestClaimBaseLifecycleScopesPinsToAssignmentEpoch(t *testing.T) {
 
 	// A fresh provider reads the same pending intent, and repeating that epoch is
 	// a no-op. A different epoch cannot overwrite an unfinished transition.
-	p2, err := New(Options{Root: p.root, WorkflowKey: "wf", Repository: repo(f.origin), Locks: p.LockDomain(), Logger: quietLogger()})
+	p2, err := providerFromOptions(t, Options{Root: p.root, WorkflowKey: "wf", Repository: repo(f.origin), Locks: p.LockDomain(), Logger: quietLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,10 @@ func TestClaimBaseLifecycleScopesPinsToAssignmentEpoch(t *testing.T) {
 		t.Errorf("fresh claim prior facts = %+v, want none without an outgoing pin", prior)
 	}
 	firstPin := first.BaseSHA
-	if state, err = p2.ClaimBase(ctx, iss); err != nil || state != (core.ClaimBase{State: core.ClaimBasePinned, Epoch: firstEpoch, BaseSHA: firstPin}) {
+	firstState := core.ClaimBase{
+		State: core.ClaimBasePinned, Epoch: firstEpoch, BaseSHA: firstPin, TargetBranch: "main",
+	}
+	if state, err = p2.ClaimBase(ctx, iss); err != nil || state != firstState {
 		t.Fatalf("first pinned ClaimBase = %+v, %v", state, err)
 	}
 
@@ -73,7 +76,7 @@ func TestClaimBaseLifecycleScopesPinsToAssignmentEpoch(t *testing.T) {
 	if err := p2.Dispose(ctx, first, false); err != nil {
 		t.Fatalf("Dispose(first claim): %v", err)
 	}
-	if state, err = p2.ClaimBase(ctx, iss); err != nil || state != (core.ClaimBase{State: core.ClaimBasePinned, Epoch: firstEpoch, BaseSHA: firstPin}) {
+	if state, err = p2.ClaimBase(ctx, iss); err != nil || state != firstState {
 		t.Fatalf("ClaimBase after disposal = %+v, %v; disposal must retain the outgoing pair", state, err)
 	}
 	if got := runGit(t, p.baseDir, "rev-parse", claimBaseRef("7", firstEpoch)); got != firstPin {
@@ -85,7 +88,7 @@ func TestClaimBaseLifecycleScopesPinsToAssignmentEpoch(t *testing.T) {
 	}
 	wantPending = core.ClaimBase{
 		State: core.ClaimBasePending, Epoch: secondEpoch,
-		OutgoingEpoch: firstEpoch, OutgoingBaseSHA: firstPin,
+		OutgoingEpoch: firstEpoch, OutgoingBaseSHA: firstPin, OutgoingTargetBranch: "main",
 	}
 	if state, err = p2.ClaimBase(ctx, iss); err != nil || state != wantPending {
 		t.Fatalf("second pending ClaimBase = %+v, %v; want %+v", state, err, wantPending)
@@ -167,7 +170,9 @@ func TestAbandonPendingClaimBaseAllowsALaterAssignment(t *testing.T) {
 		if err := p.AbandonPendingClaimBase(ctx, iss); err != nil {
 			t.Fatalf("AbandonPendingClaimBase: %v", err)
 		}
-		want := core.ClaimBase{State: core.ClaimBasePinned, Epoch: outgoing, BaseSHA: first.BaseSHA}
+		want := core.ClaimBase{
+			State: core.ClaimBasePinned, Epoch: outgoing, BaseSHA: first.BaseSHA, TargetBranch: "main",
+		}
 		if got, err := p.ClaimBase(ctx, iss); err != nil || got != want {
 			t.Fatalf("ClaimBase after abandonment = %+v, %v; want %+v", got, err, want)
 		}
@@ -179,7 +184,7 @@ func TestAbandonPendingClaimBaseAllowsALaterAssignment(t *testing.T) {
 		}
 		wantPending := core.ClaimBase{
 			State: core.ClaimBasePending, Epoch: later,
-			OutgoingEpoch: outgoing, OutgoingBaseSHA: first.BaseSHA,
+			OutgoingEpoch: outgoing, OutgoingBaseSHA: first.BaseSHA, OutgoingTargetBranch: "main",
 		}
 		if got, err := p.ClaimBase(ctx, iss); err != nil || got != wantPending {
 			t.Fatalf("later pending state = %+v, %v; want %+v", got, err, wantPending)

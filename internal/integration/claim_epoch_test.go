@@ -45,7 +45,7 @@ func TestReclaimRepinsPriorPublishedHeadBeforeSuccessCanRepeat(t *testing.T) {
 				case 1:
 					h.Workspaces.SetBranchHead("7", agentCommitSHA)
 					h.Tracker.SetPR("ben/issue-7", core.PR{
-						Number: 71, URL: "https://example.test/pull/71", State: "open", Branch: "ben/issue-7",
+						Number: 71, URL: "https://example.test/pull/71", State: "open", Branch: "ben/issue-7", BaseBranch: "main",
 					})
 				case 2:
 					// Deliberate no-op reviser: H1 and PR1 are still present.

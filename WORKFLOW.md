@@ -40,8 +40,10 @@ agent:
     # with `sandbox_mode: srt` (#149), but that posture requires `config_dir:
     # isolated` and an environment credential. This host accepts neither route
     # (#112), so selecting it here is a load refusal; this attended workflow
-    # deliberately leaves the sandbox posture at its `none` default. #81 stays
-    # open for the real-Claude proof on a compatible host.
+    # deliberately leaves the sandbox posture at its `none` default. #81 closed
+    # on 2026-09-03: the real-Claude proof came from the Airlock canaries (#195),
+    # where the substrate composes the sandbox-runtime wrapper; the adapter's own
+    # `srt` path has still not carried a real agent on a compatible host.
     disallowed_tools:
       - WebFetch
       - WebSearch
@@ -88,7 +90,10 @@ deployment:
   #
   # So: a human starts this daemon and stays for its lifetime. It is logged at
   # Warn on every startup for that reason. Moving to `risk-accepted` is one edit
-  # plus an `accepted_because`, and it waits on #155 and #156 through #76.
+  # plus an `accepted_because`. #155, #156 and #76 have closed (2026-08-20), so
+  # nothing it waits on is a ticket: the Octo `credential_sources` this file
+  # would need are the operator's to configure (docs/DEPLOY.md), and declaring
+  # the mode is the operator's decision to record.
   mode: attended
 
 hooks:
@@ -150,9 +155,15 @@ When — and only when — the task is complete:
 1. Commit all changes. Work only on the branch already checked out in this
    workspace; never create, switch, or force-update branches.
 2. Push it: `git push origin HEAD`.
-3. Open a pull request against the default branch with `gh pr create`, and put
+3. Open a pull request against `{{ target_branch }}` with
+   `gh pr create --base {{ target_branch | shellescape }}`, and put
    `Fixes #{{ issue.identifier }}` in the PR body so the issue closes on merge.
 4. Do not merge the pull request. Do not close the issue.
+
+If this branch already has an open pull request, read the latest trusted
+automated review for its current head, address its unresolved findings, and
+update the existing pull request rather than opening another. One issue, one
+branch, one pull request.
 
 {% if attempt %}
 This is attempt {{ attempt }}.

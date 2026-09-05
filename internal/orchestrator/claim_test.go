@@ -95,6 +95,23 @@ func TestPendingClaimBaseIsDurableBeforeClaimProjection(t *testing.T) {
 	}
 }
 
+func TestSuccessfulPrepareWithoutATargetCannotLaunch(t *testing.T) {
+	h := start(t, harnessOpts{
+		issues: []core.Issue{fake.Issue("1", epoch)},
+		configureWorkspaces: func(w *fake.Workspaces) {
+			w.SetDefaultTarget("")
+		},
+	})
+	h.WaitState("1", StateNeedsReview)
+
+	if got := h.Runner.StartCount(); got != 0 {
+		t.Fatalf("started %d runs from a targetless prepared workspace", got)
+	}
+	if got := h.Tracker.ReleaseCount("1"); got != 0 {
+		t.Fatalf("released a targetless claim %d times, want sticky park", got)
+	}
+}
+
 func TestPendingClaimBaseWriteFailureRetriesWithoutProjection(t *testing.T) {
 	boom := errors.New("claim-base store unavailable")
 	h := start(t, harnessOpts{
@@ -135,6 +152,7 @@ func TestFailedNewEpochInitializationRetriesFromTheOlderPin(t *testing.T) {
 		configureWorkspaces: func(w *fake.Workspaces) {
 			w.SetClaimBase("1", core.ClaimBase{
 				State: core.ClaimBasePinned, Epoch: oldEpoch, BaseSHA: fake.DefaultBaseSHA,
+				TargetBranch: fake.DefaultTargetBranch,
 			})
 		},
 	})
@@ -158,6 +176,48 @@ func TestFailedNewEpochInitializationRetriesFromTheOlderPin(t *testing.T) {
 	}
 	if state.State != core.ClaimBasePinned || state.Epoch <= 0 || state.Epoch == oldEpoch {
 		t.Errorf("claim base after retry = %+v, want a newly pinned E2", state)
+	}
+}
+
+func TestFailedLegacyUpgradeRetriesFromTheValidatedOlderPin(t *testing.T) {
+	boom := errors.New("claim-base legacy upgrade unavailable")
+	const oldEpoch = int64(17)
+	legacy := core.ClaimBase{
+		State: core.ClaimBasePinned, Epoch: oldEpoch, BaseSHA: fake.DefaultBaseSHA,
+	}
+	h := start(t, harnessOpts{
+		issues:             []core.Issue{fake.Issue("1", epoch)},
+		failBeginClaimBase: boom,
+		configureWorkspaces: func(w *fake.Workspaces) {
+			w.SetClaimBase("1", legacy)
+			w.SetClaimBaseError(legacy, core.ErrClaimTargetUnrecorded)
+		},
+	})
+	waitFor(t, "the failed legacy upgrade", func() bool {
+		return h.Workspaces.ClaimBaseBeginCount("1") == 1
+	})
+
+	if got := h.stateOf("1"); got != StateQueued {
+		t.Fatalf("state after failed legacy upgrade = %s, want queued retry", got)
+	}
+	if got := h.Tracker.Label("1"); got != core.StateLabelNone {
+		t.Fatalf("label after failed legacy upgrade = %q, want no projection", got)
+	}
+	if got := h.Runner.StartCount(); got != 0 {
+		t.Fatalf("started %d runs before the legacy upgrade landed", got)
+	}
+
+	h.Workspaces.SetFailBeginClaimBase(nil)
+	h.Workspaces.SetFailClaimBase(nil)
+	h.PollNow()
+	h.WaitState("1", StateDone)
+	state, err := h.Workspaces.ClaimBase(t.Context(), core.Issue{Identifier: "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.State != core.ClaimBasePinned || state.Epoch <= 0 || state.Epoch == oldEpoch ||
+		state.BaseSHA == "" || state.TargetBranch == "" {
+		t.Errorf("claim base after retry = %+v, want a complete later-epoch tuple", state)
 	}
 }
 
@@ -203,6 +263,33 @@ func TestPendingPrepareRetryToleratesAPathAndRetriesAMarkerRead(t *testing.T) {
 	h.WaitState("1", StateDone)
 	if got := h.Workspaces.PrepareCount("1"); got != 2 {
 		t.Errorf("prepare count after recovery = %d, want failed pre-pin call plus retry", got)
+	}
+}
+
+func TestRedispatchRejectsATargetMismatchBeforePreparingAgain(t *testing.T) {
+	prepareErr := errors.New("post-pin prepare failure")
+	h := start(t, harnessOpts{
+		issues:     []core.Issue{fake.Issue("1", epoch)},
+		prepareErr: prepareErr,
+		prepRetry:  func(error) bool { return true },
+	})
+	h.WaitState("1", StateBackoff)
+
+	state, err := h.Workspaces.ClaimBase(t.Context(), core.Issue{Identifier: "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.TargetBranch = "other-target"
+	h.Workspaces.SetClaimBase("1", state)
+	h.Workspaces.SetPrepareErrorWithWorkspace(nil)
+	h.Clock.Advance(11 * time.Second)
+	h.WaitState("1", StateNeedsReview)
+
+	if got := h.Workspaces.PrepareCount("1"); got != 1 {
+		t.Fatalf("prepare calls = %d, want no redispatch after target mismatch", got)
+	}
+	if got := h.Runner.StartCount(); got != 0 {
+		t.Fatalf("started %d runs after target mismatch", got)
 	}
 }
 
@@ -286,6 +373,44 @@ func TestVerificationValidatesClaimEpochBeforeCallingVerifier(t *testing.T) {
 	}
 	if containsMilestone(h.Tracker.Milestones("1"), core.MilestonePublished) {
 		t.Error("published an attempt whose claim epoch disappeared")
+	}
+}
+
+func TestVerificationValidatesClaimTargetBeforeCallingVerifier(t *testing.T) {
+	beforeSuccess := make(chan struct{})
+	releaseSuccess := make(chan struct{})
+	var verifierCalls atomic.Int32
+	h := start(t, harnessOpts{
+		issues: []core.Issue{fake.Issue("1", epoch)},
+		script: func(core.RunSpec, int) []core.Event { return fake.Succeed("s") },
+		eventGate: func(index int) {
+			if index == 2 {
+				close(beforeSuccess)
+				<-releaseSuccess
+			}
+		},
+		verifier: verifierFunc(func(context.Context, core.Issue, core.Workspace) (VerifyResult, error) {
+			verifierCalls.Add(1)
+			return VerifyResult{Verdict: VerdictPublished, PRURL: "https://example.test/pull/old"}, nil
+		}),
+	})
+	<-beforeSuccess
+	h.WaitState("1", StateRunning)
+
+	state, err := h.Workspaces.ClaimBase(t.Context(), core.Issue{Identifier: "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.TargetBranch = "other-target"
+	h.Workspaces.SetClaimBase("1", state)
+	close(releaseSuccess)
+	h.WaitState("1", StateNeedsReview)
+
+	if got := verifierCalls.Load(); got != 0 {
+		t.Errorf("verifier calls = %d, want 0 after claim target changed", got)
+	}
+	if containsMilestone(h.Tracker.Milestones("1"), core.MilestonePublished) {
+		t.Error("published work after the claim target changed")
 	}
 }
 

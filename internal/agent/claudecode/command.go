@@ -29,7 +29,14 @@ import (
 //     content, only paths and references.
 
 // command builds the argv for one attempt. The prompt is never part of it.
-func (p Provider) command(spec core.RunSpec) []string {
+//
+// It returns an error rather than a best-effort argv because one element is not
+// this adapter's to choose: the resume token comes from the child's own stream
+// (see the continuation branch). A caller that could ignore the refusal and use
+// the argv anyway would leave the check advisory, and there are exactly two
+// callers — Start and RemoteInvocation — each of which owes the orchestrator a
+// refusal with no process behind it (SPEC §7.3).
+func (p Provider) command(spec core.RunSpec) ([]string, error) {
 	argv := []string{p.Binary, "-p", "--output-format", "stream-json", "--verbose",
 		"--permission-mode", p.PermissionMode}
 
@@ -38,7 +45,17 @@ func (p Provider) command(spec core.RunSpec) []string {
 	// reports the same session id it was handed (verified against 2.1.221;
 	// --fork-session is what changes it), so a continuation chain keeps one
 	// stable token.
+	//
+	// Opaque to the orchestrator, checked here: the token is the one argv element
+	// the *agent* chose, so it is validated where it is minted (validSessionID)
+	// and again here, independently, against the one property that matters to an
+	// argv (harness.CheckContinuationArgv). `--resume` takes its value as the next
+	// element with no positional terminator available, so the value check is the
+	// only control there is.
 	if spec.Continuation != "" {
+		if err := harness.CheckContinuationArgv(spec.Continuation, ErrContinuationToken); err != nil {
+			return nil, err
+		}
 		argv = append(argv, "--resume", spec.Continuation)
 	}
 	if p.Model != "" {
@@ -62,7 +79,7 @@ func (p Provider) command(spec core.RunSpec) []string {
 	if spec.Limits.MaxCostUSD > 0 {
 		argv = append(argv, "--max-budget-usd", strconv.FormatFloat(spec.Limits.MaxCostUSD, 'f', -1, 64))
 	}
-	return argv
+	return argv, nil
 }
 
 // injected is this adapter's own contribution to the child environment: its

@@ -28,7 +28,7 @@ func TestARebuiltProviderSharesItsPredecessorsLockDomain(t *testing.T) {
 	root := t.TempDir()
 
 	build := func(hook string) *Provider {
-		p, err := New(Options{
+		p, err := providerFromOptions(t, Options{
 			Root:        root,
 			WorkflowKey: "wf",
 			Repository:  repo("file:///nonexistent.git"),
@@ -76,7 +76,7 @@ func TestARebuiltProviderSharesItsPredecessorsLockDomain(t *testing.T) {
 // serializes. The default must not be "no locking".
 func TestAProviderWithoutADomainStillSerializes(t *testing.T) {
 	parallel(t)
-	p, err := New(Options{
+	p, err := providerFromOptions(t, Options{
 		Root: t.TempDir(), WorkflowKey: "wf",
 		Repository: repo("file:///nonexistent.git"), Logger: quietLogger(),
 	})
@@ -113,7 +113,7 @@ func TestCheckBaseCache(t *testing.T) {
 	root := t.TempDir()
 
 	build := func(remote string) *Provider {
-		p, err := New(Options{
+		p, err := providerFromOptions(t, Options{
 			Root: root, WorkflowKey: "wf",
 			Repository: core.Repository{RemoteURL: remote},
 			Logger:     quietLogger(),
@@ -169,7 +169,7 @@ func TestCheckBaseCacheRefusesANonDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "wf", "base.git"), []byte("not a repo"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	p, err := New(Options{
+	p, err := providerFromOptions(t, Options{
 		Root: root, WorkflowKey: "wf",
 		Repository: repo("file:///nonexistent.git"), Logger: quietLogger(),
 	})

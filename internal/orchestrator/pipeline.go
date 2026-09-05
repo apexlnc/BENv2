@@ -256,9 +256,21 @@ func (o *Orchestrator) beginClaimBase(ctx context.Context, r *Record) {
 	gen, token := r.generation, r.token
 	issue, epoch := r.Issue, r.claimEpoch
 	workspaces := o.bundle().Workspaces
+	cycleSource, cycleRead := workspaces.(endedCycleSource)
+	var cycleSeq uint64
+	if cycleRead {
+		o.cycleMutationSeq++
+		cycleSeq = o.cycleMutationSeq
+		o.cycleMutationsInFlight++
+	}
 	r.pending++
 	go func() {
 		err := workspaces.BeginClaimBase(ctx, issue, epoch)
+		var cycleRefs []core.WorkspaceRef
+		var cycleErr error
+		if cycleRead {
+			cycleRefs, cycleErr = cycleSource.EndedCycles(ctx)
+		}
 		var state core.ClaimBase
 		var stateErr error
 		if err != nil {
@@ -271,6 +283,8 @@ func (o *Orchestrator) beginClaimBase(ctx context.Context, r *Record) {
 			kind: sigClaimBaseBegun, issue: issue.Identifier,
 			generation: gen, token: token, err: err,
 			claimBase: state, claimBaseErr: stateErr,
+			cycleRead: cycleRead, cycleRefs: cycleRefs,
+			cycleWorkspaces: workspaces, cycleScanErr: cycleErr, cycleScanSeq: cycleSeq,
 		})
 	}()
 }
@@ -284,22 +298,35 @@ func (o *Orchestrator) onClaimBaseBegun(ctx context.Context, r *Record, s signal
 	if r.exiting() || o.draining {
 		return
 	}
+	if s.cycleRead && !s.cycleScanOK {
+		// BeginClaimBase may already have installed the replacement. Do not
+		// prepare it after its complete obligation-directory read was refused:
+		// the loop cannot yet adopt the ownership fact, and the provider cannot
+		// prove the full pin-retention set on that path either.
+		return
+	}
 	if r.State != StateQueued && (r.State != StateBackoff || !r.claimBaseDispatch) {
 		return
 	}
 	if s.err != nil {
+		if errors.Is(s.claimBaseErr, core.ErrClaimTargetUnrecorded) &&
+			legacyClaimBaseCanUpgrade(s.claimBase, r.claimEpoch) {
+			o.log.Warn("upgrading a legacy claim target; holding the claim and retrying next tick",
+				"issue", r.Issue.Identifier, "epoch", r.claimEpoch,
+				"provider_epoch", s.claimBase.Epoch, "error", s.err)
+			return
+		}
 		if s.claimBaseErr != nil {
 			o.enterEpochFault(ctx, r, "claim epoch: pending intent is unreadable after initialization failed")
 			return
 		}
 		switch {
-		case s.claimBase.State == core.ClaimBasePinned &&
-			s.claimBase.Epoch == r.claimEpoch && s.claimBase.BaseSHA != "":
+		case claimBasePinsEpoch(s.claimBase, r.claimEpoch):
 			// The authority says the operation completed despite the reported
 			// error. Continue from the durable fact, not the syscall outcome.
 		case s.claimBase.State == core.ClaimBaseAbsent,
 			s.claimBase.State == core.ClaimBasePending && s.claimBase.Epoch == r.claimEpoch,
-			s.claimBase.State == core.ClaimBasePinned && s.claimBase.Epoch > 0 && s.claimBase.BaseSHA != "":
+			claimBasePinsEpoch(s.claimBase, s.claimBase.Epoch) && s.claimBase.Epoch != r.claimEpoch:
 			// Absence, our own pending intent, or a readable prior pin are the
 			// expected states when initialization fails around its atomic replace.
 			// None contradicts the current assignment; keep the claim unprojected
@@ -368,7 +395,12 @@ func (o *Orchestrator) beginPrepare(ctx context.Context, r *Record) {
 	// process of its own has run or exited, and any verdict the last one
 	// reported has already been routed.
 	r.ranThisAttempt, r.afterRunFired = false, false
-	r.eventsClosed, r.handleDone, r.groupGone, r.outcome = false, false, false, nil
+	r.eventsClosed, r.handleDone, r.domainQuiet, r.outcome = false, false, false, nil
+	// Nothing has ordered this attempt stopped. Stated rather than left to the
+	// stop that set it, because a §9.9 signal outliving its attempt is the whole
+	// of #236: FailureReason beside it is sticky on purpose, and the difference
+	// between the two is only visible if this line exists.
+	r.budgetStop, r.finishAfterStop = false, false
 	// The attempt-outcome record's per-attempt fields (#60). The start instant is
 	// taken here, at the entry to `preparing`, rather than at the launch: the
 	// worktree preparation is part of what a dispatch costs in wall clock, and an
@@ -400,11 +432,7 @@ func (o *Orchestrator) beginPrepare(ctx context.Context, r *Record) {
 		var ws core.Workspace
 		var facts core.LocalBranchFacts
 		ws, facts, err := workspaces.PrepareClaim(ctx, issue, attempt, epoch)
-		var claimBase core.ClaimBase
-		var claimBaseErr error
-		if err != nil {
-			claimBase, claimBaseErr = workspaces.ClaimBase(ctx, issue)
-		}
+		claimBase, claimBaseErr := workspaces.ClaimBase(ctx, issue)
 		o.send(ctx, signal{
 			kind: sigPrepared, issue: issue.Identifier, generation: gen, token: token,
 			workspace: ws, facts: facts, err: err,
@@ -444,16 +472,20 @@ func (o *Orchestrator) onPrepared(ctx context.Context, r *Record, s signal) {
 		o.failLaunch(ctx, r, s.err, "preparing the workspace", o.prepRetryable(s.err))
 		return
 	}
-	if r.claimEpoch <= 0 || r.Workspace.ClaimEpoch != r.claimEpoch || r.Workspace.BaseSHA == "" {
+	if s.claimBaseErr != nil || r.claimEpoch <= 0 || s.workspace.ClaimEpoch != r.claimEpoch ||
+		!claimBaseAuthorizesWorkspace(s.claimBase, s.workspace) {
 		o.enterEpochFault(ctx, r, fmt.Sprintf(
-			"claim epoch: prepared workspace carries %d/%s, expected positive epoch %d",
-			r.Workspace.ClaimEpoch, r.Workspace.BaseSHA, r.claimEpoch))
+			"claim epoch: prepared workspace carries %d/%s/%s, provider returned %+v: %v; expected epoch %d and the same complete tuple",
+			s.workspace.ClaimEpoch, s.workspace.BaseSHA, s.workspace.TargetBranch,
+			s.claimBase, s.claimBaseErr, r.claimEpoch))
 		return
 	}
-	if r.Attempt == 1 && s.facts.AdvancedPastBase(s.facts.BaseSHA) {
+	if r.Attempt == 1 && (r.Workspace.PriorWork || s.facts.AdvancedPastBase(s.facts.BaseSHA)) {
 		// This remains the first failure-budget dispatch of the fresh claim:
 		// moving the baseline with the display floor keeps max_attempts
 		// independent of history whose exact count did not survive (§9.6).
+		// Local providers prove that history with branch facts; a remote
+		// provider reports work already folded into its newly pinned base.
 		r.Attempt = 2
 		r.attemptBase = 1
 	}
@@ -465,7 +497,23 @@ func claimBaseAllowsPrepare(state core.ClaimBase, epoch int64, readErr error) bo
 		return false
 	}
 	return state.State == core.ClaimBasePending ||
-		(state.State == core.ClaimBasePinned && state.BaseSHA != "")
+		claimBasePinsEpoch(state, epoch)
+}
+
+func claimBasePinsEpoch(state core.ClaimBase, epoch int64) bool {
+	return epoch > 0 && state.State == core.ClaimBasePinned && state.Epoch == epoch &&
+		state.BaseSHA != "" && state.TargetBranch != ""
+}
+
+func claimBaseAuthorizesWorkspace(state core.ClaimBase, ws core.Workspace) bool {
+	return ws.ClaimEpoch > 0 && ws.BaseSHA != "" && ws.TargetBranch != "" &&
+		claimBasePinsEpoch(state, ws.ClaimEpoch) &&
+		state.BaseSHA == ws.BaseSHA && state.TargetBranch == ws.TargetBranch
+}
+
+func legacyClaimBaseCanUpgrade(state core.ClaimBase, epoch int64) bool {
+	return epoch > 0 && state.State == core.ClaimBasePinned && state.Epoch > 0 &&
+		state.Epoch != epoch && state.BaseSHA != "" && state.TargetBranch == ""
 }
 
 // prepRetryable classifies a Prepare failure. SPEC §9.2 has both a retryable
@@ -587,9 +635,9 @@ func (o *Orchestrator) beginStart(ctx context.Context, r *Record) {
 			}
 		}
 		// §9.10's workspace precondition, written **before** the launch and durable
-		// on return. The ordering is the whole design: the process group does not
-		// exist until the process does, so a marker written afterwards leaves a
-		// window in which a crash strands a live group with nothing recording it —
+		// on return. The ordering is the whole design: the execution domain does
+		// not exist until launch, so a marker written afterwards leaves a window
+		// in which a crash strands a live domain with nothing recording it —
 		// and a workspace with no marker reads as free, which is a second agent in a
 		// worktree at the next start. Writing first inverts the failure: a crash in
 		// the window leaves a marker carrying no evidence, which §9.10 parks for a
@@ -630,14 +678,14 @@ func (o *Orchestrator) onStarted(ctx context.Context, r *Record, s signal) {
 		r.handle = s.handle
 	}
 	if s.err != nil && s.handle == nil {
-		// No process exists — harness.Start returns a handle whenever cmd.Start
-		// succeeded, so a nil one means the launch never happened — and the marker
-		// beginStart wrote before trying is now describing nothing.
+		// No unowned execution domain exists: Start may return without a handle
+		// only before provider release or after its trusted domain was torn down.
+		// The marker beginStart wrote before trying is now describing nothing.
 		//
 		// Cleared *here*, ahead of every branch below, because all of them can
 		// return: a finish ordered by reconciliation, and a drain that suspends the
 		// record, both leave the failure branch unreached. Nothing else will ever
-		// clear it — this attempt has no group to confirm gone, so confirmQuiet is
+		// clear it — this attempt has no domain to confirm quiet, so confirmQuiet is
 		// not on its path — and what survives is the marker's "interrupted cleanup of
 		// a launch that failed" reading, which parks the issue at the next start.
 		o.freeWorkspaceMarker(ctx, r)
@@ -714,24 +762,23 @@ func (o *Orchestrator) pumpRun(ctx context.Context, r *Record, handle core.RunHa
 					//
 					// The stream closing says only that the adapter has nothing
 					// further to say. It used to wait for Done before reporting
-					// anything, which made progress depend on the process dying:
-					// a liveness kill whose *leader* survives SIGKILL never
-					// closes Done (harness reap waits on the process, awaitFlush
-					// on a transcript whose pipes that leader still holds), so
-					// the record sat in `running` with its outcome held,
+					// anything, which made progress depend on direct execution
+					// ending: a failed teardown can leave it and its transcript
+					// pipes live, so Done never closes and the record otherwise
+					// sits in `running` with its outcome held,
 					// unprobed and unlogged. Visibility cannot wait on that.
 					o.send(ctx, signal{kind: sigEventsClosed, issue: id, generation: gen, token: token, sawTerminal: sawTerminal})
 
-					// Done is the phase edge: after it, anything left in the
-					// group has outlived the process that owned it, so cleaning
-					// it with a signal is safe. Before it, the only permissible
+					// Done is the phase edge: after it, any remaining domain
+					// member has outlived direct execution, so bounded teardown
+					// is permissible. Before it, the only permissible
 					// question is Probe. Waiting here also keeps the ordinary
-					// run prompt — without this wake, a run whose group is gone
+					// run prompt — without this wake, a run whose domain is quiet
 					// a moment after its stream closed would sit until the next
 					// poll, 30 s by default.
 					//
-					// If the leader never dies this waits for the life of the
-					// process, which is the honest shape: there is no phase edge
+					// If direct execution never ends this waits for its life,
+					// which is the honest shape: there is no phase edge
 					// to report, and the probe path is already carrying the
 					// record.
 					select {
@@ -826,7 +873,11 @@ func (o *Orchestrator) onRunEvent(ctx context.Context, r *Record, s signal) {
 			// quiet. So nothing else will ever file this attempt, and the measured
 			// cost of omitting this guard was every such attempt vanishing from the
 			// log.
-			r.stopping = true
+			// The two are not the same statement, and only the first is about
+			// this stop. `budgetStop` is what onStopped classifies this stop by;
+			// the reason and the outcome are the record's history, which survives
+			// into the re-queue that follows (restoreBudgets, SPEC §5.6).
+			r.stopping, r.budgetStop = true, true
 			r.FailureReason = core.FailureBudgetExceeded
 			r.lastOutcome = string(core.FailureBudgetExceeded)
 			o.beginStop(ctx, r, core.StopDiscard)
@@ -858,13 +909,10 @@ func (o *Orchestrator) onRunEvent(ctx context.Context, r *Record, s signal) {
 // workspace it was produced in has no processes left in it.
 //
 // Three facts, and only the third is the one every caller needs. The adapter
-// closes Events as soon as it has emitted the terminal event. Done adds that
-// the harness process has been reaped — but explicitly not its process group:
-// a harness that spawned tools of its own leaves them in that group, and on a
-// natural exit no signal ladder runs, so nothing has asked whether they are
-// gone (claudecode handle.reap, awaitCleanup). SPEC §7.5 puts group
-// termination behind `Stop` and makes its confirmed/unconfirmed verdict the
-// evidence — so that is what the orchestrator has to ask for.
+// closes Events after its terminal event. Done adds the direct-execution and
+// transcript phase edge, but says nothing about other members of the
+// substrate-owned domain. Probe/Stop's confirmed verdict is the domain-quiet
+// evidence the orchestrator must ask for (SPEC §7.5).
 //
 // It matters because everything a terminal event leads to touches that
 // workspace: the §9.7 evidence check reads it, the §6.5 after-run hook runs
@@ -876,33 +924,31 @@ func (o *Orchestrator) holdOutcome(r *Record, ev core.Event, detail string) {
 	r.outcome = &runOutcome{event: ev, detail: detail}
 }
 
-// confirmQuiet asks whether the run's process group is gone, and routes the held
-// outcome once it is. Retried on later ticks while the answer is no, which is
+// confirmQuiet asks whether the run's execution domain is quiet, and routes the
+// held outcome once it is. Retried on later ticks while the answer is no, which is
 // §9.8's posture for an unconfirmed stop applied to a natural end.
 //
 // *Which* question depends on how far the run has got, and the distinction is the
 // whole of #79 (SPEC §7.5):
 //
-//   - Before Done, the process may still be flushing its transcript. Only Probe
-//     is permissible — it observes and signals nothing. Asking with Stop here
-//     would SIGTERM a group about to exit on its own and truncate §7.2's record,
-//     which is the cost that ruled out the alternatives on that ticket.
-//   - After Done, the process is reaped, so anything still in the group has
-//     outlived its owner and will not leave on its own. That is what makes a
-//     signal both safe and necessary, so the question becomes Stop.
+//   - Before Done, direct execution may still be flushing its transcript. Only
+//     Probe is permissible: it is one read-only observation.
+//   - After Done, remaining members have outlived direct execution, so the
+//     teardown-capable Stop is permissible. A naturally empty domain still
+//     short-circuits on its initial observation without signalling.
 //
 // Neither answer authorizes anything by itself: only a confirmed termination
 // does, and applyOutcome is where that is enforced.
 func (o *Orchestrator) confirmQuiet(ctx context.Context, r *Record) {
-	if r.outcome == nil || !r.eventsClosed || r.groupGone || r.probeInFlight || r.stopInFlight || r.exiting() {
+	if r.outcome == nil || !r.eventsClosed || r.domainQuiet || r.probeInFlight || r.stopInFlight || r.exiting() {
 		return
 	}
 	if r.handle == nil {
-		// No process was ever started, so there is no group to confirm. The marker
+		// No execution domain was started, so there is nothing to confirm. The marker
 		// is still cleared: beginStart writes it before the launch, so a Start that
 		// failed leaves one behind, and that is the "interrupted cleanup of a launch
 		// that failed" reading §9.10 would otherwise park on.
-		r.groupGone = true
+		r.domainQuiet = true
 		o.freeWorkspaceMarker(ctx, r)
 		o.applyOutcome(ctx, r)
 		return
@@ -913,12 +959,11 @@ func (o *Orchestrator) confirmQuiet(ctx context.Context, r *Record) {
 	}
 
 	// StopInterrupt, not StopDiscard, for the grace rather than the mode's other
-	// half: discard is deliberately *less patient* (harness handle.Stop cuts the
-	// ladder's grace to a tenth), and impatience is the wrong trade for a
+	// half: discard is deliberately *less patient*, and impatience is the wrong trade for a
 	// question whose only answer worth having is a confirmed one. An unconfirmed
 	// verdict costs a retained claim and another tick (SPEC §9.8), while waiting
-	// costs nothing at all in the ordinary case, where the ladder short-circuits
-	// on a group that is already gone.
+	// costs nothing at all in the ordinary case, where Stop short-circuits on a
+	// domain already observed quiet.
 	//
 	// Discard's own purpose — abandoning a reader nobody is coming back for — has
 	// none here: `Done` has already closed, and the harness closes it only once
@@ -930,14 +975,14 @@ func (o *Orchestrator) confirmQuiet(ctx context.Context, r *Record) {
 // applyOutcome routes a held outcome, once the workspace is quiet.
 //
 // The condition is a re-check, not the gate. What actually keeps a retry out of a
-// possibly-live worktree is that both callers establish `groupGone` first —
+// possibly-live worktree is that both callers establish `domainQuiet` first —
 // confirmQuiet only for a record that never started a process, onStopped only on
 // a `Stop` that answered confirmed — so no reachable path can arrive here with it
 // false, and no test can therefore catch its removal. It is written anyway
 // because the invariant is worth more than the line: a third caller is where this
 // would break, and it would break silently (SPEC §9.8).
 func (o *Orchestrator) applyOutcome(ctx context.Context, r *Record) {
-	if r.outcome == nil || !r.eventsClosed || !r.groupGone {
+	if r.outcome == nil || !r.eventsClosed || !r.domainQuiet {
 		return
 	}
 	if !r.summarized {
@@ -968,9 +1013,9 @@ func (o *Orchestrator) applyOutcome(ctx context.Context, r *Record) {
 }
 
 // onEventsClosed fires when the run's event stream closes. That is the adapter
-// saying it has nothing further to report — not that the process is gone (Done),
-// and not that its process group is (Stop). Raw stdout reaching EOF is a third
-// thing again, downstream of this: the pump closes Events and keeps draining.
+// saying it has nothing further to report — not that direct execution reached
+// Done, and not that its execution domain is quiet. Raw stdout EOF is a third
+// fact again, downstream of this: the pump closes Events and keeps draining.
 //
 // The sawTerminal branch is a fail-safe for a violated RunHandle contract, not
 // the crash path. SPEC §7.4 makes the terminal event ground truth and adapters
@@ -981,7 +1026,7 @@ func (o *Orchestrator) applyOutcome(ctx context.Context, r *Record) {
 // which no conforming one does — so it is held rather than routed, on the same
 // terms as everything else this workspace has to wait for.
 func (o *Orchestrator) onEventsClosed(ctx context.Context, r *Record, s signal) {
-	// The stream is over; the process and its group may not be. Nothing may
+	// The stream is over; direct execution and its domain may not be. Nothing may
 	// touch this attempt's workspace on the strength of this fact alone — the
 	// probe below is what settles that (confirmQuiet, applyOutcome).
 	r.eventsClosed = true
@@ -996,8 +1041,8 @@ func (o *Orchestrator) onEventsClosed(ctx context.Context, r *Record, s signal) 
 		// the next-tick retry (SPEC §9.8) with nothing to call Stop on.
 		return
 	}
-	// The handle is deliberately kept until the group is confirmed gone: it is
-	// the only way to stop a descendant that outlived the harness, and an exit
+	// The handle is deliberately kept until the domain is confirmed quiet: it is
+	// the only route to a member that outlived direct execution, and an exit
 	// arriving in this window has to be able to.
 	//
 	// An exit already under way is not a crash either.
@@ -1075,19 +1120,39 @@ func (o *Orchestrator) enterFailed(ctx context.Context, r *Record, why string, c
 		return
 	}
 	// The label blocks re-dispatch; the claim is released so a human can take
-	// it (SPEC §9.2). Workspace kept for forensics.
+	// it (SPEC §9.2). The local workspace stays for forensics, while a remote
+	// allocation applies its explicit on_failure policy below.
 	o.comment(ctx, r, core.MilestoneComment{
 		Milestone: core.MilestoneFailed,
 		Reason:    r.FailureReason,
 		Detail:    why,
 	})
+	o.completeFailure(ctx, r)
 	o.release(ctx, r, "failed: "+why)
 }
 
 // enterNeedsReview parks a run. Most routes here are verification verdicts
 // rather than failures and carry no §7.3 cause — only §9.9's budget breach
 // does, which is why the parameter exists at all.
+//
+// A park is a *routing* decision — it keeps the claim and the workspace and
+// waits for a human — so it is refused for a record whose exit is already
+// ordered, on the same terms every other routing site refuses one (applyOutcome,
+// confirmQuiet, the parked sweep). The guard is here rather than at any one
+// caller because the state it prevents is a property of the pair rather than of
+// the route that reached it: a `needs-review` record that is also `gone` or
+// `claimLost` is permanently `exiting()`, so reconciliation skips it, the parked
+// sweep filters it out, its owed tracker writes are discarded unattempted
+// (absence.go) and no exit is ever queued — the record, its §9.5 slot, its
+// workspace and every future identity reload are held for the life of the
+// process (#236). Nothing is lost by refusing: the caller has decided this
+// attempt is over and recorded it, and the exit owns what happens next.
 func (o *Orchestrator) enterNeedsReview(ctx context.Context, r *Record, why string, cause core.FailureReason) {
+	if r.orderedExit() {
+		o.log.Info("not parking a record whose exit is already ordered; the exit owns it",
+			"issue", r.Issue.Identifier, "detail", why, "reason", r.stopReason)
+		return
+	}
 	if err := o.transitionCaused(ctx, r, StateNeedsReview, why, cause); err != nil {
 		return
 	}
@@ -1323,8 +1388,8 @@ func (o *Orchestrator) onTimerFetched(ctx context.Context, r *Record, s signal) 
 	}
 	switch s.claimBase.State {
 	case core.ClaimBasePinned:
-		if s.claimBase.Epoch != r.claimEpoch || s.claimBase.BaseSHA == "" ||
-			(r.hasWorkspace() && (r.Workspace.ClaimEpoch != s.claimBase.Epoch || r.Workspace.BaseSHA != s.claimBase.BaseSHA)) {
+		if !claimBasePinsEpoch(s.claimBase, r.claimEpoch) ||
+			(r.hasWorkspace() && !claimBaseAuthorizesWorkspace(s.claimBase, r.Workspace)) {
 			o.enterEpochFault(ctx, r, fmt.Sprintf(
 				"claim epoch: re-dispatch found pinned state %+v, expected epoch %d and the retained workspace pair",
 				s.claimBase, r.claimEpoch))
@@ -1347,10 +1412,10 @@ func (o *Orchestrator) onTimerFetched(ctx context.Context, r *Record, s signal) 
 		case gate.action != recoveryActionApprove || gate.epochFault:
 			o.enterEpochFault(ctx, r, "claim epoch: "+gate.detail)
 			return
-		case r.Workspace.ClaimEpoch != 0 || r.Workspace.BaseSHA != "":
+		case r.Workspace.ClaimEpoch != 0 || r.Workspace.BaseSHA != "" || r.Workspace.TargetBranch != "":
 			// A path alone is the concrete provider's ordinary pre-pin error
-			// return. Only an epoch/base pair conflicts with pending state.
-			o.enterEpochFault(ctx, r, "claim epoch: pending state conflicts with a retained workspace epoch/base pair")
+			// return. Any part of the authority tuple conflicts with pending state.
+			o.enterEpochFault(ctx, r, "claim epoch: pending state conflicts with a retained workspace epoch/base/target tuple")
 			return
 		}
 	default:
@@ -1417,13 +1482,12 @@ func (o *Orchestrator) beginVerify(ctx context.Context, r *Record) {
 			return
 		}
 		claimBase, claimBaseErr := workspaces.ClaimBase(ctx, issue)
-		if claimBaseErr != nil || claimBase.State != core.ClaimBasePinned ||
-			claimBase.Epoch != ws.ClaimEpoch || claimBase.BaseSHA == "" || claimBase.BaseSHA != ws.BaseSHA {
+		if claimBaseErr != nil || !claimBaseAuthorizesWorkspace(claimBase, ws) {
 			o.send(ctx, signal{
 				kind: sigVerified, issue: issue.Identifier, generation: gen, token: token,
 				epochFault: true,
-				epochDetail: fmt.Sprintf("claim epoch: verification expected %d/%s, provider returned %+v: %v",
-					ws.ClaimEpoch, ws.BaseSHA, claimBase, claimBaseErr),
+				epochDetail: fmt.Sprintf("claim epoch: verification expected %d/%s/%s, provider returned %+v: %v",
+					ws.ClaimEpoch, ws.BaseSHA, ws.TargetBranch, claimBase, claimBaseErr),
 			})
 			return
 		}
@@ -1471,6 +1535,18 @@ func (o *Orchestrator) onVerified(ctx context.Context, r *Record, s signal) {
 			o.log.Warn("reading the current claim epoch before verification; retrying next tick",
 				"issue", r.Issue.Identifier, "error", s.err)
 		}
+		r.verifyRetry = true
+		return
+	}
+	if errors.Is(s.err, core.ErrPublishApprovalPending) {
+		// Protected-file review is an unfinished trusted publication, not an
+		// agent failure and not missing evidence. Keep the claim and attempt
+		// intact, then ask the publisher again on a later poll. Its durable
+		// operation key remains fixed while each retry receives a fresh backend
+		// run identity, so an approval can never revive the terminal run that
+		// first returned pending.
+		o.log.Info("trusted publication is awaiting approval; retrying next tick",
+			"issue", r.Issue.Identifier)
 		r.verifyRetry = true
 		return
 	}
@@ -1529,7 +1605,7 @@ func (o *Orchestrator) onVerified(ctx context.Context, r *Record, s signal) {
 		// into a held-claim record once these writes land — not before, since
 		// it is what retries them — and the §9.8 sweep releases the claim
 		// when the issue goes terminal, rather than leaving it for a restart.
-		o.dispose(ctx, r, false)
+		o.disposePublished(ctx, r)
 
 	case VerdictIncomplete:
 		if !o.continuable(r) {
@@ -1581,12 +1657,12 @@ func (o *Orchestrator) onVerified(ctx context.Context, r *Record, s signal) {
 	}
 }
 
-// beginProbe observes the run's process group without touching it, and reports
+// beginProbe observes the run's execution domain without touching it, and reports
 // the answer back through the loop (#79).
 //
-// Its own in-flight slot, not the ladder's: a probe is not a signal, so it
-// neither needs nor deserves the "one ladder at a time" guard, and holding the
-// ladder's slot would let an outstanding observation delay the cleanup Done
+// Its own in-flight slot, not the teardown's: a probe does not act, so it
+// neither needs nor deserves the "one teardown at a time" guard, and holding
+// that slot would let an outstanding observation delay the cleanup Done
 // enables.
 func (o *Orchestrator) beginProbe(ctx context.Context, r *Record) {
 	if r.probeInFlight || r.handle == nil {
@@ -1602,7 +1678,7 @@ func (o *Orchestrator) beginProbe(ctx context.Context, r *Record) {
 	}()
 }
 
-// onProbed applies an observation of the process group.
+// onProbed applies a read-only observation of the execution domain.
 //
 // A confirmed one is the same fact a confirmed stop reports, so it routes the
 // same way. An unconfirmed one retains everything and says so, which is the
@@ -1621,7 +1697,7 @@ func (o *Orchestrator) onProbed(ctx context.Context, r *Record, s signal) {
 		//
 		// `exiting()` is the load-bearing half, and it is load-bearing on its own:
 		// an exit whose last stop came back unconfirmed sits between retries with
-		// no ladder out at all, and that is the state a confirmed observation
+		// no teardown out at all, and that is the state a confirmed observation
 		// would otherwise route (TestOnProbedRefusesToRouteWhileAnExitIsPending).
 		// `stopInFlight` is a re-check that no reachable state needs — a stop
 		// starts either from an exit, which the first term covers, or from
@@ -1634,14 +1710,14 @@ func (o *Orchestrator) onProbed(ctx context.Context, r *Record, s signal) {
 	}
 	if r.handleDone {
 		// The phase edge overtook this observation. It cannot stand in for the
-		// stop that is now owed: the group may have acquired — or kept —
-		// something that only a signal will clear, and this answer predates the
-		// question. confirmQuiet asks again, as a stop.
+		// Stop that is now owed: this answer predates the phase edge and cannot
+		// stand in for the fresh, teardown-capable observation. confirmQuiet asks
+		// again through Stop.
 		o.confirmQuiet(ctx, r)
 		return
 	}
 	if s.probe != core.TerminationConfirmed {
-		o.log.Warn("event stream closed but the process group is not confirmed gone; holding the outcome and retrying next tick",
+		o.log.Warn("event stream closed but the execution domain is not confirmed quiet; holding the outcome and retrying next tick",
 			"issue", r.Issue.Identifier)
 		return
 	}
@@ -1652,9 +1728,9 @@ func (o *Orchestrator) onProbed(ctx context.Context, r *Record, s signal) {
 // enables.
 //
 // Immediately, not next tick: the poll interval is 30 s by default, and a run
-// whose group went quiet a moment after its stream closed would otherwise wait
-// that out for nothing. This is also the only path that cleans a group which
-// outlived its process, so deferring it defers the cleanup too.
+// whose domain went quiet a moment after its stream closed would otherwise wait
+// that out for nothing. This is also the path that permits teardown of a member
+// which outlived direct execution, so deferring it defers cleanup too.
 func (o *Orchestrator) onHandleDone(ctx context.Context, r *Record) {
 	r.handleDone = true
 	if r.suspended {
@@ -1667,11 +1743,11 @@ func (o *Orchestrator) onHandleDone(ctx context.Context, r *Record) {
 	o.confirmQuiet(ctx, r)
 }
 
-// quiet records that the group is gone and routes what was waiting on it. One
+// quiet records that the domain is quiet and routes what was waiting on it. One
 // place, because both askers end here and the ordering rules below are the same
 // either way.
 func (o *Orchestrator) quiet(ctx context.Context, r *Record) {
-	r.groupGone = true
+	r.domainQuiet = true
 	o.freeWorkspaceMarker(ctx, r)
 	if r.cancelRun != nil {
 		r.cancelRun()
@@ -1681,16 +1757,16 @@ func (o *Orchestrator) quiet(ctx context.Context, r *Record) {
 	o.applyOutcome(ctx, r)
 }
 
-// beginStop walks the handle's signal ladder and reports the termination back.
+// beginStop asks the handle for bounded domain teardown and reports the result.
 //
-// One ladder at a time. Both askers — an exit stopping a live run, and the
+// One teardown at a time. Both askers — an exit stopping a live run, and the
 // cleanup a finished one owes its workspace once Done has closed — put the same
-// question to the same handle, so a second ladder would buy nothing but a second
-// answer to race the first with. An exit that overtakes a ladder already walking
+// question to the same handle, so a second operation would buy nothing but a
+// second answer to race the first with. An exit that overtakes a teardown
 // therefore inherits its answer rather than asking again, and an unconfirmed one
 // is re-driven next tick like any other (retryPendingExits).
 //
-// An *observation* is not a ladder and does not share this slot (#79): an exit
+// An *observation* is not teardown and does not share this slot (#79): an exit
 // that overtakes one starts its stop immediately, and the probe's answer is
 // dropped rather than mistaken for the stop's (onProbed).
 func (o *Orchestrator) beginStop(ctx context.Context, r *Record, mode core.StopMode) {
@@ -1698,7 +1774,7 @@ func (o *Orchestrator) beginStop(ctx context.Context, r *Record, mode core.StopM
 		return
 	}
 	if r.handle == nil {
-		// No process was started, so there is no group that could be alive.
+		// No execution domain was started, so there is nothing that could be live.
 		// Stated rather than left to the field's zero value, which is
 		// unconfirmed (SPEC §9.8): this is the one place entitled to say a
 		// workspace is free without a probe, and it should have to say it.
@@ -1715,7 +1791,7 @@ func (o *Orchestrator) beginStop(ctx context.Context, r *Record, mode core.StopM
 	}()
 }
 
-// onStopped applies a finished signal ladder, for whichever asker is waiting on
+// onStopped applies a finished bounded teardown, for whichever asker is waiting on
 // it — and, when several are, orders them.
 //
 // An exit outranks a held outcome. Reconciliation can decide an issue is gone,
@@ -1733,7 +1809,7 @@ func (o *Orchestrator) onStopped(ctx context.Context, r *Record, s signal) {
 		// exactly as every other unconfirmed stop is, and the drain does not
 		// complete until it comes back confirmed.
 		if s.termination != core.TerminationConfirmed {
-			o.log.Warn("shutdown: process group not confirmed gone; retaining the claim and retrying next tick",
+			o.log.Warn("shutdown: execution domain not confirmed quiet; retaining the claim and retrying next tick",
 				"issue", r.Issue.Identifier)
 			return
 		}
@@ -1744,29 +1820,29 @@ func (o *Orchestrator) onStopped(ctx context.Context, r *Record, s signal) {
 		// SPEC §9.8: an unconfirmed termination retains the claim. A
 		// possibly-alive process must never share a workspace with a
 		// replacement, so nothing is released, nothing is disposed, nothing
-		// reads the workspace, and the ladder is walked again next tick.
+		// reads the workspace, and teardown is retried next tick.
 		if r.exiting() {
 			o.log.Warn("stop unconfirmed; retaining the claim and retrying next tick",
 				"issue", r.Issue.Identifier)
 		} else {
-			o.log.Warn("event stream closed but the process group is not confirmed gone; holding the outcome and retrying next tick",
+			o.log.Warn("event stream closed but the execution domain is not confirmed quiet; holding the outcome and retrying next tick",
 				"issue", r.Issue.Identifier)
 		}
 		return
 	}
 
-	// The group is gone: the workspace has no process left in it. That is the
+	// The domain is quiet: the workspace has no attempt process left in it. That is the
 	// one fact every asker wanted, whichever of them asked — a stop that ended a
 	// live run, the cleanup a finished one owed after Done, or the observation
 	// before it (onProbed).
 	if !r.exiting() {
-		// Nothing has asked this record to leave, so the ladder was the
+		// Nothing has asked this record to leave, so the teardown was the
 		// quiescence question and what the run reported is still what happens
 		// next.
 		o.quiet(ctx, r)
 		return
 	}
-	r.groupGone = true
+	r.domainQuiet = true
 	o.freeWorkspaceMarker(ctx, r)
 	if r.cancelRun != nil {
 		r.cancelRun()
@@ -1778,9 +1854,16 @@ func (o *Orchestrator) onStopped(ctx context.Context, r *Record, s signal) {
 	// life of the record, and reconciliation skips exiting records — so a
 	// parked issue that a human then closed or re-queued would be ignored
 	// permanently (SPEC §9.8).
-	r.stopping = false
+	//
+	// The §9.9 cause and the post-stop disposition go with it, read into the
+	// branches below first: both belong to the stop that has just finished, and
+	// this is the site that consumes them (Record.budgetStop and
+	// Record.finishAfterStop).
+	budgetStop := r.budgetStop
+	budgetPark := budgetStop && !r.finishAfterStop
+	r.stopping, r.budgetStop, r.finishAfterStop = false, false, false
 
-	if r.FailureReason == core.FailureBudgetExceeded {
+	if budgetPark {
 		// Before attemptEnded, deliberately. §9.9's park is the one attempt end that
 		// reads the branch *after* this point rather than before it, and the §6.5
 		// after-run hook runs against the same worktree under the same issue lock
@@ -1793,12 +1876,18 @@ func (o *Orchestrator) onStopped(ctx context.Context, r *Record, s signal) {
 		return
 	}
 	o.attemptEnded(ctx, r)
-	// Everything else that reaches here is an ordered exit ending a live run —
-	// reconciliation found the issue terminal, unroutable or gone — so §7.3's
-	// `killed`, "deliberate stop", is what happened to this attempt. It is stated
-	// here rather than inferred later from an empty reason, which is the same
-	// thing an attempt whose verification errored has (see onVerified).
-	o.recordAttempt(r, core.FailureKilled, VerdictUnknown)
+	// Everything else that reaches here is an ordered exit ending a live run.
+	// When that exit initiated the stop, §7.3's `killed` is the cause; when it
+	// overtook a budget stop already in flight, the cap remains the cause and the
+	// exit changes only the record's disposition.
+	reason := core.FailureKilled
+	if budgetStop {
+		// The exit changes where the record goes, not why this process was
+		// stopped. Keeping the cause makes the attempt log agree with the stop
+		// the runner actually received.
+		reason = core.FailureBudgetExceeded
+	}
+	o.recordAttempt(r, reason, VerdictUnknown)
 	if r.pending > 0 {
 		// A verifier may still be reading the workspace. Disposing under it
 		// would race the evidence check (SPEC §9.7); defer to the signal that

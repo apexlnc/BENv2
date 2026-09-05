@@ -47,6 +47,63 @@ func goDirective(gomod string) (string, bool) {
 	return moduleDirective(gomod, "go")
 }
 
+// directRequirements returns the module paths go.mod declares directly — every
+// `require` entry without an `// indirect` marker, in both the parenthesized
+// block and single-line spellings. This is only the declaration-side ownership
+// input. `// indirect` is not trusted as proof that source imports nothing from
+// the module: arch_test.go independently classifies every third-party import.
+//
+// Hand-parsed for the reason moduleDirective is. It is what anchors
+// arch_test.go's ownership tables to something outside themselves: the tables
+// can only refuse a dependency somebody already thought to list, and this is the
+// file that knows what was actually added (#243).
+//
+// Only `require` entries are read. A `replace` or `exclude` block's lines have
+// their own shapes and are never mistaken for requirements.
+func directRequirements(gomod string) []string {
+	var out []string
+	inBlock := false
+	for line := range strings.Lines(gomod) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "//") {
+			continue
+		}
+		body, comment, hasComment := strings.Cut(line, "//")
+		body = strings.TrimSpace(body)
+		fields := strings.Fields(body)
+		if !inBlock && len(fields) == 2 && fields[0] == "require" && fields[1] == "(" {
+			inBlock = true
+			continue
+		}
+		if inBlock && body == ")" {
+			inBlock = false
+			continue
+		}
+		if hasComment && isIndirectMarker(comment) {
+			// Excluded only from the direct-declaration gate. The source walk
+			// still requires any import from this module to name an owner or
+			// exemption, even before `go mod tidy` promotes the requirement.
+			continue
+		}
+		switch {
+		case inBlock && len(fields) == 2:
+			out = append(out, fields[0])
+		case !inBlock && len(fields) == 3 && fields[0] == "require":
+			out = append(out, fields[1])
+		}
+	}
+	return out
+}
+
+// isIndirectMarker reports go.mod's `// indirect` annotation, which `go mod
+// tidy` writes as the comment's first word. Matched as a word rather than by
+// substring: a prose comment mentioning indirection is not the marker, and
+// treating it as one would drop a real dependency out of the ownership check.
+func isIndirectMarker(comment string) bool {
+	fields := strings.Fields(comment)
+	return len(fields) > 0 && strings.TrimSuffix(fields[0], ";") == "indirect"
+}
+
 // isMinorLevel reports whether v is exactly MAJOR.MINOR — the shape every
 // patch release of that minor satisfies. Anything longer (1.26.1) or
 // pre-release (1.26rc1) names one toolchain and turns the rest away.
@@ -187,6 +244,68 @@ func TestGoModPolicyParsing(t *testing.T) {
 			}
 			if got := followsGoModPolicy(tc.gomod); got != tc.wantPolicy {
 				t.Errorf("followsGoModPolicy = %v, want %v", got, tc.wantPolicy)
+			}
+		})
+	}
+}
+
+// The requirement scan's negative control. Driven by the real go.mod alone, the
+// declaration-side ownership check in arch_test.go passes just as happily if
+// this parse silently returns nothing — which is the exact failure it exists to
+// prevent, arriving from the other side. Source-side completeness has its own
+// independent negative control there.
+func TestDirectRequirementParsing(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		gomod string
+		want  []string
+	}{
+		{
+			name: "block form, indirect entries excluded",
+			gomod: "module example.com/m\n\ngo 1.26\n\n" +
+				"require (\n\texample.com/a v1.0.0\n\texample.com/b v2.0.0\n)\n\n" +
+				"require (\n\texample.com/c v1.0.0 // indirect\n)\n",
+			want: []string{"example.com/a", "example.com/b"},
+		},
+		{
+			name:  "single-line form",
+			gomod: "module example.com/m\n\nrequire example.com/a v1.0.0\nrequire example.com/c v1.0.0 // indirect\n",
+			want:  []string{"example.com/a"},
+		},
+		{
+			name: "a commented-out entry is not an entry",
+			gomod: "module example.com/m\n\nrequire (\n" +
+				"\t// example.com/removed v1.0.0\n\texample.com/a v1.0.0\n)\n",
+			want: []string{"example.com/a"},
+		},
+		{
+			// The marker is a word, not a substring: this entry is direct.
+			name:  "a comment that merely mentions indirection",
+			gomod: "module example.com/m\n\nrequire (\n\texample.com/a v1.0.0 // reached indirectly by nobody\n)\n",
+			want:  []string{"example.com/a"},
+		},
+		{
+			// Neither directive is a requirement, and the module line's shape
+			// (two fields) is the block-entry shape.
+			name:  "directives outside a block are not requirements",
+			gomod: "module example.com/m\n\ngo 1.26\n\ntoolchain go1.26.1\n",
+		},
+		{
+			name: "a replace block is not a require block",
+			gomod: "module example.com/m\n\nrequire (\n\texample.com/a v1.0.0\n)\n\n" +
+				"replace (\n\texample.com/a => ../a\n)\n",
+			want: []string{"example.com/a"},
+		},
+		{
+			name:  "a major-version suffix is part of the module path",
+			gomod: "module example.com/m\n\nrequire (\n\tgithub.com/google/go-github/v90 v90.0.0\n)\n",
+			want:  []string{"github.com/google/go-github/v90"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := directRequirements(tc.gomod)
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("directRequirements = %v, want %v", got, tc.want)
 			}
 		})
 	}

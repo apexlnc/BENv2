@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -232,6 +233,23 @@ type sandboxPaths struct {
 	Workspace    string
 	SharedGitDir string
 	PrivateDir   string
+	// WorktreeAdmin is this workspace's one linked-worktree administrative
+	// directory. Git's pointer names the candidate, but it is accepted only as a
+	// real direct child of the provider-reported SharedGitDir and only when its
+	// two pointers resolve back to those reported paths. It therefore selects a
+	// narrower capability inside a trusted root; it never selects the root.
+	WorktreeAdmin string
+	// SharedGitWriteDirs is the closed set of common subdirectories a normal
+	// linked-worktree commit mutates. Each is checked as a real directory before
+	// it reaches the settings file. Keeping the shared root and its `worktrees`
+	// child out of this set is what makes later worktree registrations read-only
+	// to a sandbox that was composed before they existed.
+	SharedGitWriteDirs []string
+	// SharedGitReadFiles is the closed set of shared-repository files Git needs in
+	// addition to the mutable subdirectories above. The shared root itself must
+	// not enter allowRead: Linux srt emits that parent read-only bind after the
+	// child write binds, which would mask every one of them.
+	SharedGitReadFiles []string
 	// Binary is the absolute path Start launches, and Canonical is that path
 	// with symlinks resolved. Both are named: srt normalizes settings entries,
 	// so on this repo's own install (`~/.local/bin/claude` →
@@ -261,8 +279,11 @@ type sandboxPaths struct {
 // Two things the posture does NOT claim, stated here because a posture oversold
 // is worse than one absent:
 //
-//   - `$HOME` is not sealed. srt adds `~/.claude/debug` and `~/.npm/_logs` to
-//     its own default write paths whatever this file says.
+//   - The built-in write set is not replaced. srt adds `/tmp/claude`,
+//     `/private/tmp/claude`, `~/.claude/debug` and `~/.npm/_logs` whatever this
+//     file says. CLAUDE_CODE_TMPDIR changes the child's TMPDIR, but does not
+//     remove either fixed temp grant. Kind.LocalWrites reports all four
+//     directory trees so daemon scratch cannot be placed beneath them.
 //   - Egress allowlisting is a setting, not a boundary: the proxy matches the
 //     client-supplied hostname without terminating TLS (SPEC §10.1's design
 //     note). srt 0.0.73 does offer `tlsTerminate`, which would make it more
@@ -270,16 +291,23 @@ type sandboxPaths struct {
 //     told to trust a private CA — the same failure the darwin pin exists to
 //     avoid.
 func (p Provider) sandboxSettings(paths sandboxPaths, goos, home string) sandboxSettings {
-	// allowWrite is the set an agent legitimately mutates. The shared git dir is
-	// in it because srt does not special-case linked worktrees: BEN's `.git` is
-	// a *file* pointing into `base.git`, and without the shared dir writable
-	// `git commit` fails on `…/worktrees/<key>/index.lock`.
-	write := []string{paths.Workspace, paths.SharedGitDir, paths.PrivateDir}
+	// The common repository is deliberately not a writable root. On Linux every
+	// deny is a read-only bind mount; if its writable parent can be renamed, the
+	// mount moves with the old directory and the denied name can be recreated.
+	// Exact mutable roots leave `base.git/worktrees` read-only while preserving
+	// objects, refs, reflogs and this attempt's index/HEAD state.
+	write := []string{paths.Workspace, paths.PrivateDir}
+	write = append(write, paths.SharedGitWriteDirs...)
+	if paths.WorktreeAdmin != "" {
+		write = append(write, paths.WorktreeAdmin)
+	}
 	// allowWrite does not imply read, and a `/tmp` fixture hides it: under
-	// `denyRead: [$HOME]` with base.git writable but not readable, git reports
+	// `denyRead: [$HOME]` with Git's mutable roots writable but its common
+	// metadata not readable, git reports
 	// "not a git repository: …/worktrees/<key>". SPEC §5.2.4's default workspace
 	// root is under `$HOME`, so this is load-bearing rather than academic.
-	read := append(slices.Clone(write), paths.Binary, paths.Canonical, filepath.Dir(paths.Canonical))
+	read := append(slices.Clone(write), paths.SharedGitReadFiles...)
+	read = append(read, paths.Binary, paths.Canonical, filepath.Dir(paths.Canonical))
 	if paths.GH != "" {
 		// The credential helper runs it, and an install under the denied $HOME
 		// would otherwise be unexecutable — the same trap the harness binary's
@@ -291,6 +319,35 @@ func (p Provider) sandboxSettings(paths sandboxPaths, goos, home string) sandbox
 	// disagreeing about the same boundary.
 	read = append(read, p.AddDirs...)
 	write = append(write, p.AddDirs...)
+	denyWrite := []string{
+		// Hooks and config are code and configuration the *next* run
+		// executes, in a directory shared by every workspace of this
+		// workflow.
+		filepath.Join(paths.SharedGitDir, "hooks"),
+		filepath.Join(paths.SharedGitDir, "config"),
+		// The gitdir pointer: writable under srt by design, and §6.2
+		// reattaches, so an agent that rewrote it would choose the
+		// repository the *next* attempt puts in allowWrite.
+		filepath.Join(paths.Workspace, ".git"),
+		// BEN's own control files — an agent that can rewrite its git
+		// config can restore an `insteadOf` rewrite and redirect its next
+		// push, and one that can rewrite this settings file chooses its
+		// own sandbox.
+		paths.Control.Dir,
+	}
+	if paths.WorktreeAdmin != "" {
+		// These stable pointer/config files are not part of a commit's mutable
+		// state. commondir relocates the config, hooks, refs and objects Git
+		// uses; gitdir points back at the worktree and is consumed by Git's
+		// worktree administration; config.worktree can steer Git when the common
+		// config enables worktreeConfig. The rest stays writable: index.lock,
+		// index and logs/HEAD are genuinely rewritten by a commit.
+		denyWrite = append(denyWrite,
+			filepath.Join(paths.WorktreeAdmin, "commondir"),
+			filepath.Join(paths.WorktreeAdmin, "config.worktree"),
+			filepath.Join(paths.WorktreeAdmin, "gitdir"),
+		)
+	}
 
 	return sandboxSettings{
 		Filesystem: sandboxFilesystem{
@@ -300,22 +357,7 @@ func (p Provider) sandboxSettings(paths sandboxPaths, goos, home string) sandbox
 			// writable while the control dir inside it is not.
 			AllowWrite: dedupe(write),
 			Disabled:   false,
-			DenyWrite: dedupe([]string{
-				// Hooks and config are code and configuration the *next* run
-				// executes, in a directory shared by every workspace of this
-				// workflow.
-				filepath.Join(paths.SharedGitDir, "hooks"),
-				filepath.Join(paths.SharedGitDir, "config"),
-				// The gitdir pointer: writable under srt by design, and §6.2
-				// reattaches, so an agent that rewrote it would choose the
-				// repository the *next* attempt puts in allowWrite.
-				filepath.Join(paths.Workspace, ".git"),
-				// BEN's own control files — an agent that can rewrite its git
-				// config can restore an `insteadOf` rewrite and redirect its next
-				// push, and one that can rewrite this settings file chooses its
-				// own sandbox.
-				paths.Control.Dir,
-			}),
+			DenyWrite:  dedupe(denyWrite),
 		},
 		Network: sandboxNetwork{
 			AllowedDomains:      dedupe(append(slices.Clone(egressFloor), p.SandboxDomains...)),
@@ -460,7 +502,7 @@ func (p Provider) probeEnforcement(ctx context.Context, t harness.Timings, sandb
 	if out, err := harness.ProbeCombined(ctx, t, argv[0], env, argv[1:]...); err != nil {
 		return fmt.Errorf("%w: the runtime refused a write the posture allows, so the two "+
 			"refusals above say nothing about the policy: %v: %s",
-			ErrSandboxPosture, err, strings.TrimSpace(string(out)))
+			ErrSandboxPosture, err, harness.Excerpt(strings.TrimSpace(string(out)), harness.ProbeExcerpt))
 	}
 	return os.Remove(allowed)
 }
@@ -472,10 +514,9 @@ func (p Provider) probeEnforcement(ctx context.Context, t harness.Timings, sandb
 // dispatch — but it is the same *shape*, and the capability under test here is
 // the platform's, not the workspace's.
 func (p Provider) probeSandboxPaths(private, binary, gh string) sandboxPaths {
-	spec := core.RunSpec{Workspace: core.WorkspacePaths{
+	return p.baseSandboxPaths(core.RunSpec{Workspace: core.WorkspacePaths{
 		Path: private, SharedGitDir: private, PrivateDir: private,
-	}}
-	return p.sandboxPathsFor(spec, binary, gh)
+	}}, binary, gh)
 }
 
 // probeEgress is the behavioural half of readiness (#81 F3′): compose the real
@@ -519,7 +560,7 @@ func (p Provider) probeEgress(ctx context.Context, t harness.Timings, sandboxBin
 	// no credential: `gh api` reports the URL and the transport error.
 	return fmt.Errorf("%w: a Go client cannot reach api.github.com under this posture, so a run "+
 		"would commit and push and then fail to open a PR (§6.7): %v: %s",
-		ErrSandboxPosture, err, strings.TrimSpace(string(out)))
+		ErrSandboxPosture, err, harness.Excerpt(strings.TrimSpace(string(out)), harness.ProbeExcerpt))
 }
 
 // gitConfigFile is the global git configuration BEN owns under this posture.
@@ -545,6 +586,12 @@ func (p Provider) probeEgress(ctx context.Context, t harness.Timings, sandboxBin
 // GitHub Enterprise (WithEnterpriseURLs), so a github.com-only helper would
 // leave every Enterprise deployment unable to push. `gh` answers nothing for a
 // host it holds no token for, which is what makes the wider scope safe.
+//
+// Automatic maintenance is disabled here because the agent's git does not pass
+// through gitcmd.Argv. The deliberately narrow shared-repository write set has
+// no common-root lock files, so either modern `git maintenance --auto` or the
+// legacy auto-gc path would eventually turn a successful commit into a warning
+// or failure as the repository grows.
 func gitConfigFile(identity gitIdentity, excludes, ghBinary string) string {
 	var b strings.Builder
 	b.WriteString("# Written by BEN for one workspace (SPEC §6.2, #81). GIT_CONFIG_GLOBAL points\n")
@@ -555,6 +602,10 @@ func gitConfigFile(identity gitIdentity, excludes, ghBinary string) string {
 	fmt.Fprintf(&b, "\temail = %s\n", gitConfigValue(identity.Email))
 	b.WriteString("[core]\n")
 	fmt.Fprintf(&b, "\texcludesFile = %s\n", gitConfigValue(excludes))
+	b.WriteString("[gc]\n")
+	b.WriteString("\tauto = 0\n")
+	b.WriteString("[maintenance]\n")
+	b.WriteString("\tauto = false\n")
 	if ghBinary != "" {
 		b.WriteString("[credential]\n")
 		// The empty value resets any helper list inherited from an earlier file,
@@ -625,8 +676,33 @@ func (p Provider) writeSandbox(paths sandboxPaths, identity gitIdentity) error {
 	return nil
 }
 
-// sandboxPathsFor gathers what the posture binds for one attempt.
-func (p Provider) sandboxPathsFor(spec core.RunSpec, binary, gh string) sandboxPaths {
+// sandboxPathsFor gathers what the posture binds for one attempt. The shared
+// repository comes only from the provider (SPEC §7.1); Git's pointer can select
+// one direct child within it only after the reciprocal pointer pair is proved.
+func (p Provider) sandboxPathsFor(spec core.RunSpec, binary, gh string) (sandboxPaths, error) {
+	paths := p.baseSandboxPaths(spec, binary, gh)
+	admin, err := linkedWorktreeAdmin(spec.Workspace)
+	if err != nil {
+		return sandboxPaths{}, err
+	}
+	if err := ensureEmptyWorktreeConfig(admin); err != nil {
+		return sandboxPaths{}, err
+	}
+	writeDirs, err := sharedGitWriteDirs(spec.Workspace.SharedGitDir)
+	if err != nil {
+		return sandboxPaths{}, err
+	}
+	readFiles, err := sharedGitReadFiles(spec.Workspace.SharedGitDir)
+	if err != nil {
+		return sandboxPaths{}, err
+	}
+	paths.WorktreeAdmin = admin
+	paths.SharedGitWriteDirs = writeDirs
+	paths.SharedGitReadFiles = readFiles
+	return paths, nil
+}
+
+func (p Provider) baseSandboxPaths(spec core.RunSpec, binary, gh string) sandboxPaths {
 	// EvalSymlinks failing is not a refusal: the path came from ResolveBinary,
 	// which established it exists, and naming it twice costs nothing.
 	canonical, err := filepath.EvalSymlinks(binary)
@@ -642,6 +718,231 @@ func (p Provider) sandboxPathsFor(spec core.RunSpec, binary, gh string) sandboxP
 		GH:           gh,
 		Control:      sandboxControlFor(spec.Workspace.PrivateDir),
 	}
+}
+
+const maxGitPointerBytes = 16 << 10
+
+// linkedWorktreeAdmin accepts the workspace's pointer only as a selector inside
+// the provider-reported shared repository. That distinction is the trust
+// boundary: a rewritten pointer can make the attempt fail, but cannot add an
+// arbitrary path to allowWrite. Every accepted pointer is canonical too. A
+// path through a writable symlink that merely resolves correctly now could be
+// retargeted after the posture starts and would move Git without changing the
+// denied pointer file itself.
+func linkedWorktreeAdmin(paths core.WorkspacePaths) (string, error) {
+	worktrees := filepath.Join(paths.SharedGitDir, "worktrees")
+	if err := requireRealDir(worktrees, "linked-worktree registry"); err != nil {
+		return "", err
+	}
+
+	dotGit := filepath.Join(paths.Path, ".git")
+	admin, err := readGitPath(dotGit, "gitdir: ")
+	if err != nil {
+		return "", err
+	}
+	if err := requireRealDir(admin, "linked-worktree admin dir"); err != nil {
+		return "", err
+	}
+	resolvedAdmin, err := resolvedPath(admin)
+	if err != nil {
+		return "", fmt.Errorf("%w: resolving the linked-worktree admin dir: %v", ErrSandbox, err)
+	}
+	registry, err := resolvedPath(worktrees)
+	if err != nil {
+		return "", fmt.Errorf("%w: resolving the linked-worktree registry: %v", ErrSandbox, err)
+	}
+	if admin != resolvedAdmin {
+		return "", fmt.Errorf("%w: the workspace gitdir uses a non-canonical path", ErrSandbox)
+	}
+	if filepath.Dir(resolvedAdmin) != registry {
+		return "", fmt.Errorf("%w: the workspace gitdir is not a direct child of the reported shared git dir", ErrSandbox)
+	}
+
+	common, err := readGitPath(filepath.Join(resolvedAdmin, "commondir"), "")
+	if err != nil {
+		return "", err
+	}
+	back, err := readGitPath(filepath.Join(resolvedAdmin, "gitdir"), "")
+	if err != nil {
+		return "", err
+	}
+	shared, err := resolvedPath(paths.SharedGitDir)
+	if err != nil {
+		return "", fmt.Errorf("%w: resolving the reported shared git dir: %v", ErrSandbox, err)
+	}
+	resolvedDotGit, err := resolvedPath(dotGit)
+	if err != nil {
+		return "", fmt.Errorf("%w: resolving the workspace gitdir file: %v", ErrSandbox, err)
+	}
+	if common != shared {
+		return "", fmt.Errorf("%w: worktree commondir is not the canonical reported shared git dir", ErrSandbox)
+	}
+	if back != resolvedDotGit {
+		return "", fmt.Errorf("%w: worktree gitdir is not the canonical reported workspace", ErrSandbox)
+	}
+	return resolvedAdmin, nil
+}
+
+// ensureEmptyWorktreeConfig gives Linux srt an existing file to mount
+// read-only. Its bubblewrap backend cannot create a missing deny target after
+// this patch makes the admin directory's parent read-only. A retained config is
+// not repaired: non-empty content is executable/configuration steering state
+// from an earlier attempt, so the next run refuses it.
+func ensureEmptyWorktreeConfig(admin string) error {
+	path := filepath.Join(admin, "config.worktree")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err == nil {
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("%w: creating the empty per-worktree Git config: %v", ErrSandbox, err)
+		}
+		return nil
+	}
+	if !os.IsExist(err) {
+		return fmt.Errorf("%w: creating the empty per-worktree Git config: %v", ErrSandbox, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("%w: inspecting the per-worktree Git config: %v", ErrSandbox, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() != 0 {
+		return fmt.Errorf("%w: per-worktree Git config is not an empty regular file", ErrSandbox)
+	}
+	if !fileHasOneLink(info) {
+		return fmt.Errorf("%w: per-worktree Git config has another hard link", ErrSandbox)
+	}
+	return nil
+}
+
+// sharedGitWriteDirs returns only fixed Git stores, never the shared root or
+// its worktree registry. `logs` is created before srt starts because the first
+// commit creates the branch reflog, while Linux srt skips an allowWrite path
+// that does not exist when its mount namespace is assembled.
+func sharedGitWriteDirs(shared string) ([]string, error) {
+	logs := filepath.Join(shared, "logs")
+	if err := os.Mkdir(logs, 0o755); err != nil && !os.IsExist(err) {
+		return nil, fmt.Errorf("%w: creating the shared Git reflog dir: %v", ErrSandbox, err)
+	}
+
+	var dirs []string
+	for _, name := range []string{"objects", "refs", "logs", "reftable"} {
+		dir := filepath.Join(shared, name)
+		info, err := os.Lstat(dir)
+		if os.IsNotExist(err) && name == "reftable" {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: inspecting shared Git %s dir: %v", ErrSandbox, name, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return nil, fmt.Errorf("%w: shared Git %s path is not a real directory", ErrSandbox, name)
+		}
+		dirs = append(dirs, dir)
+	}
+	return dirs, nil
+}
+
+// sharedGitReadFiles exposes Git's required shared metadata without a parent
+// bind over the mutable children. `info/exclude` is read by ordinary status and
+// add operations even when empty. Optional packed-refs is included only when
+// present; a later daemon-side pack cannot turn an older sandbox's fixed
+// settings into a new read grant.
+func sharedGitReadFiles(shared string) ([]string, error) {
+	var files []string
+	for _, entry := range []struct {
+		name     string
+		required bool
+	}{
+		{"config", true},
+		{"HEAD", true},
+		{filepath.Join("info", "exclude"), true},
+		{"packed-refs", false},
+	} {
+		path := filepath.Join(shared, entry.name)
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) && !entry.required {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: inspecting shared Git %s: %v", ErrSandbox, entry.name, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("%w: shared Git %s is not a regular file", ErrSandbox, entry.name)
+		}
+		if !fileHasOneLink(info) {
+			return nil, fmt.Errorf("%w: shared Git %s has another hard link", ErrSandbox, entry.name)
+		}
+		files = append(files, path)
+	}
+	return files, nil
+}
+
+func requireRealDir(path, what string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("%w: inspecting %s: %v", ErrSandbox, what, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("%w: %s is not a real directory", ErrSandbox, what)
+	}
+	return nil
+}
+
+// readGitPath reads one of Git's one-line path files without letting corrupt
+// retained state allocate an unbounded buffer. The contents are never included
+// in an error because a prior attempt could have authored them.
+func readGitPath(path, prefix string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("%w: inspecting Git path file %s: %v", ErrSandbox, filepath.Base(path), err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: Git path file %s is not a regular file", ErrSandbox, filepath.Base(path))
+	}
+	// A read-only mount protects one name, not every name for the same inode.
+	// Refuse a retained hard link before an agent can rewrite this pointer
+	// through an alias in its writable workspace.
+	if !fileHasOneLink(info) {
+		return "", fmt.Errorf("%w: Git path file %s has another hard link", ErrSandbox, filepath.Base(path))
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("%w: opening Git path file %s: %v", ErrSandbox, filepath.Base(path), err)
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxGitPointerBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("%w: reading Git path file %s: %v", ErrSandbox, filepath.Base(path), err)
+	}
+	if len(raw) > maxGitPointerBytes {
+		return "", fmt.Errorf("%w: Git path file %s is too large", ErrSandbox, filepath.Base(path))
+	}
+	value := strings.TrimSuffix(string(raw), "\n")
+	value = strings.TrimSuffix(value, "\r")
+	if prefix != "" {
+		if !strings.HasPrefix(value, prefix) {
+			return "", fmt.Errorf("%w: Git path file %s has an invalid prefix", ErrSandbox, filepath.Base(path))
+		}
+		value = strings.TrimPrefix(value, prefix)
+	}
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") {
+		return "", fmt.Errorf("%w: Git path file %s is not one path", ErrSandbox, filepath.Base(path))
+	}
+	if !filepath.IsAbs(value) {
+		value = filepath.Join(filepath.Dir(path), value)
+	}
+	abs, err := filepath.Abs(value)
+	if err != nil {
+		return "", fmt.Errorf("%w: resolving Git path file %s: %v", ErrSandbox, filepath.Base(path), err)
+	}
+	return filepath.Clean(abs), nil
+}
+
+func resolvedPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
 }
 
 // checkSandboxMode refuses an unknown posture. The refused value travels as
@@ -717,15 +1018,15 @@ func checkSandboxPostures(p Provider, publish core.PublishCredential) error {
 
 // checkSandboxSpec refuses an `srt` run the provider reported no shared git dir
 // for. Deriving one is forbidden (SPEC §7.1) and guessing one would put a
-// repository nobody named into allowWrite, so a refusal is the only answer left
-// — and without it `git commit` fails inside the workspace anyway, one attempt
-// at a time.
+// repository nobody named into the sandbox grants, so a refusal is the only
+// answer left — and without its mutable stores and fixed metadata `git commit`
+// fails inside the workspace anyway, one attempt at a time.
 func (p Provider) checkSandboxSpec(spec core.RunSpec) error {
 	if p.SandboxMode != SandboxSRT || spec.Workspace.SharedGitDir != "" {
 		return nil
 	}
-	return fmt.Errorf("%w: sandbox_mode %s must make the shared git dir writable — a linked "+
-		"worktree's .git is a pointer into it, so `git commit` fails without it — and this "+
+	return fmt.Errorf("%w: sandbox_mode %s must grant the required paths inside the shared git "+
+		"dir — a linked worktree's .git is a pointer into it, so `git commit` fails without them — and this "+
 		"adapter may not discover it from inside the worktree (SPEC §6.1, §7.1)",
 		ErrSharedGitDir, SandboxSRT)
 }

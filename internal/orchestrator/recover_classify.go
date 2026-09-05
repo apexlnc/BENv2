@@ -298,7 +298,7 @@ func classifyRecoveryTrackerGates(
 
 // classifyRecoveryClaimBase is the safety precondition between tracker gates
 // 1–4 and the existing projection/evidence table. resolved=false is the sole
-// authorizing answer: a matching positive pinned pair may continue. Every other
+// authorizing answer: a matching positive pinned tuple may continue. Every other
 // state resolves without asking §9.7.
 func classifyRecoveryClaimBase(
 	anchor int64,
@@ -311,7 +311,7 @@ func classifyRecoveryClaimBase(
 	if readErr != nil {
 		return epochFaultRecovery(anchor, "claim-base state is unreadable"), true
 	}
-	if state.State == core.ClaimBasePinned && state.Epoch == anchor && state.BaseSHA != "" {
+	if claimBasePinsEpoch(state, anchor) {
 		return recoveryVerdict{}, false
 	}
 	if state.State == core.ClaimBasePending && state.Epoch == anchor {

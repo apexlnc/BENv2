@@ -2,10 +2,13 @@ package workspace
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,12 +16,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 	"github.com/srhg-ai-7cef3f93/ben/internal/fake"
+	"github.com/srhg-ai-7cef3f93/ben/internal/gitcmd"
+	"github.com/srhg-ai-7cef3f93/ben/internal/gitremote"
 )
 
 // TestMain pins git to a hermetic configuration: no user/system config, a
@@ -62,16 +68,53 @@ type fixture struct {
 }
 
 func newFixture(t *testing.T) *fixture {
+	return newFixtureWithObjectFormat(t, "")
+}
+
+func newFixtureWithObjectFormat(t *testing.T, format string) *fixture {
 	t.Helper()
 	dir := t.TempDir()
 	seed := filepath.Join(dir, "seed")
-	runGit(t, dir, "init", "--quiet", "-b", "main", seed)
+	initArgs := []string{"init", "--quiet", "-b", "main"}
+	if format != "" {
+		initArgs = append(initArgs, "--object-format="+format)
+	}
+	runGit(t, dir, append(initArgs, seed)...)
 	writeFile(t, filepath.Join(seed, "README.md"), "seed\n")
 	runGit(t, seed, "add", ".")
 	runGit(t, seed, "commit", "--quiet", "-m", "seed")
 	origin := filepath.Join(dir, "origin.git")
 	runGit(t, dir, "clone", "--quiet", "--bare", seed, origin)
 	return &fixture{origin: origin, seed: seed}
+}
+
+// BEN forwards TMPDIR to local agents, so it is an agent-writable root rather
+// than a place the daemon can stage configuration for a credentialed process.
+// The scratch repository must live in a separately supplied daemon-only tree.
+func TestRemoteScratchIsOutsideForwardedTMPDIR(t *testing.T) {
+	f := newFixture(t)
+	agentTmp := t.TempDir()
+	p, err := New(Options{
+		Root: t.TempDir(), WorkflowKey: "wf", ScratchRoot: t.TempDir(), AgentTempRoot: agentTmp,
+		Repository: repo(f.origin), Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", agentTmp)
+
+	repo, cleanup, err := p.temporaryRemoteRepository(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	scratch := filepath.Dir(repo)
+	if !strictlyUnder(normalizePath(scratch), normalizePath(p.scratchRoot)) {
+		t.Fatalf("remote scratch %s is not under daemon scratch root %s", scratch, p.scratchRoot)
+	}
+	if samePath(scratch, agentTmp) || strictlyUnder(normalizePath(scratch), normalizePath(agentTmp)) {
+		t.Fatalf("remote scratch %s is inside agent-writable TMPDIR %s", scratch, agentTmp)
+	}
 }
 
 func (f *fixture) head(t *testing.T) string {
@@ -118,11 +161,23 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+func providerFromOptions(t *testing.T, opts Options) (*Provider, error) {
+	t.Helper()
+	if opts.ScratchRoot == "" {
+		opts.ScratchRoot = t.TempDir()
+	}
+	if opts.AgentTempRoot == "" {
+		opts.AgentTempRoot = t.TempDir()
+	}
+	return New(opts)
+}
+
 func newProvider(t *testing.T, f *fixture, hooks Hooks) *Provider {
 	t.Helper()
-	p, err := New(Options{
+	p, err := providerFromOptions(t, Options{
 		Root:        t.TempDir(),
 		WorkflowKey: "wf",
+		ScratchRoot: t.TempDir(),
 		// A credential source is set even though file remotes never consult the
 		// credential: every test then exercises the per-invocation resolution
 		// and the credential-helper argv/env plumbing.
@@ -139,9 +194,275 @@ func newProvider(t *testing.T, f *fixture, hooks Hooks) *Provider {
 	return p
 }
 
+func branchFrom(t *testing.T, f *fixture, branch, parent string) string {
+	t.Helper()
+	sha := runGit(t, f.origin, "commit-tree", parent+"^{tree}", "-p", parent, "-m", "seed "+branch)
+	runGit(t, f.origin, "update-ref", "refs/heads/"+branch, sha)
+	return sha
+}
+
 func issue(id string) core.Issue { return core.Issue{Identifier: id} }
 
 const testClaimEpoch int64 = 101
+
+func TestReadyAuthenticatesAndRequiresTheSelectedBranch(t *testing.T) {
+	parallel(t)
+	f := newFixture(t)
+	release := branchFrom(t, f, "release/v2", f.head(t))
+	if release == "" {
+		t.Fatal("release fixture has no head")
+	}
+	auth := fake.NewRemoteAuth("x-access-token", "ready-token")
+	p, err := providerFromOptions(t, Options{
+		Root: t.TempDir(), WorkflowKey: "wf",
+		Repository: core.Repository{RemoteURL: f.origin, AuthSource: auth},
+		BaseBranch: "release/v2", Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Ready(context.Background()); err != nil {
+		t.Fatalf("Ready(configured branch): %v", err)
+	}
+	if auth.Calls() == 0 {
+		t.Fatal("Ready did not obtain the remote credential")
+	}
+
+	missing, err := providerFromOptions(t, Options{
+		Root: t.TempDir(), WorkflowKey: "wf",
+		Repository: core.Repository{RemoteURL: f.origin, AuthSource: fake.NewRemoteAuth("x-access-token", "ready-token")},
+		BaseBranch: "valid-but-absent", Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := missing.Ready(context.Background()); !errors.Is(err, ErrBaseBranchNotFound) {
+		t.Fatalf("Ready(absent branch) = %v, want ErrBaseBranchNotFound", err)
+	}
+
+	runGit(t, f.origin, "symbolic-ref", "HEAD", "refs/heads/absent-default")
+	omitted, err := providerFromOptions(t, Options{
+		Root: t.TempDir(), WorkflowKey: "wf",
+		Repository: core.Repository{RemoteURL: f.origin}, Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := omitted.Ready(context.Background()); !errors.Is(err, ErrBaseBranchNotFound) {
+		t.Fatalf("Ready(absent repository default) = %v, want ErrBaseBranchNotFound", err)
+	}
+	runGit(t, f.origin, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	branchFrom(t, f, "ben/7", f.head(t))
+	runGit(t, f.origin, "symbolic-ref", "HEAD", "refs/heads/ben/7")
+	reserved, err := providerFromOptions(t, Options{
+		Root: t.TempDir(), WorkflowKey: "wf",
+		Repository: core.Repository{RemoteURL: f.origin}, Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reserved.Ready(context.Background()); !errors.Is(err, ErrBaseBranchReserved) {
+		t.Fatalf("Ready(reserved repository default) = %v, want ErrBaseBranchReserved", err)
+	}
+	runGit(t, f.origin, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	credentialErr := errors.New("credential unavailable")
+	failingAuth := fake.NewRemoteAuth("x-access-token", "unused")
+	failingAuth.Err = credentialErr
+	blocked, err := providerFromOptions(t, Options{
+		Root: t.TempDir(), WorkflowKey: "wf",
+		Repository: core.Repository{RemoteURL: f.origin, AuthSource: failingAuth},
+		BaseBranch: "release/v2", Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blocked.Ready(context.Background()); !errors.Is(err, credentialErr) {
+		t.Fatalf("Ready credential failure = %v, want original error preserved", err)
+	}
+}
+
+func TestConfiguredTargetSeedsFreshWorkButNeverOverridesAnIssueBranch(t *testing.T) {
+	parallel(t)
+	f := newFixture(t)
+	main := f.head(t)
+	release := branchFrom(t, f, "release/v2", main)
+	p, err := providerFromOptions(t, Options{
+		Root: t.TempDir(), WorkflowKey: "wf", Repository: repo(f.origin),
+		BaseBranch: "release/v2", Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fresh := issue("7")
+	if err := p.BeginClaimBase(context.Background(), fresh, 1); err != nil {
+		t.Fatal(err)
+	}
+	ws, _, err := p.PrepareClaim(context.Background(), fresh, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.BaseSHA != release || ws.TargetBranch != "release/v2" || runGit(t, ws.Path, "rev-parse", "HEAD") != release {
+		t.Fatalf("fresh workspace = %+v at %s, want release/v2 at %s", ws, runGit(t, ws.Path, "rev-parse", "HEAD"), release)
+	}
+
+	existingHead := branchFrom(t, f, "ben/8", main)
+	existing := issue("8")
+	if err := p.BeginClaimBase(context.Background(), existing, 2); err != nil {
+		t.Fatal(err)
+	}
+	reattached, _, err := p.PrepareClaim(context.Background(), existing, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reattached.BaseSHA != existingHead || reattached.TargetBranch != "release/v2" ||
+		runGit(t, reattached.Path, "rev-parse", "HEAD") != existingHead {
+		t.Fatalf("reattached workspace = %+v, want issue head %s and target release/v2", reattached, existingHead)
+	}
+}
+
+func TestClaimTargetSurvivesRetryRollbackReloadRestartAndDefaultMovement(t *testing.T) {
+	parallel(t)
+	ctx := context.Background()
+	f := newFixture(t)
+	p := newProvider(t, f, Hooks{})
+	iss := issue("7")
+	if err := p.BeginClaimBase(ctx, iss, 1); err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := p.PrepareClaim(ctx, iss, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.TargetBranch != "main" {
+		t.Fatalf("first target = %q, want main", first.TargetBranch)
+	}
+
+	trunk := branchFrom(t, f, "trunk", f.head(t))
+	runGit(t, f.origin, "symbolic-ref", "HEAD", "refs/heads/trunk")
+	retry, _, err := p.PrepareClaim(ctx, iss, 2, 1)
+	if err != nil || retry.TargetBranch != "main" {
+		t.Fatalf("retry after default movement = %+v, %v; want retained main", retry, err)
+	}
+
+	reloaded, err := providerFromOptions(t, Options{
+		Root: p.root, WorkflowKey: "wf", Repository: repo(f.origin),
+		BaseBranch: "trunk", Locks: p.LockDomain(), Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, _, err := reloaded.PrepareClaim(ctx, iss, 3, 1)
+	if err != nil || restarted.TargetBranch != "main" {
+		t.Fatalf("reloaded same epoch = %+v, %v; want retained main", restarted, err)
+	}
+
+	if err := reloaded.BeginClaimBase(ctx, iss, 2); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := reloaded.ClaimBase(ctx, iss)
+	if err != nil || pending.OutgoingTargetBranch != "main" {
+		t.Fatalf("pending rollover = %+v, %v; want outgoing main", pending, err)
+	}
+	if err := reloaded.AbandonPendingClaimBase(ctx, iss); err != nil {
+		t.Fatal(err)
+	}
+	rolledBack, err := reloaded.ClaimBase(ctx, iss)
+	if err != nil || rolledBack.TargetBranch != "main" {
+		t.Fatalf("rolled-back pin = %+v, %v; want main", rolledBack, err)
+	}
+
+	if err := reloaded.BeginClaimBase(ctx, iss, 3); err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := reloaded.PrepareClaim(ctx, iss, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.TargetBranch != "trunk" {
+		t.Fatalf("new epoch target = %q, want trunk", next.TargetBranch)
+	}
+	if trunk == "" {
+		t.Fatal("trunk fixture has no head")
+	}
+}
+
+func TestLegacyTargetlessClaimIsNonAuthorizingUntilALaterEpoch(t *testing.T) {
+	parallel(t)
+	ctx := context.Background()
+	f := newFixture(t)
+	release := branchFrom(t, f, "release/v2", f.head(t))
+	p := newProvider(t, f, Hooks{})
+	iss := issue("7")
+	if err := p.BeginClaimBase(ctx, iss, 1); err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := p.PrepareClaim(ctx, iss, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := fmt.Sprintf(`{"version":1,"state":"pinned","epoch":1,"base_sha":%q}`, first.BaseSHA)
+	if err := os.WriteFile(p.claimBasePath(first.Key), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyState, err := p.ClaimBase(ctx, iss)
+	if !errors.Is(err, ErrClaimTargetUnrecorded) {
+		t.Fatalf("ClaimBase(legacy) = %v, want ErrClaimTargetUnrecorded", err)
+	}
+	if legacyState.State != core.ClaimBasePinned || legacyState.Epoch != 1 ||
+		legacyState.BaseSHA != first.BaseSHA || legacyState.TargetBranch != "" {
+		t.Fatalf("ClaimBase(legacy) state = %+v, want the non-authorizing epoch/base for upgrade", legacyState)
+	}
+	if _, _, err := p.PrepareClaim(ctx, iss, 2, 1); !errors.Is(err, ErrClaimTargetUnrecorded) {
+		t.Fatalf("PrepareClaim(same legacy epoch) = %v, want ErrClaimTargetUnrecorded", err)
+	}
+	if err := p.BeginClaimBase(ctx, iss, 1); !errors.Is(err, ErrClaimTargetUnrecorded) {
+		t.Fatalf("BeginClaimBase(same legacy epoch) = %v, want ErrClaimTargetUnrecorded", err)
+	}
+	if err := os.Chmod(p.claimBaseDir(), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := p.BeginClaimBase(ctx, iss, 2)
+	if err := os.Chmod(p.claimBaseDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if writeErr == nil {
+		t.Fatal("BeginClaimBase succeeded while the claim store refused its replacement write")
+	}
+	afterFailure, err := p.ClaimBase(ctx, iss)
+	if !errors.Is(err, ErrClaimTargetUnrecorded) || afterFailure != legacyState {
+		t.Fatalf("ClaimBase after failed legacy upgrade = %+v, %v; want unchanged %+v and ErrClaimTargetUnrecorded",
+			afterFailure, err, legacyState)
+	}
+
+	upgraded, err := providerFromOptions(t, Options{
+		Root: p.root, WorkflowKey: "wf", Repository: repo(f.origin),
+		BaseBranch: "release/v2", Locks: p.LockDomain(), Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upgraded.BeginClaimBase(ctx, iss, 2); err != nil {
+		t.Fatalf("BeginClaimBase(later epoch): %v", err)
+	}
+	next, prior, err := upgraded.PrepareClaim(ctx, iss, 1, 2)
+	if err != nil {
+		t.Fatalf("PrepareClaim(later epoch): %v", err)
+	}
+	if next.TargetBranch != "release/v2" || next.BaseSHA == "" || release == "" {
+		t.Fatalf("upgraded workspace = %+v, want complete release/v2 pin", next)
+	}
+	if prior.BaseSHA != first.BaseSHA {
+		t.Fatalf("outgoing legacy base = %s, want %s", prior.BaseSHA, first.BaseSHA)
+	}
+	state, err := upgraded.ClaimBase(ctx, iss)
+	if err != nil || state.TargetBranch != "release/v2" {
+		t.Fatalf("upgraded ClaimBase = %+v, %v", state, err)
+	}
+}
 
 // prepareForTest gives pre-claim-epoch workspace tests the production ordering:
 // pending is durable before prepare, and prepare receives the expected tracker
@@ -208,6 +529,115 @@ func TestNewValidation(t *testing.T) {
 	}
 }
 
+func TestNewRequiresAnIsolatedScratchRoot(t *testing.T) {
+	parallel(t)
+	root := t.TempDir()
+	agentTmp := t.TempDir()
+	extraWritable := t.TempDir()
+	validScratch := t.TempDir()
+	for _, tt := range []struct {
+		name       string
+		scratch    string
+		agentRoots []string
+	}{
+		{name: "missing"},
+		{name: "relative", scratch: "state"},
+		{name: "workspace root", scratch: root},
+		{name: "inside workspace root", scratch: filepath.Join(root, "state")},
+		{name: "contains workspace root", scratch: filepath.Dir(root)},
+		{name: "agent TMPDIR", scratch: agentTmp},
+		{name: "relative agent writable root", scratch: validScratch, agentRoots: []string{"relative"}},
+		{name: "filesystem-wide agent access", scratch: validScratch, agentRoots: []string{"/"}},
+		{name: "agent writable root is scratch", scratch: extraWritable, agentRoots: []string{extraWritable}},
+		{name: "agent writable root contains scratch", scratch: filepath.Join(extraWritable, "state"), agentRoots: []string{extraWritable}},
+		{name: "scratch contains agent writable root", scratch: extraWritable, agentRoots: []string{filepath.Join(extraWritable, "agent")}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p, err := New(Options{
+				Root: root, WorkflowKey: "wf", ScratchRoot: tt.scratch, AgentTempRoot: agentTmp,
+				AgentWrites: core.LocalWriteScope{Roots: tt.agentRoots}, Repository: repo("/canonical.git"),
+			})
+			if !errors.Is(err, ErrScratchRoot) {
+				t.Fatalf("New(ScratchRoot=%q) = (%v, %v), want ErrScratchRoot", tt.scratch, p, err)
+			}
+			if p != nil {
+				t.Fatal("New returned a provider alongside a scratch-root refusal")
+			}
+		})
+	}
+
+	if p, err := New(Options{
+		Root: root, WorkflowKey: "wf", ScratchRoot: t.TempDir(), AgentTempRoot: agentTmp,
+		Repository: repo("/canonical.git"),
+	}); err != nil || p == nil {
+		t.Fatalf("New(disjoint ScratchRoot) = (%v, %v), want accepted", p, err)
+	}
+	if p, err := New(Options{
+		Root: root, WorkflowKey: "wf", ScratchRoot: t.TempDir(), AgentTempRoot: agentTmp,
+		AgentWrites: core.LocalWriteScope{Unbounded: true}, Repository: repo("/canonical.git"),
+	}); err != nil || p == nil {
+		t.Fatalf("New(unbounded agent declaration) = (%v, %v), want accepted for an externally bounded or accepted deployment", p, err)
+	}
+	if p, err := New(Options{
+		Root: root, WorkflowKey: "wf", ScratchRoot: t.TempDir(), AgentTempRoot: agentTmp,
+		AgentWrites: core.LocalWriteScope{Unbounded: true, Roots: []string{"/"}}, Repository: repo("/canonical.git"),
+	}); !errors.Is(err, ErrScratchRoot) || p != nil {
+		t.Fatalf("New(mixed unbounded and concrete scope) = (%v, %v), want ErrScratchRoot", p, err)
+	}
+}
+
+// Validation resolves a symlinked scratch root once and the provider retains
+// that resolved path. If it retained the original spelling, an agent able to
+// replace the link after New could steer daemon-created Git config back into
+// its own writable tree before the credentialed process starts.
+func TestRemoteScratchPinsAValidatedSymlinkTarget(t *testing.T) {
+	parallel(t)
+	root := t.TempDir()
+	agentTmp := t.TempDir()
+	agentWritable := t.TempDir()
+	daemonScratch := t.TempDir()
+	link := filepath.Join(agentWritable, "scratch")
+	if err := os.Symlink(daemonScratch, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	p, err := New(Options{
+		Root: root, WorkflowKey: "wf", ScratchRoot: link, AgentTempRoot: agentTmp,
+		AgentWrites: core.LocalWriteScope{Roots: []string{agentWritable}}, Repository: repo("/canonical.git"),
+	})
+	if err != nil {
+		t.Fatalf("New with a safely resolved scratch link: %v", err)
+	}
+	if p.scratchRoot != normalizePath(daemonScratch) {
+		t.Fatalf("stored scratch root = %q, want resolved target %q", p.scratchRoot, normalizePath(daemonScratch))
+	}
+
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	redirected := filepath.Join(agentWritable, "redirected")
+	if err := os.Mkdir(redirected, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(redirected, link); err != nil {
+		t.Fatal(err)
+	}
+	repo, cleanup, err := p.temporaryRemoteRepository(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if !strictlyUnder(normalizePath(repo), normalizePath(daemonScratch)) {
+		t.Fatalf("remote repository %q escaped validated scratch target %q", repo, daemonScratch)
+	}
+	entries, err := os.ReadDir(redirected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("substituted target received daemon files: %v", entries)
+	}
+}
+
 // Canary tokens: RemoteURL reaches git as argv and base.git's `origin`, so the
 // refusal's own message is a publication seam of its own (SPEC §10.2; #52).
 const (
@@ -265,7 +695,7 @@ func TestNewRefusesEmbeddedCredentials(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := New(Options{Root: "/tmp/x", WorkflowKey: "wf", Repository: repo(tt.url)})
+			p, err := providerFromOptions(t, Options{Root: "/tmp/x", WorkflowKey: "wf", Repository: repo(tt.url)})
 			if !errors.Is(err, ErrRemoteCredentials) {
 				t.Fatalf("New(%q) error = %v, want ErrRemoteCredentials", tt.url, err)
 			}
@@ -306,7 +736,7 @@ func TestNewRefusesTransportHelperRemotes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := New(Options{Root: "/tmp/x", WorkflowKey: "wf", Repository: repo(tt.url)})
+			p, err := providerFromOptions(t, Options{Root: "/tmp/x", WorkflowKey: "wf", Repository: repo(tt.url)})
 			if !errors.Is(err, ErrTransportHelperRemote) {
 				t.Fatalf("New(%q) error = %v, want ErrTransportHelperRemote", tt.url, err)
 			}
@@ -373,7 +803,7 @@ func TestNewAcceptsCredentialFreeRemotes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := New(Options{Root: "/tmp/x", WorkflowKey: "wf", Repository: repo(tt.url)}); err != nil {
+			if _, err := providerFromOptions(t, Options{Root: "/tmp/x", WorkflowKey: "wf", Repository: repo(tt.url)}); err != nil {
 				t.Errorf("New(%q) = %v, want accepted", tt.url, err)
 			}
 		})
@@ -397,7 +827,7 @@ func TestNewRefusesBeforeTouchingTheTree(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			root := t.TempDir()
-			if _, err := New(Options{Root: root, WorkflowKey: "wf", Repository: repo(tt.remote)}); !errors.Is(err, tt.want) {
+			if _, err := providerFromOptions(t, Options{Root: root, WorkflowKey: "wf", Repository: repo(tt.remote)}); !errors.Is(err, tt.want) {
 				t.Fatalf("New error = %v, want %v", err, tt.want)
 			}
 			entries, err := os.ReadDir(root)
@@ -500,7 +930,7 @@ func TestRetryReattachesBranchAndKeepsCommits(t *testing.T) {
 	if err := p.Dispose(ctx, ws2, false); err != nil {
 		t.Fatalf("Dispose: %v", err)
 	}
-	p2, err := New(Options{Root: p.root, WorkflowKey: "wf", Repository: core.Repository{RemoteURL: f.origin}, Logger: quietLogger()})
+	p2, err := providerFromOptions(t, Options{Root: p.root, WorkflowKey: "wf", Repository: core.Repository{RemoteURL: f.origin}, Logger: quietLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -776,7 +1206,7 @@ func TestHookFailureSemantics(t *testing.T) {
 		// corrected config) must re-run the bootstrap, not silently reuse
 		// the half-built workspace.
 		marker := filepath.Join(t.TempDir(), "bootstrap.ran")
-		p2, err := New(Options{
+		p2, err := providerFromOptions(t, Options{
 			Root: p.root, WorkflowKey: "wf", Repository: repo(f.origin),
 			Hooks:  Hooks{AfterCreate: fmt.Sprintf("touch %q", marker)},
 			Logger: quietLogger(),
@@ -1103,7 +1533,7 @@ func TestConcurrentPrepareSingleWorkspace(t *testing.T) {
 func TestRemoteCredentialRedaction(t *testing.T) {
 	parallel(t)
 	auth := fake.NewRemoteAuth("x-access-token", "sekret123")
-	p, err := New(Options{
+	p, err := providerFromOptions(t, Options{
 		Root:        t.TempDir(),
 		WorkflowKey: "wf",
 		// Port 1 refuses instantly; the fetch fails without a network.
@@ -1133,7 +1563,7 @@ func TestRedactionFollowsRotation(t *testing.T) {
 	parallel(t)
 	const before, after = "sekret-before-rotation", "sekret-after-rotation"
 	auth := fake.NewRemoteAuth("x-access-token", before)
-	p, err := New(Options{
+	p, err := providerFromOptions(t, Options{
 		Root:        t.TempDir(),
 		WorkflowKey: "wf",
 		Repository:  core.Repository{RemoteURL: "https://127.0.0.1:1/none.git", AuthSource: auth},
@@ -1211,18 +1641,19 @@ func (a *refusingAuth) Auth(context.Context) (core.RemoteAuth, error) {
 // The credential helper delivers the secret to git through the environment;
 // `git credential fill` exercises the exact helper + env plumbing remoteGit
 // uses, without a network.
+//
+// The helper answers only for the configured remote's protocol and host (#230),
+// so the request here names the remote this provider is built for. That the
+// helper *refuses* every other host is gitremote's to prove, over the shell it
+// owns; what this holds is the pairing — this provider's remote, this
+// provider's scope, one credential fill that succeeds.
 func TestAuthCredentialHelper(t *testing.T) {
 	parallel(t)
+	const remote = "https://example.invalid/o/r.git"
 	cmd := exec.Command("git",
-		"-c", "credential.helper=",
-		"-c", "credential.helper="+gitCredentialHelper,
-		"credential", "fill")
+		append(gitremote.CredentialConfig(), "credential", "fill")...)
 	cmd.Dir = t.TempDir()
-	cmd.Env = append(os.Environ(),
-		"BEN_REMOTE_USERNAME=x-access-token",
-		"BEN_REMOTE_PASSWORD=sekret123",
-		"GIT_TERMINAL_PROMPT=0",
-	)
+	cmd.Env = append(gitcmd.RemoteEnv(), gitremote.CredentialEnv(remote, "x-access-token", "sekret123")...)
 	cmd.Stdin = strings.NewReader("protocol=https\nhost=example.invalid\npath=o/r.git\n\n")
 	out, err := cmd.Output()
 	if err != nil {
@@ -1237,6 +1668,158 @@ func TestAuthCredentialHelper(t *testing.T) {
 		if strings.Contains(arg, "sekret123") {
 			t.Errorf("credential appears in argv: %q", arg)
 		}
+	}
+}
+
+// TestRemoteGitScopesTheCredentialToTheConfiguredRemote is #230's anchor at this
+// package's own boundary: what the provider hands the operating system.
+//
+// gitremote proves the helper refuses a foreign host. It cannot prove that *this*
+// provider tells it which host is its own — a caller that passed an empty remote,
+// or another provider's, would leave that suite green while every request went
+// unanswered or, worse, answered for somebody else's host. So the assertion here
+// is over the recorded argv and environment of a real `remoteGit`, not over a
+// composer the call site is free to stop using.
+//
+// The environment is read from the child rather than from the composer for the
+// same reason installGitRecorder reads argv there (AGENTS.md, Conventions).
+func TestRemoteGitScopesTheCredentialToTheConfiguredRemote(t *testing.T) {
+	const (
+		remote   = "https://forge.test:8443/acme/widgets.git"
+		password = "scope-token"
+	)
+	p, err := providerFromOptions(t, Options{
+		Root: t.TempDir(), WorkflowKey: "wf",
+		Repository: core.Repository{
+			RemoteURL:  remote,
+			AuthSource: fake.NewRemoteAuth("x-access-token", password),
+		},
+		Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	invocation := installGitProbe(t)
+	if _, err := p.remoteGit(context.Background(), dir, "ls-remote", "--", remote, "HEAD"); err != nil {
+		t.Fatalf("remoteGit: %v", err)
+	}
+	argv, env := invocation()
+
+	if !slices.Contains(argv, "credential.helper="+gitremote.CredentialHelper) {
+		t.Errorf("git %s\n  does not install the scoped credential helper",
+			strings.Join(argv, " "))
+	}
+	if !slices.Contains(argv, "credential.helper=") {
+		t.Errorf("git %s\n  does not clear the inherited helper list first, so an ambient helper "+
+			"on the daemon host could answer instead", strings.Join(argv, " "))
+	}
+	// Derived from the configured remote, and spelled as git spells the request:
+	// the port is part of the host.
+	for _, want := range []struct{ key, value string }{
+		{gitremote.EnvProtocol, "https"},
+		{gitremote.EnvHost, "forge.test:8443"},
+		{gitremote.EnvUsername, "x-access-token"},
+		{gitremote.EnvPassword, password},
+	} {
+		if got := env[want.key]; got != want.value {
+			t.Errorf("child %s = %q, want %q", want.key, got, want.value)
+		}
+	}
+	// The credential is delivered by environment alone (SPEC §10.2).
+	for _, arg := range argv {
+		if strings.Contains(arg, password) {
+			t.Errorf("the credential reached argv, where `ps` can read it: %q", arg)
+		}
+	}
+}
+
+// installGitProbe puts a `git` in front of the real one on PATH that records one
+// invocation's argv and credential environment and exits without running git.
+//
+// Separate from installGitRecorder, which execs the real git and keeps argv
+// only: this one must read the child's *environment*, and it must not run a
+// remote git at all — the invocations it stands in front of contact a remote
+// that does not exist.
+func installGitProbe(t *testing.T) func() (argv []string, env map[string]string) {
+	t.Helper()
+	dir := t.TempDir()
+	record := filepath.Join(dir, "invocation")
+	// One record, fields separated by US (\037), written under a single
+	// redirection so a partial file cannot read as a complete invocation. The
+	// variable names are the exported constants: a rename that CredentialEnv and
+	// the shell agreed on but this did not leaves the reads empty and fails here.
+	var script strings.Builder
+	script.WriteString("#!/bin/sh\n{\nprintf 'arg=%s\\037' \"$@\"\n")
+	for _, name := range []string{
+		gitremote.EnvProtocol, gitremote.EnvHost, gitremote.EnvUsername, gitremote.EnvPassword,
+	} {
+		fmt.Fprintf(&script, "printf 'env=%s=%%s\\037' \"$%s\"\n", name, name)
+	}
+	fmt.Fprintf(&script, "} > %s\n", shellQuote(record))
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script.String()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	return func() ([]string, map[string]string) {
+		raw, err := os.ReadFile(record)
+		if err != nil {
+			t.Fatalf("the probe recorded nothing, so this test asserts nothing: %v", err)
+		}
+		var argv []string
+		env := map[string]string{}
+		for _, field := range strings.Split(strings.TrimSuffix(string(raw), "\x1f"), "\x1f") {
+			switch key, value, _ := strings.Cut(field, "="); key {
+			case "arg":
+				argv = append(argv, value)
+			case "env":
+				name, v, _ := strings.Cut(value, "=")
+				env[name] = v
+			}
+		}
+		return argv, env
+	}
+}
+
+// A credential source and a remote git would authenticate to in the clear is a
+// combination no scoping can make safe: the configured host is the one reading
+// the token off the wire (#230).
+func TestNewRefusesACredentialOverACleartextRemote(t *testing.T) {
+	parallel(t)
+	for _, remote := range []string{
+		"http://" + canaryHost + "/o/r.git",
+		"HTTP://" + canaryHost + "/o/r.git",
+		"ftp://" + canaryHost + "/o/r.git",
+	} {
+		t.Run(remote, func(t *testing.T) {
+			opts := Options{
+				Root: "/tmp/x", WorkflowKey: "wf", ScratchRoot: t.TempDir(), AgentTempRoot: t.TempDir(),
+				Repository: core.Repository{
+					RemoteURL:  remote,
+					AuthSource: fake.NewRemoteAuth("x-access-token", canaryPassword),
+				},
+			}
+			p, err := New(opts)
+			if !errors.Is(err, ErrCleartextCredentialRemote) {
+				t.Fatalf("New(%q) error = %v, want ErrCleartextCredentialRemote", remote, err)
+			}
+			if p != nil {
+				t.Error("New returned a provider alongside a refusal")
+			}
+			if strings.Contains(err.Error(), canaryPassword) {
+				t.Errorf("refusal leaked the credential: %s", err)
+			}
+
+			// The pairing is the refusal, not the scheme: the same remote with no
+			// credential source exposes nothing, and BEN's own suites read from
+			// credential-free remotes over transports git never authenticates.
+			opts.Repository.AuthSource = nil
+			if _, err := New(opts); err != nil {
+				t.Errorf("New(%q) without a credential source = %v, want it accepted", remote, err)
+			}
+		})
 	}
 }
 
@@ -1317,6 +1900,309 @@ func TestBaseOriginMismatchFailsClosed(t *testing.T) {
 	_, err := prepareForTest(t, p, ctx, issue("1"), 2)
 	if !errors.Is(err, ErrBaseRepoState) {
 		t.Fatalf("err = %v, want ErrBaseRepoState", err)
+	}
+}
+
+// The keys are literal rather than derived from the production matcher: this is
+// the independent anchor for the closed repository-local refusal policy
+// (AGENTS.md, Conventions; #231). Removing a production alternative must leave
+// its case here red.
+func TestBaseRemoteSteeringConfigFailsClosed(t *testing.T) {
+	parallel(t)
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "fetch URL rewrite", key: "url.https://attacker.invalid/.insteadOf", value: "REMOTE"},
+		{name: "push URL rewrite", key: "url.https://attacker.invalid/.pushInsteadOf", value: "REMOTE"},
+		{name: "HTTP proxy", key: "http.proxy", value: "http://attacker.invalid:8080"},
+		{name: "HTTP address override", key: "http.curloptResolve", value: "+canonical.invalid:443:192.0.2.1"},
+		{name: "HTTP TLS verification", key: "http.sslVerify", value: "false"},
+		{name: "URL-scoped HTTP policy", key: "http.https://canonical.invalid/.proxy", value: "http://attacker.invalid:8080"},
+		{name: "remote push URL", key: "remote.upstream.pushurl", value: "https://attacker.invalid/repo.git"},
+		{name: "partial-clone extension", key: "extensions.partialClone", value: "evil"},
+		{name: "promisor remote", key: "remote.evil.promisor", value: "true"},
+		{name: "promisor filter", key: "remote.evil.partialCloneFilter", value: "blob:none"},
+		{name: "unconditional include", key: "include.path", value: "attacker-owned.config"},
+		{name: "conditional include", key: "includeIf.onbranch:ben/**.path", value: "attacker-owned.config"},
+		{name: "worktree config", key: "extensions.worktreeConfig", value: "true"},
+		{name: "credential helper", key: "credential.helper", value: "!false"},
+		{name: "URL-scoped credential helper", key: "credential.https://attacker.invalid.helper", value: "!false"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			p := newProvider(t, f, Hooks{})
+			iss := issue("1")
+			if _, err := prepareForTest(t, p, context.Background(), iss, 1); err != nil {
+				t.Fatalf("Prepare: %v", err)
+			}
+			value := tt.value
+			if value == "REMOTE" {
+				value = p.remoteURL
+			}
+			runGit(t, p.baseDir, "config", "--local", "--add", tt.key, value)
+
+			_, err := prepareForTest(t, p, context.Background(), iss, 2)
+			if !errors.Is(err, ErrBaseConfigSteering) {
+				t.Fatalf("Prepare with %s = %v, want ErrBaseConfigSteering", tt.key, err)
+			}
+			if !errors.Is(err, ErrBaseRepoState) {
+				t.Errorf("Prepare with %s = %v, want the ErrBaseRepoState umbrella too", tt.key, err)
+			}
+		})
+	}
+}
+
+// Publication re-probes origin after the run. The attacker repository carries
+// a real positive branch fact, and the raw-Git control proves base.git's config
+// redirects the canonical URL to it. PublishFacts must nevertheless report the
+// canonical branch absent: its network process cannot read that config, even
+// while the planted key remains in place (#231).
+func TestPublishFactsIgnoresAPlantedRemoteRewrite(t *testing.T) {
+	parallel(t)
+	ctx := context.Background()
+	canonical := newFixture(t)
+	attacker := newFixture(t)
+	p := newProvider(t, canonical, Hooks{})
+	ws, err := prepareForTest(t, p, ctx, issue("42"), 1)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	head := agentCommit(t, ws.Path, "work.txt")
+	runGit(t, ws.Path, "push", "--quiet", attacker.origin, "HEAD:refs/heads/ben/42")
+
+	runGit(t, p.baseDir, "config", "--local", "--add",
+		"url."+attacker.origin+".insteadOf", p.remoteURL)
+	control := runGit(t, p.baseDir, "ls-remote", "--", p.remoteURL, "refs/heads/ben/42")
+	if fields := strings.Fields(control); len(fields) != 2 || fields[0] != head || fields[1] != "refs/heads/ben/42" {
+		t.Fatalf("redirected control = %q, want attacker-authored %s on ben/42", control, head)
+	}
+
+	facts, err := p.PublishFacts(ctx, ws)
+	if err != nil {
+		t.Fatalf("PublishFacts with a planted insteadOf: %v", err)
+	}
+	if facts.Head != head || !facts.DescendsBase || !facts.RemoteProbed || facts.RemoteHead != "" || facts.RemoteHasHead {
+		t.Fatalf("PublishFacts = %+v, want local head %s and a canonical absent-branch fact", facts, head)
+	}
+
+	// The cache-state refusal remains: the command boundary does not silently
+	// bless configuration the run planted for a later or accidental consumer.
+	if _, err := prepareForTest(t, p, ctx, issue("42"), 2); !errors.Is(err, ErrBaseConfigSteering) {
+		t.Fatalf("Prepare with the planted insteadOf = %v, want ErrBaseConfigSteering", err)
+	}
+}
+
+// The fresh repository is not sufficient if Git still loads the daemon
+// account's user-global configuration: a run granted that otherwise-disjoint
+// directory can plant the same insteadOf redirect there. The raw control proves
+// the global file forges a positive remote fact; the provider must still ask
+// the canonical repository and report the branch absent.
+func TestPublishFactsIgnoresAPlantedGlobalRewrite(t *testing.T) {
+	ctx := context.Background()
+	canonical := newFixture(t)
+	attacker := newFixture(t)
+	p := newProvider(t, canonical, Hooks{})
+	ws, err := prepareForTest(t, p, ctx, issue("42"), 1)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	head := agentCommit(t, ws.Path, "work.txt")
+	runGit(t, ws.Path, "push", "--quiet", attacker.origin, "HEAD:refs/heads/ben/42")
+
+	global := filepath.Join(t.TempDir(), "agent-writable.gitconfig")
+	runGit(t, p.root, "config", "--file", global, "url."+attacker.origin+".insteadOf", p.remoteURL)
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	control := runGit(t, p.root, "ls-remote", "--", p.remoteURL, "refs/heads/ben/42")
+	if fields := strings.Fields(control); len(fields) != 2 || fields[0] != head {
+		t.Fatalf("global-redirect control = %q, want attacker-authored %s", control, head)
+	}
+
+	facts, err := p.PublishFacts(ctx, ws)
+	if err != nil {
+		t.Fatalf("PublishFacts with a global rewrite: %v", err)
+	}
+	if facts.Head != head || !facts.RemoteProbed || facts.RemoteHead != "" || facts.RemoteHasHead {
+		t.Fatalf("PublishFacts = %+v, want local head %s and a canonical absent-branch fact", facts, head)
+	}
+}
+
+// Git applies repository-local http.proxy even when the remote is an explicit
+// URL. The raw control reaches the attacker proxy; the provider's target fetch
+// and publication probe do not, because their network processes run against a
+// fresh daemon-created config rather than base.git/config (#231).
+func TestRemoteOperationsIgnoreBaseHTTPTransportConfig(t *testing.T) {
+	for _, key := range []string{
+		"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+	} {
+		t.Setenv(key, "")
+	}
+
+	ctx := context.Background()
+	canonical := newFixture(t)
+	runGit(t, canonical.origin, "update-server-info")
+	server := httptest.NewServer(http.FileServer(http.Dir(filepath.Dir(canonical.origin))))
+	defer server.Close()
+
+	p, err := providerFromOptions(t, Options{
+		Root:        t.TempDir(),
+		WorkflowKey: "wf",
+		Repository:  repo(server.URL + "/origin.git"),
+		BaseBranch:  "main",
+		Logger:      quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, err := prepareForTest(t, p, ctx, issue("42"), 1)
+	if err != nil {
+		t.Fatalf("Prepare over dumb HTTP: %v", err)
+	}
+
+	var proxyHits atomic.Int64
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxyHits.Add(1)
+		http.Error(w, "attacker proxy", http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	runGit(t, p.baseDir, "config", "--local", "http.proxy", proxy.URL)
+
+	control := exec.Command("git", "ls-remote", "--", p.remoteURL, "refs/heads/main")
+	control.Dir = p.baseDir
+	if out, err := control.CombinedOutput(); err == nil {
+		t.Fatalf("raw Git ignored base http.proxy and succeeded: %s", out)
+	}
+	if proxyHits.Load() == 0 {
+		t.Fatal("raw Git did not reach the configured proxy; the control proves nothing")
+	}
+	attackerHits := proxyHits.Load()
+
+	upstream := canonical.pushCommit(t, "upstream over HTTP")
+	runGit(t, canonical.origin, "update-server-info")
+	if err := p.fetchBase(ctx, "main"); err != nil {
+		t.Fatalf("isolated target fetch: %v", err)
+	}
+	if got := runGit(t, p.baseDir, "rev-parse", "refs/heads/main"); got != upstream {
+		t.Fatalf("fetched target = %s, want canonical %s", got, upstream)
+	}
+
+	head := agentCommit(t, ws.Path, "work.txt")
+	facts, err := p.PublishFacts(ctx, ws)
+	if err != nil {
+		t.Fatalf("PublishFacts with base http.proxy: %v", err)
+	}
+	if facts.Head != head || !facts.RemoteProbed || facts.RemoteHead != "" {
+		t.Fatalf("PublishFacts = %+v, want canonical absent-branch fact for %s", facts, head)
+	}
+	if got := proxyHits.Load(); got != attackerHits {
+		t.Fatalf("provider remote operations made %d attacker-proxy requests; want 0", got-attackerHits)
+	}
+}
+
+// The scratch repository intentionally has no copy of base.git's refs. Seed it
+// with only the prior value of the ref being refreshed: that tip is sufficient
+// for ordinary fast-forward negotiation, while importing every run-authored ref
+// would widen both the work and the trust surface. The pack hook records the
+// server-side exclusion input and the actual transferred pack header.
+func TestIsolatedFetchNegotiatesFromTheCachedTip(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	for i := 0; i < 20; i++ {
+		f.pushCommit(t, fmt.Sprintf("cached-%02d", i))
+	}
+
+	dir := t.TempDir()
+	revisions := filepath.Join(dir, "pack-revisions")
+	pack := filepath.Join(dir, "transfer.pack")
+	hook := filepath.Join(dir, "pack-objects-hook")
+	script := "#!/bin/sh\ntee " + shellQuote(revisions) + " | \"$@\" | tee " + shellQuote(pack) + "\n"
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	serverConfig := filepath.Join(dir, "server.gitconfig")
+	runGit(t, dir, "config", "--file", serverConfig, "uploadpack.packObjectsHook", shellQuote(hook))
+	// uploadpack.packObjectsHook is honored only from protected configuration.
+	// Put that configuration on the fixture server side of a fake SSH transport:
+	// the fetching client must ignore its own global config, while the server is
+	// still observable enough to prove what negotiation sent it.
+	ssh := filepath.Join(dir, "fixture-ssh")
+	sshScript := "#!/bin/sh\nGIT_CONFIG_GLOBAL=" + shellQuote(serverConfig) +
+		" exec git-upload-pack " + shellQuote(f.origin) + "\n"
+	if err := os.WriteFile(ssh, []byte(sshScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_SSH_COMMAND", shellQuote(ssh))
+	p, err := providerFromOptions(t, Options{
+		Root: t.TempDir(), WorkflowKey: "wf", Repository: repo("ssh://fixture.invalid/repository.git"),
+		Logger: quietLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepareForTest(t, p, ctx, issue("42"), 1); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	cached := runGit(t, p.baseDir, "rev-parse", "refs/heads/main")
+
+	upstream := f.pushCommit(t, "one-new-commit")
+	if err := p.fetchBase(ctx, "main"); err != nil {
+		t.Fatalf("fetchBase: %v", err)
+	}
+	if got := runGit(t, p.baseDir, "rev-parse", "refs/heads/main"); got != upstream {
+		t.Fatalf("fetched target = %s, want %s", got, upstream)
+	}
+
+	input, err := os.ReadFile(revisions)
+	if err != nil {
+		t.Fatalf("read pack revision input: %v", err)
+	}
+	if !strings.Contains(string(input), "\n--not\n"+cached+"\n") {
+		t.Fatalf("pack revision input does not exclude cached tip %s:\n%s", cached, input)
+	}
+	raw, err := os.ReadFile(pack)
+	if err != nil {
+		t.Fatalf("read transferred pack: %v", err)
+	}
+	if len(raw) < 12 || string(raw[:4]) != "PACK" {
+		t.Fatalf("transfer is not a complete pack header: %x", raw)
+	}
+	if objects := binary.BigEndian.Uint32(raw[8:12]); objects != 3 {
+		t.Fatalf("advancing one commit transferred %d objects, want commit + tree + blob only", objects)
+	}
+}
+
+// A repository's object format governs every object ID and pack it accepts.
+// Sharing a SHA-256 base object directory with a default-SHA-1 scratch
+// repository therefore fails before negotiation; the isolated repository must
+// be initialized from the already accepted base's reported storage format.
+func TestIsolatedFetchPreservesTheBaseObjectFormat(t *testing.T) {
+	parallel(t)
+	ctx := context.Background()
+	f := newFixtureWithObjectFormat(t, "sha256")
+	p := newProvider(t, f, Hooks{})
+	if err := os.MkdirAll(p.wfDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, p.wfDir, "clone", "--quiet", "--bare", f.origin, p.baseDir)
+	if got := runGit(t, p.baseDir, "rev-parse", "--show-object-format"); got != "sha256" {
+		t.Fatalf("base object format = %q, want sha256", got)
+	}
+	if err := p.CheckBaseCache(ctx); err != nil {
+		t.Fatalf("accepted SHA-256 base: %v", err)
+	}
+	if err := p.Ready(ctx); err != nil {
+		t.Fatalf("probe SHA-256 remote: %v", err)
+	}
+
+	want := f.pushCommit(t, "sha256-upstream")
+	if err := p.fetchBase(ctx, "main"); err != nil {
+		t.Fatalf("fetch SHA-256 base: %v", err)
+	}
+	if got := runGit(t, p.baseDir, "rev-parse", "refs/heads/main"); got != want {
+		t.Fatalf("fetched target = %s, want %s", got, want)
 	}
 }
 

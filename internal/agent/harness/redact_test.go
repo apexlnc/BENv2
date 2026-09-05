@@ -147,6 +147,7 @@ func TestEmittedEventTextIsRedacted(t *testing.T) {
 		},
 		Redact:  []string{credential},
 		Timings: Timings{StopGrace: 20 * time.Millisecond, PostExitDrain: 20 * time.Millisecond},
+		Domain:  completedDomain{output: "saw " + credential + "\n"},
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -169,6 +170,32 @@ func TestEmittedEventTextIsRedacted(t *testing.T) {
 	if !strings.Contains(joinedText, "saw ") {
 		t.Errorf("event text lost the non-credential half of the line: %q", joinedText)
 	}
+}
+
+type completedDomain struct{ output string }
+
+func (completedDomain) Ready(context.Context) error { return nil }
+
+func (d completedDomain) Start(_ context.Context, launch DomainLaunch) (DomainRun, error) {
+	if launch.OnDomain != nil {
+		if err := launch.OnDomain(core.RunEvidence{Scheme: "redact-test", ID: "1"}); err != nil {
+			return nil, err
+		}
+	}
+	_, _ = io.WriteString(launch.Stdout, d.output)
+	done := make(chan struct{})
+	close(done)
+	return completedRun{done: done}, nil
+}
+
+type completedRun struct{ done <-chan struct{} }
+
+func (r completedRun) DirectDone() <-chan struct{} { return r.done }
+func (completedRun) Probe(context.Context) core.Termination {
+	return core.TerminationConfirmed
+}
+func (completedRun) Stop(context.Context, core.StopMode) core.Termination {
+	return core.TerminationConfirmed
 }
 
 // readStdout hands the pump the same slice it writes to the transcript, so a

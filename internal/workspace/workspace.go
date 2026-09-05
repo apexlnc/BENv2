@@ -8,7 +8,8 @@
 //
 //   - base.git is bootstrapped atomically (temp dir + rename) and fetched
 //     before every attempt; unexpected base state fails closed, no
-//     auto-repair. The default branch is fetched into refs/heads/; origin's
+//     auto-repair. The claim's retained target branch is fetched into
+//     refs/heads/; origin's
 //     ben/* issue branch is probed every prepare and fetched into
 //     refs/ben/remote/<workspace_key> — fetch cannot move a checked-out
 //     branch — as the remote-first reattach source (SPEC §6.2; #16).
@@ -21,7 +22,7 @@
 //     never -B (force-recreating it has discarded agent commits in
 //     production). Reattach is remote-first (SPEC §6.2; #16): a branch that
 //     exists on origin but not locally is created at the remote head, never
-//     derived from the default branch; when both exist, strictly-behind
+//     derived from the configured/default target branch; when both exist, strictly-behind
 //     fast-forwards, strictly-ahead (unpushed work) attaches as-is, and true
 //     divergence fails closed.
 //   - A durable provider-owned claim-base record binds the positive tracker
@@ -58,7 +59,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,6 +66,7 @@ import (
 	"time"
 
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
+	"github.com/srhg-ai-7cef3f93/ben/internal/gitremote"
 )
 
 const (
@@ -89,6 +90,23 @@ type Options struct {
 	Root string
 	// WorkflowKey names this workflow's subtree under Root (SPEC §5.1, §6.2).
 	WorkflowKey string
+	// ScratchRoot is a daemon-only directory for ephemeral repositories used by
+	// credentialed remote Git commands. Assembly supplies the workflow's state
+	// directory: unlike workspace paths and TMPDIR, it is never handed to an
+	// agent. It must be absolute and must not overlap any agent-writable root.
+	ScratchRoot string
+	// AgentTempRoot is the TMPDIR root the local agent receives. It is supplied
+	// separately so New can prove ScratchRoot does not overlap it; using the
+	// process environment here would make tests and assembly disagree about the
+	// boundary they constructed.
+	AgentTempRoot string
+	// AgentWrites is the complete additional write scope reported by the
+	// selected local agent kind. Concrete roots must not overlap ScratchRoot.
+	// Unbounded is accepted deliberately: it records that this in-process path
+	// check cannot establish isolation, while the deployment may supply an
+	// external principal/filesystem boundary (SPEC §10.1). Treating it as "/"
+	// would make every possible scratch path a startup refusal.
+	AgentWrites core.LocalWriteScope
 	// Repository is what the base repo fetches from and what it stores as its
 	// `origin` remote, plus the credential for those fetches — as the tracker
 	// named them (RepositoryFrom). The value passes from the adapter to here
@@ -97,7 +115,12 @@ type Options struct {
 	// RemoteURL MUST be credential-free — userinfo carrying a password is
 	// rejected whatever the scheme, and http(s) userinfo is rejected whole
 	// (ErrRemoteCredentials); the credential belongs in Repository.AuthSource.
+	// When an AuthSource is present the remote must also not be one git would
+	// authenticate to in the clear (ErrCleartextCredentialRemote).
 	Repository core.Repository
+	// BaseBranch is workspace.base_branch. Empty selects the repository default
+	// when a new claim epoch is first prepared.
+	BaseBranch string
 	Hooks      Hooks
 	// Locks is the serialization for this workspace tree (see LockDomain). Nil
 	// allocates a fresh one, which is right for the first provider on a tree and
@@ -113,8 +136,9 @@ type Options struct {
 // core interface it exposes the claim-aware prepare/store operations,
 // PublishFacts, AfterRun and Sweep to the consumers that own those questions.
 type Provider struct {
-	root      string
-	remoteURL string
+	root       string
+	remoteURL  string
+	baseBranch string
 	// authSource is where the remote credential comes from, resolved immediately
 	// before each remote invocation (SPEC §6.2, amendment 6). Nil means
 	// unauthenticated — a public repo, a file remote, ambient helpers.
@@ -127,10 +151,11 @@ type Provider struct {
 	hookTimeout time.Duration
 	logger      *slog.Logger
 
-	wfDir      string // <root>/<workflow_key>
-	baseDir    string // <root>/<workflow_key>/base.git
-	issuesDir  string // <root>/<workflow_key>/issues
-	privateDir string // <root>/<workflow_key>/private
+	wfDir       string // <root>/<workflow_key>
+	baseDir     string // <root>/<workflow_key>/base.git
+	issuesDir   string // <root>/<workflow_key>/issues
+	privateDir  string // <root>/<workflow_key>/private
+	scratchRoot string // daemon-owned; never reported in core.WorkspacePaths
 
 	// locks is the serialization for this workspace tree — shared, not owned.
 	// See LockDomain.
@@ -199,18 +224,39 @@ func New(opts Options) (*Provider, error) {
 		return nil, fmt.Errorf("workspace: Root must be absolute (the config loader normalizes it — SPEC §5.2.4): %q", opts.Root)
 	case opts.WorkflowKey == "":
 		return nil, errors.New("workspace: WorkflowKey is required")
+	case opts.ScratchRoot == "":
+		return nil, fmt.Errorf("%w: ScratchRoot is required", ErrScratchRoot)
+	case !filepath.IsAbs(opts.ScratchRoot):
+		return nil, fmt.Errorf("%w: ScratchRoot must be absolute: %q", ErrScratchRoot, opts.ScratchRoot)
+	case opts.AgentTempRoot == "":
+		return nil, fmt.Errorf("%w: AgentTempRoot is required", ErrScratchRoot)
+	case !filepath.IsAbs(opts.AgentTempRoot):
+		return nil, fmt.Errorf("%w: AgentTempRoot must be absolute: %q", ErrScratchRoot, opts.AgentTempRoot)
+	case opts.AgentWrites.Unbounded && len(opts.AgentWrites.Roots) != 0:
+		return nil, fmt.Errorf("%w: an unbounded AgentWrites scope must not also name concrete roots", ErrScratchRoot)
 	case opts.Repository.RemoteURL == "":
 		return nil, errors.New("workspace: Repository.RemoteURL is required")
 	}
-	if isTransportHelperRemote(opts.Repository.RemoteURL) {
+	for i, root := range opts.AgentWrites.Roots {
+		if root == "" || !filepath.IsAbs(root) {
+			// Provider values may be env-resolved, so identify the field without
+			// copying its value into an unredacted runtime error.
+			return nil, fmt.Errorf("%w: AgentWrites.Roots[%d] must be a non-empty absolute path", ErrScratchRoot, i)
+		}
+	}
+	if gitremote.IsTransportHelper(opts.Repository.RemoteURL) {
 		return nil, ErrTransportHelperRemote
 	}
-	if embedsCredential(opts.Repository.RemoteURL) {
+	if gitremote.EmbedsCredential(opts.Repository.RemoteURL) {
 		return nil, ErrRemoteCredentials
+	}
+	if opts.Repository.AuthSource != nil && gitremote.IsCleartextTransport(opts.Repository.RemoteURL) {
+		return nil, ErrCleartextCredentialRemote
 	}
 	p := &Provider{
 		root:        filepath.Clean(opts.Root),
 		remoteURL:   opts.Repository.RemoteURL,
+		baseBranch:  opts.BaseBranch,
 		authSource:  opts.Repository.AuthSource,
 		hooks:       opts.Hooks,
 		hookTimeout: opts.Hooks.Timeout,
@@ -230,112 +276,28 @@ func New(opts Options) (*Provider, error) {
 	p.baseDir = filepath.Join(p.wfDir, "base.git")
 	p.issuesDir = filepath.Join(p.wfDir, "issues")
 	p.privateDir = filepath.Join(p.wfDir, "private")
-	return p, nil
-}
-
-// isTransportHelperRemote recognizes Git's explicit <helper>::<address>
-// syntax (#98). Git selects even an empty helper prefix (an immediate "::");
-// otherwise its grammar is an ASCII letter or digit first, then letters,
-// digits, '+', '-' or '.', immediately followed by "::". Unlike an RFC 3986
-// scheme, Git permits a digit first for compatibility. Only the prefix is
-// read; the address is intentionally opaque because the helper owns its
-// grammar.
-//
-// Looking for "::" anywhere would refuse unrelated working remotes such as
-// ssh://git@[::1]/repo.git. Parsing the address would fail in the opposite
-// direction: malformed URL text is still a valid helper-owned address and
-// still reaches git's argv and config.
-func isTransportHelperRemote(remoteURL string) bool {
-	for i := 0; i < len(remoteURL); i++ {
-		if isTransportHelperNameByte(remoteURL[i], i == 0) {
-			continue
+	// Keep the resolved spelling, not the caller's symlink. Otherwise a link
+	// beneath an agent-writable parent can point somewhere safe during this
+	// check and be substituted before temporaryRemoteRepository follows it.
+	p.scratchRoot = normalizePath(opts.ScratchRoot)
+	root := normalizePath(p.root)
+	scratch := p.scratchRoot
+	untrustedRoots := []struct{ name, path string }{
+		{name: "workspace root", path: root},
+		{name: "agent TMPDIR", path: normalizePath(opts.AgentTempRoot)},
+	}
+	for i, path := range opts.AgentWrites.Roots {
+		untrustedRoots = append(untrustedRoots, struct{ name, path string }{
+			name: fmt.Sprintf("agent writable root %d", i), path: normalizePath(path),
+		})
+	}
+	for _, untrusted := range untrustedRoots {
+		if untrusted.path == scratch || strictlyUnder(untrusted.path, scratch) || strictlyUnder(scratch, untrusted.path) {
+			return nil, fmt.Errorf("%w: ScratchRoot %s overlaps %s",
+				ErrScratchRoot, p.scratchRoot, untrusted.name)
 		}
-		return remoteURL[i] == ':' && i+1 < len(remoteURL) && remoteURL[i+1] == ':'
 	}
-	return false
-}
-
-func isTransportHelperNameByte(c byte, first bool) bool {
-	alphanumeric := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
-	return alphanumeric || !first && (c == '+' || c == '-' || c == '.')
-}
-
-// embedsCredential reports whether a remote URL carries a credential in its
-// userinfo (SPEC §10.2; #52). RemoteURL reaches git as argv and is stored in
-// base.git's `origin`, so a secret here is `ps`-visible and on disk; the
-// credential belongs in Repository.AuthSource, which reaches git through the child
-// environment.
-//
-// The invariant is syntactic — RFC 3986 userinfo with a password component —
-// and deliberately not "the string looks like a secret". A bare username stays
-// accepted, because `ssh://git@…` is conventional and public; that carve-out is
-// what rules the broader reading out, since `ssh://s3cret@host/` would have to
-// be refused too. It also settles the percent-encoded case: git hands ssh the
-// same `git:pass@host` destination for both ssh://git:pass@host and
-// ssh://git%3Apass@host, so both are usernames as far as ssh is concerned, and
-// only the syntax separates them.
-//
-// So for ssh a userinfo password is refused as a *credential-shaped* string,
-// not because ssh would authenticate with it — it never does. For http(s) it is
-// refused because there it genuinely is the auth mechanism, which is why that
-// scheme refuses bare userinfo too: `x-access-token@` is a real PAT shape.
-func embedsCredential(remoteURL string) bool {
-	u, err := url.Parse(remoteURL)
-	if err != nil {
-		return unparsedAuthorityHasCredential(remoteURL)
-	}
-	if u.User == nil {
-		return false
-	}
-	if _, hasPassword := u.User.Password(); hasPassword {
-		return true
-	}
-	return u.Scheme == "http" || u.Scheme == "https"
-}
-
-// unparsedAuthorityHasCredential is the fallback for a scheme-bearing URL
-// net/url could not parse — an invalid port, a space in the userinfo. The
-// string still reaches git, so "unreadable" must not become "unchecked".
-//
-// It carries *both* of embedsCredential's rules, not just the password one:
-// `https://token@host:notaport/x` fails to parse and is exactly the shape the
-// http(s) rule exists for, so a fallback that only looked for a colon would
-// hand the stricter scheme the weaker check.
-//
-// It is confined to explicit `scheme://` authorities, and is unreachable when
-// the parse succeeds, where the password half would be redundant anyway:
-// net/url splits userinfo at the last "@" and sets a password whenever the raw
-// userinfo holds a literal ":", so every string that half could catch,
-// Password() already caught.
-//
-// The confinement is load-bearing, not tidiness. Git's scp-like syntax has no
-// userinfo production to inspect, and its path may hold both colons and "@":
-// `git@host:path@segment/repo.git` is user `git`, host `host`, path
-// `path@segment/repo.git` — verified against git's ssh argv. Reading that
-// path's trailing "@" as a userinfo delimiter refuses a working remote.
-func unparsedAuthorityHasCredential(remoteURL string) bool {
-	scheme, rest, ok := strings.Cut(remoteURL, "://")
-	if !ok {
-		return false
-	}
-	// RFC 3986 §3.2: the authority ends at the first "/", "?" or "#".
-	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
-		rest = rest[:i]
-	}
-	// Split at the last "@", matching net/url rather than inventing a split:
-	// on the first, `ssh://alias@user:pass@host` reads as user `alias` and the
-	// password goes unseen.
-	at := strings.LastIndex(rest, "@")
-	if at < 0 {
-		return false
-	}
-	// http(s) refuses userinfo whole, as on the parsed path — the empty
-	// userinfo of `https://@host` included. net/url lowercases the scheme for
-	// us there; nothing has here, so fold explicitly.
-	if strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https") {
-		return true
-	}
-	return strings.Contains(rest[:at], ":")
+	return p, nil
 }
 
 // IsApplicable reports whether this strategy can serve the workflow
@@ -408,8 +370,16 @@ func (p *Provider) prepare(ctx context.Context, issue core.Issue, attempt int, e
 	}
 	if claimBase.State == core.ClaimBasePinned {
 		ws.ClaimEpoch, ws.BaseSHA = claimBase.Epoch, claimBase.BaseSHA
+		ws.TargetBranch = claimBase.TargetBranch
 	}
-	if err := p.ensureBase(ctx); err != nil {
+	target := claimBase.TargetBranch
+	if claimBase.State == core.ClaimBasePending {
+		target, err = p.resolveTargetBranch(ctx)
+		if err != nil {
+			return ws, core.LocalBranchFacts{}, err
+		}
+	}
+	if err := p.ensureBase(ctx, target); err != nil {
 		return ws, core.LocalBranchFacts{}, err
 	}
 	// Whose directory this is, recorded before anything creates one. §9.10 step 5
@@ -421,11 +391,7 @@ func (p *Provider) prepare(ctx context.Context, issue core.Issue, attempt int, e
 	if err := p.recordOwner(key, issue.Identifier); err != nil {
 		return ws, core.LocalBranchFacts{}, fmt.Errorf("workspace: recording the owner of %s: %w", key, err)
 	}
-	def, err := p.defaultBranch(ctx)
-	if err != nil {
-		return ws, core.LocalBranchFacts{}, err
-	}
-	if err := p.fetchBase(ctx, def); err != nil { // fetch-before-attempt (SPEC §6.2)
+	if err := p.fetchBase(ctx, target); err != nil { // fetch-before-attempt (SPEC §6.2)
 		return ws, core.LocalBranchFacts{}, err
 	}
 	remoteSHA, err := p.fetchRemoteIssueBranch(ctx, key, ws.Branch)
@@ -444,12 +410,12 @@ func (p *Provider) prepare(ctx context.Context, issue core.Issue, attempt int, e
 		case claimBase.State == core.ClaimBasePinned:
 			startSHA = claimBase.BaseSHA
 		default:
-			startSHA, localExists, err = p.revParse(ctx, "refs/heads/"+def)
+			startSHA, localExists, err = p.revParse(ctx, "refs/heads/"+target)
 			if err != nil {
 				return ws, core.LocalBranchFacts{}, err
 			}
 			if !localExists {
-				return ws, core.LocalBranchFacts{}, fmt.Errorf("%w: default branch %q missing from base repository", ErrBaseRepoState, def)
+				return ws, core.LocalBranchFacts{}, fmt.Errorf("%w: target branch %q missing from base repository", ErrBaseRepoState, target)
 			}
 		}
 	}
@@ -528,10 +494,10 @@ func (p *Provider) prepare(ctx context.Context, issue core.Issue, attempt int, e
 		if !ok {
 			return ws, core.LocalBranchFacts{}, fmt.Errorf("%w: attached branch %s has no head", ErrWorkspaceState, ws.Branch)
 		}
-		if err := p.pinClaimBaseLocked(ctx, key, claimBase, head); err != nil {
+		if err := p.pinClaimBaseLocked(ctx, key, claimBase, head, target); err != nil {
 			return ws, core.LocalBranchFacts{}, err
 		}
-		ws.ClaimEpoch, ws.BaseSHA = expectedEpoch, head
+		ws.ClaimEpoch, ws.BaseSHA, ws.TargetBranch = expectedEpoch, head, target
 	}
 
 	// After the worktree is established and on every path through the switch,
@@ -777,7 +743,7 @@ func (p *Provider) Sweep(ctx context.Context, terminal func(workspaceKey string)
 // bootstrap is atomic — init, HEAD discovery, and the first fetch happen in
 // a temp dir renamed into place — so an existing base.git is always fully
 // formed and anything unexpected fails closed with no auto-repair.
-func (p *Provider) ensureBase(ctx context.Context) error {
+func (p *Provider) ensureBase(ctx context.Context, target string) error {
 	p.locks.baseMu.Lock()
 	defer p.locks.baseMu.Unlock()
 
@@ -811,20 +777,19 @@ func (p *Provider) ensureBase(ctx context.Context) error {
 	if _, err := p.git(ctx, tmp, "remote", "add", "origin", p.remoteURL); err != nil {
 		return fmt.Errorf("workspace: bootstrap base: %w", err)
 	}
-	def, err := p.remoteDefaultBranch(ctx, tmp)
-	if err != nil {
-		return err
+	if target == "" {
+		return fmt.Errorf("%w: no claim-scoped target branch", ErrClaimTargetUnrecorded)
 	}
-	if _, err := p.git(ctx, tmp, "symbolic-ref", "HEAD", "refs/heads/"+def); err != nil {
+	if _, err := p.git(ctx, tmp, "symbolic-ref", "HEAD", "refs/heads/"+target); err != nil {
 		return fmt.Errorf("workspace: bootstrap base: %w", err)
 	}
-	if _, err := p.remoteGit(ctx, tmp, "fetch", "--quiet", p.remoteURL, "+refs/heads/"+def+":refs/heads/"+def); err != nil {
+	if _, err := p.remoteGit(ctx, tmp, "fetch", "--quiet", p.remoteURL, "+refs/heads/"+target+":refs/heads/"+target); err != nil {
 		return fmt.Errorf("workspace: bootstrap fetch: %w", err)
 	}
 	if err := os.Rename(tmp, p.baseDir); err != nil {
 		return fmt.Errorf("workspace: bootstrap base: %w", err)
 	}
-	p.logger.Info("base repository bootstrapped", "path", p.baseDir, "branch", def)
+	p.logger.Info("base repository bootstrapped", "path", p.baseDir, "branch", target)
 	return nil
 }
 
@@ -862,6 +827,44 @@ func (p *Provider) CheckBaseCache(ctx context.Context) error {
 	return p.validateBase(ctx)
 }
 
+// Ready proves the branch a future claim would select exists on the canonical
+// remote, using the same credential source as Prepare. It intentionally runs
+// after CheckBaseCache in assembly: a local identity mismatch is cheaper and
+// more definitive than a network lookup.
+func (p *Provider) Ready(ctx context.Context) error {
+	_, err := p.resolveTargetBranch(ctx)
+	return err
+}
+
+// baseConfigSteeringPattern is the closed repository-local refusal policy for
+// validateBase (#231). The run can write base.git/config, so transport and
+// authentication policy there is untrusted state (SPEC §3.5, §9.7):
+//
+//   - url.*.{insteadOf,pushInsteadOf} aliases an explicit URL, so passing
+//     p.remoteURL in argv does not pin the endpoint;
+//   - every http.* key is refused as one namespace rather than enumerating
+//     Git's evolving transport settings: proxy and curloptResolve steer the
+//     endpoint, sslVerify changes its authenticity, and URL-scoped variants
+//     carry the same authority;
+//   - remote.*.pushurl supplies a second publication endpoint;
+//   - extensions.partialClone and remote.*.{promisor,partialCloneFilter} can
+//     turn an otherwise local missing-object read into an implicit fetch;
+//   - include.path, includeIf.*.path and extensions.worktreeConfig can hide any
+//     of these keys in another run-authored file, including behind a condition
+//     validation does not take or in base.git/config.worktree;
+//   - credential[.<url>].helper supplies executable authentication policy in
+//     the same untrusted file.
+//
+// This refusal is cache-state defense in depth, not the command boundary: all
+// post-bootstrap network commands run in a fresh daemon-created repository, so
+// even an unclassified key or a write after validation is not read by them.
+// Other remote.* URLs cannot affect those commands because each receives
+// p.remoteURL rather than a remote name. Hooks, fsmonitor, replacement refs and
+// grafts are the separate invocation-wide neutralization owned by internal/gitcmd
+// (#228). The hard-coded cases in workspace_test.go anchor this policy outside
+// the declaration, so deleting one alternative cannot make its own test disappear.
+const baseConfigSteeringPattern = `^(url\..*\.(insteadof|pushinsteadof)|http\..*|remote\..*\.(pushurl|promisor|partialclonefilter)|include\.path|includeif\..*\.path|extensions\.(worktreeconfig|partialclone)|credential(\..*)?\.helper)$`
+
 // validateBase checks an existing base.git without repairing anything
 // (SPEC §6.2, fail closed). Callers hold baseMu.
 func (p *Provider) validateBase(ctx context.Context) error {
@@ -879,7 +882,22 @@ func (p *Provider) validateBase(ctx context.Context) error {
 		return fmt.Errorf("%w: %s is not a bare repository (fail closed, no auto-repair — SPEC §6.2)",
 			ErrBaseRepoState, p.baseDir)
 	}
-	originURL, gitErr := p.git(ctx, p.baseDir, "config", "--get", "remote.origin.url")
+	// --no-includes asks only what base.git/config itself declares. Includes are
+	// refused by name rather than followed: their target and activation are both
+	// run-authored, and a conditional include could answer differently later.
+	hasSteering, gitErr := p.gitConfigHasMatch(ctx, p.baseDir, baseConfigSteeringPattern)
+	if gitErr != nil {
+		return fmt.Errorf("%w: inspecting repository-local config in %s: %v",
+			ErrBaseRepoState, p.baseDir, gitErr)
+	}
+	if hasSteering {
+		// Do not echo the matched key: URL and credential subsections can carry
+		// sensitive text, and the named refusal is enough to identify the class.
+		return fmt.Errorf("%w: %w (fail closed, no auto-repair — SPEC §6.2)",
+			ErrBaseRepoState, ErrBaseConfigSteering)
+	}
+
+	originURL, gitErr := p.git(ctx, p.baseDir, "config", "--local", "--no-includes", "--get", "remote.origin.url")
 	if gitErr != nil {
 		return fmt.Errorf("%w: %s has no origin remote (fail closed, no auto-repair — SPEC §6.2): %v",
 			ErrBaseRepoState, p.baseDir, gitErr)
@@ -891,10 +909,111 @@ func (p *Provider) validateBase(ctx context.Context) error {
 	return nil
 }
 
-// remoteDefaultBranch reads the remote HEAD symref. The credential-bearing
-// URL is passed per-invocation so it is never stored in base.git's config.
-func (p *Provider) remoteDefaultBranch(ctx context.Context, dir string) (string, error) {
-	out, err := p.remoteGit(ctx, dir, "ls-remote", "--symref", p.remoteURL, "HEAD")
+// temporaryRemoteRepository creates the configuration boundary for a remote
+// operation. Its empty template and fresh config are daemon-authored; base.git
+// is deliberately not a repository discovery parent. ScratchRoot comes from
+// daemon state and is neither reported as a workspace path nor included in any
+// writable root declared by the selected agent kind, so a concurrent run cannot
+// substitute config between initialization and exec (#231).
+func (p *Provider) temporaryRemoteRepository(ctx context.Context, objectFormat string) (repo string, cleanup func(), err error) {
+	if err := os.MkdirAll(p.scratchRoot, 0o700); err != nil {
+		return "", nil, fmt.Errorf("workspace: create daemon scratch root: %w", err)
+	}
+	root, err := os.MkdirTemp(p.scratchRoot, "ben-remote-")
+	if err != nil {
+		return "", nil, fmt.Errorf("workspace: create remote scratch directory: %w", err)
+	}
+	cleanup = func() { _ = os.RemoveAll(root) }
+	template := filepath.Join(root, "template")
+	if err := os.Mkdir(template, 0o700); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("workspace: create empty Git template: %w", err)
+	}
+	repo = filepath.Join(root, "repo.git")
+	initArgs := []string{"init", "--quiet", "--bare", "--template=" + template}
+	if objectFormat != "" {
+		initArgs = append(initArgs, "--object-format="+objectFormat)
+	}
+	initArgs = append(initArgs, repo)
+	if _, err := p.git(ctx, root, initArgs...); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("workspace: initialize remote scratch repository: %w", err)
+	}
+	return repo, cleanup, nil
+}
+
+// isolatedRemoteGit runs a remote command where no repository-local config a
+// run can author is discoverable. It is for remote reads that do not retain
+// objects; fetchRemoteRef is the corresponding object-import path.
+func (p *Provider) isolatedRemoteGit(ctx context.Context, args ...string) (string, error) {
+	repo, cleanup, err := p.temporaryRemoteRepository(ctx, "")
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	return p.remoteGit(ctx, repo, args...)
+}
+
+// fetchRemoteRef fetches through a fresh repository while sharing only
+// base.git's content-addressed object store, then advances the requested cache
+// ref explicitly. Holding baseMu preserves the existing serialization of all
+// cache object/ref writes. Crucially, the credentialed process reads the fresh
+// repository's config, never base.git/config; validation timing is therefore
+// irrelevant to where it connects.
+func (p *Provider) fetchRemoteRef(ctx context.Context, remoteRef, cacheRef string) (string, error) {
+	negotiationTip, tipExists, err := p.revParse(ctx, cacheRef)
+	if err != nil {
+		return "", err
+	}
+
+	p.locks.baseMu.Lock()
+	defer p.locks.baseMu.Unlock()
+	objectFormat, err := p.git(ctx, p.baseDir, "rev-parse", "--show-object-format")
+	if err != nil || objectFormat == "" || strings.ContainsAny(objectFormat, " \t\r\n") {
+		return "", fmt.Errorf("%w: cannot determine base object format %q: %v",
+			ErrBaseRepoState, objectFormat, err)
+	}
+
+	repo, cleanup, err := p.temporaryRemoteRepository(ctx, objectFormat)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+
+	objectDir := filepath.Join(p.baseDir, "objects")
+	const (
+		scratchRef     = "refs/ben/fetch"
+		negotiationRef = "refs/ben/have"
+	)
+	if tipExists {
+		// The scratch repository has no run-authored refs. Give negotiation only
+		// the previous value of the cache ref being advanced: if origin knows it,
+		// upload-pack excludes its reachable history; if not, protocol negotiation
+		// falls back to the complete pack without trusting the tip as evidence.
+		if _, err := p.gitObjectDir(ctx, repo, objectDir,
+			"update-ref", negotiationRef, negotiationTip); err != nil {
+			return "", fmt.Errorf("workspace: seed remote negotiation: %w", err)
+		}
+	}
+	if _, err := p.remoteGitObjectDir(ctx, repo, objectDir,
+		"fetch", "--quiet", "--no-tags", p.remoteURL, "+"+remoteRef+":"+scratchRef); err != nil {
+		return "", err
+	}
+	sha, err := p.gitObjectDir(ctx, repo, objectDir,
+		"rev-parse", "--verify", scratchRef+"^{commit}")
+	if err != nil || sha == "" {
+		return "", fmt.Errorf("%w: fetched %s did not materialize: %v", ErrBaseRepoState, remoteRef, err)
+	}
+	if _, err := p.git(ctx, p.baseDir, "update-ref", cacheRef, sha); err != nil {
+		return "", err
+	}
+	return sha, nil
+}
+
+// remoteDefaultBranch reads the remote HEAD symref. The credential-bearing URL
+// is passed per-invocation and the command cannot discover base.git's config.
+func (p *Provider) remoteDefaultBranch(ctx context.Context) (string, error) {
+	out, err := p.isolatedRemoteGit(ctx, "ls-remote", "--symref", p.remoteURL, "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("workspace: resolve remote default branch: %w", err)
 	}
@@ -908,28 +1027,42 @@ func (p *Provider) remoteDefaultBranch(ctx context.Context, dir string) (string,
 	// The remote URL is credential-free by construction: New refuses one that
 	// embeds a credential (ErrRemoteCredentials), which is why the secret lives
 	// behind AuthSource in the first place.
-	return "", fmt.Errorf("workspace: remote %s did not advertise a default branch (empty repository?)",
-		p.remoteURL)
+	return "", fmt.Errorf("%w: remote %s did not advertise a default branch (empty repository?)",
+		ErrBaseBranchNotFound, p.remoteURL)
 }
 
-// defaultBranch reads the base clone's HEAD symref, pinned at bootstrap.
-func (p *Provider) defaultBranch(ctx context.Context) (string, error) {
-	out, err := p.baseGit(ctx, "symbolic-ref", "--short", "HEAD")
-	if err != nil || out == "" {
-		return "", fmt.Errorf("%w: cannot resolve default branch: %v", ErrBaseRepoState, err)
+func (p *Provider) resolveTargetBranch(ctx context.Context) (string, error) {
+	target := p.baseBranch
+	if target == "" {
+		var err error
+		target, err = p.remoteDefaultBranch(ctx)
+		if err != nil {
+			return "", err
+		}
 	}
-	return out, nil
+	if target == "ben" || strings.HasPrefix(target, branchPrefix) {
+		return "", fmt.Errorf("%w: %q", ErrBaseBranchReserved, target)
+	}
+	ref := "refs/heads/" + target
+	out, err := p.isolatedRemoteGit(ctx, "ls-remote", "--", p.remoteURL, ref)
+	if err != nil {
+		return "", fmt.Errorf("workspace: resolve base branch %q: %w", target, err)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if _, name, ok := strings.Cut(strings.TrimSpace(line), "\t"); ok && name == ref {
+			return target, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %q", ErrBaseBranchNotFound, target)
 }
 
-// fetchBase updates only the default branch before an attempt (SPEC §6.2).
+// fetchBase updates only the claim's retained target branch before an attempt
+// (SPEC §6.2).
 // The ben/* branch head is deliberately not fetched here: it may be checked
 // out in a worktree, and fetch refuses to move checked-out refs — origin's
 // view arrives via fetchRemoteIssueBranch instead.
 func (p *Provider) fetchBase(ctx context.Context, def string) error {
-	spec := "+refs/heads/" + def + ":refs/heads/" + def
-	p.locks.baseMu.Lock()
-	_, err := p.remoteGit(ctx, p.baseDir, "fetch", "--quiet", p.remoteURL, spec)
-	p.locks.baseMu.Unlock()
+	_, err := p.fetchRemoteRef(ctx, "refs/heads/"+def, "refs/heads/"+def)
 	if err != nil {
 		return fmt.Errorf("workspace: fetch before attempt: %w", err)
 	}
@@ -944,9 +1077,7 @@ func (p *Provider) fetchBase(ctx context.Context, def string) error {
 // that ref's, so it always names objects this repository has.
 func (p *Provider) fetchRemoteIssueBranch(ctx context.Context, key, branch string) (string, error) {
 	ref := "refs/heads/" + branch
-	p.locks.baseMu.Lock()
-	out, err := p.remoteGit(ctx, p.baseDir, "ls-remote", "--", p.remoteURL, ref)
-	p.locks.baseMu.Unlock()
+	out, err := p.isolatedRemoteGit(ctx, "ls-remote", "--", p.remoteURL, ref)
 	if err != nil {
 		return "", fmt.Errorf("workspace: probe origin for %s: %w", branch, err)
 	}
@@ -970,18 +1101,9 @@ func (p *Provider) fetchRemoteIssueBranch(ctx context.Context, key, branch strin
 		}
 		return "", nil
 	}
-	p.locks.baseMu.Lock()
-	_, err = p.remoteGit(ctx, p.baseDir, "fetch", "--quiet", p.remoteURL, "+"+ref+":"+cacheRef)
-	p.locks.baseMu.Unlock()
+	sha, err := p.fetchRemoteRef(ctx, ref, cacheRef)
 	if err != nil {
 		return "", fmt.Errorf("workspace: fetch origin %s: %w", branch, err)
-	}
-	sha, ok, err := p.revParse(ctx, cacheRef)
-	if err != nil {
-		return "", err
-	}
-	if !ok {
-		return "", fmt.Errorf("%w: fetched %s but %s did not materialize", ErrBaseRepoState, ref, cacheRef)
 	}
 	return sha, nil
 }
@@ -1209,7 +1331,9 @@ func (p *Provider) checkContained(ws core.WorkspacePaths) error {
 }
 
 func strictlyUnder(child, parent string) bool {
-	return child != parent && strings.HasPrefix(child, parent+string(filepath.Separator))
+	rel, err := filepath.Rel(parent, child)
+	return err == nil && rel != "." && rel != ".." && !filepath.IsAbs(rel) &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // normalizePath resolves symlinks on the deepest existing ancestor so that

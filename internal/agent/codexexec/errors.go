@@ -30,6 +30,10 @@ var (
 	// discovers it (SPEC §7.3).
 	ErrBinary = errors.New("codex-exec: harness binary unusable")
 
+	// ErrExecutionDomain refuses local startup when the Linux containment and
+	// quiet-evidence provider cannot prove its complete capability matrix.
+	ErrExecutionDomain = errors.New("codex-exec: local execution domain unavailable")
+
 	// ErrPromptEmpty refuses a run with no prompt. The template layer already
 	// refuses an empty body (SPEC §5.3); this is the boundary restating it, so
 	// a bug upstream cannot spend an agent turn on nothing.
@@ -63,4 +67,20 @@ var (
 	// orchestrator records as launch_error — non-retryable, since a rerun with
 	// the same inputs fails identically).
 	ErrEnvNamespace = errors.New("codex-exec: BEN_ is reserved to the orchestrator")
+
+	// ErrContinuationToken refuses a resume token that argv cannot carry safely
+	// (SPEC §7.1, §9.6): the token is minted from the child's own JSON stream, and
+	// one beginning with `-` is a flag the agent selected for its own next
+	// invocation rather than a thread id. The stream layer refuses such a token
+	// where it mints it (validThreadID); this is the second, independent anchor,
+	// so the argv construction is safe whatever reached it — a state file written
+	// by an older binary included.
+	ErrContinuationToken = errors.New("codex-exec: continuation token unusable as an argv element")
+
+	// ErrRemoteGitHubCredential refuses a standard reusable GitHub credential
+	// variable in a remote invocation. Such a variable is ordinary provider
+	// environment for a local run, but #194 forbids serializing its authority to
+	// an execution substrate; remote publication identity belongs to the worker
+	// profile.
+	ErrRemoteGitHubCredential = errors.New("codex-exec: reusable GitHub credential forbidden on a remote substrate")
 )

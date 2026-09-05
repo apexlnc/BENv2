@@ -2,7 +2,13 @@
   "filesystem": {
     "allowRead": [
       "/home/ben/.local/bin/claude",
-      "/home/ben/.local/share/ben/wf/base.git",
+      "/home/ben/.local/share/ben/wf/base.git/HEAD",
+      "/home/ben/.local/share/ben/wf/base.git/config",
+      "/home/ben/.local/share/ben/wf/base.git/info/exclude",
+      "/home/ben/.local/share/ben/wf/base.git/logs",
+      "/home/ben/.local/share/ben/wf/base.git/objects",
+      "/home/ben/.local/share/ben/wf/base.git/refs",
+      "/home/ben/.local/share/ben/wf/base.git/worktrees/issue-7",
       "/home/ben/.local/share/ben/wf/issues/issue-7",
       "/home/ben/.local/share/ben/wf/private/issue-7",
       "/home/ben/.local/share/claude/versions",
@@ -13,7 +19,10 @@
       "/home/ben"
     ],
     "allowWrite": [
-      "/home/ben/.local/share/ben/wf/base.git",
+      "/home/ben/.local/share/ben/wf/base.git/logs",
+      "/home/ben/.local/share/ben/wf/base.git/objects",
+      "/home/ben/.local/share/ben/wf/base.git/refs",
+      "/home/ben/.local/share/ben/wf/base.git/worktrees/issue-7",
       "/home/ben/.local/share/ben/wf/issues/issue-7",
       "/home/ben/.local/share/ben/wf/private/issue-7",
       "/srv/shared"
@@ -21,6 +30,9 @@
     "denyWrite": [
       "/home/ben/.local/share/ben/wf/base.git/config",
       "/home/ben/.local/share/ben/wf/base.git/hooks",
+      "/home/ben/.local/share/ben/wf/base.git/worktrees/issue-7/commondir",
+      "/home/ben/.local/share/ben/wf/base.git/worktrees/issue-7/config.worktree",
+      "/home/ben/.local/share/ben/wf/base.git/worktrees/issue-7/gitdir",
       "/home/ben/.local/share/ben/wf/issues/issue-7/.git",
       "/home/ben/.local/share/ben/wf/private/issue-7/sandbox"
     ],

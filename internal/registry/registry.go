@@ -47,8 +47,9 @@ var (
 	// kind the loader accepted and the CLI could not find is the drift #55 was
 	// about.
 	sources = map[string]core.SourceKind{
-		credential.OctoSTSKindName: credential.OctoSTSKind{},
-		credential.StaticKindName:  credential.StaticKind{},
+		credential.OctoSTSKindName:       credential.OctoSTSKind{},
+		credential.ProjectedOIDCKindName: credential.ProjectedOIDCKind{},
+		credential.StaticKindName:        credential.StaticKind{},
 	}
 )
 

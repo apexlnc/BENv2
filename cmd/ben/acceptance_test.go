@@ -279,7 +279,7 @@ func TestPushedWithoutAPRContinuesAndThenPublishes(t *testing.T) {
 	}
 
 	// The retry's `gh pr create` succeeds.
-	h.Tracker.SetPR("ben/issue-7", core.PR{Number: 12, URL: "https://example.test/pull/12", State: "open", Branch: "ben/issue-7"})
+	h.Tracker.SetPR("ben/issue-7", core.PR{Number: 12, URL: "https://example.test/pull/12", State: "open", Branch: "ben/issue-7", BaseBranch: "main"})
 
 	h.Clock.Advance(2 * time.Second)
 	h.waitState(orchestrator.StateDone)
@@ -400,7 +400,7 @@ func TestARewrittenBranchDoesNotVerifyEvenWithAnOpenPR(t *testing.T) {
 		// core.PublishFacts.AdvancedPastBase).
 		return core.PublishFacts{Head: rewrittenSHA}, nil
 	}, func(tr *fake.Tracker) {
-		tr.SetPR("ben/issue-7", core.PR{Number: 13, URL: "https://example.test/pull/13", State: "open", Branch: "ben/issue-7"})
+		tr.SetPR("ben/issue-7", core.PR{Number: 13, URL: "https://example.test/pull/13", State: "open", Branch: "ben/issue-7", BaseBranch: "main"})
 	})
 
 	h.waitState(orchestrator.StateNeedsReview)
@@ -428,7 +428,7 @@ func TestARewrittenBranchDoesNotVerifyEvenWithAnOpenPR(t *testing.T) {
 // other leg holds and a caller checking only for non-nil would publish.
 func TestAClosedPRIsNotPublishEvidence(t *testing.T) {
 	h := startE2E(t, pushedAndDescends, func(tr *fake.Tracker) {
-		tr.SetPR("ben/issue-7", core.PR{Number: 11, URL: "https://example.test/pull/11", State: "closed", Branch: "ben/issue-7"})
+		tr.SetPR("ben/issue-7", core.PR{Number: 11, URL: "https://example.test/pull/11", State: "closed", Branch: "ben/issue-7", BaseBranch: "main"})
 	})
 
 	// Incomplete, not published: the work exists and is pushed, so this takes
@@ -441,6 +441,39 @@ func TestAClosedPRIsNotPublishEvidence(t *testing.T) {
 	}
 	if n := h.Tracker.FindPRReads(); n == 0 {
 		t.Error("leg 3 was never read; the git legs all held, so the tracker decides this one")
+	}
+}
+
+func TestAWrongTargetPullRequestParksAsContradicted(t *testing.T) {
+	h := startE2E(t, pushedAndDescends, func(tr *fake.Tracker) {
+		tr.SetPR("ben/issue-7", core.PR{
+			Number: 14, URL: "https://example.test/pull/14", State: "open",
+			Branch: "ben/issue-7", BaseBranch: "unprotected",
+		})
+	})
+
+	h.waitState(orchestrator.StateNeedsReview)
+	h.waitForNeedsReviewComment()
+	if h.reachedDone() {
+		t.Fatalf("path = %v; a wrong-target pull request must not publish", h.o.Transitions.Path("7"))
+	}
+	if got := h.lastComment().Detail; !strings.Contains(got, "targets unprotected, not main") {
+		t.Fatalf("needs-review detail = %q, want the target contradiction", got)
+	}
+}
+
+func TestAmbiguousPullRequestsParkWithoutSelectingEither(t *testing.T) {
+	h := startE2E(t, pushedAndDescends, func(tr *fake.Tracker) {
+		tr.SetFailFindPR(core.ErrPRAmbiguous)
+	})
+
+	h.waitState(orchestrator.StateNeedsReview)
+	h.waitForNeedsReviewComment()
+	if h.reachedDone() {
+		t.Fatalf("path = %v; ambiguous pull requests must not publish", h.o.Transitions.Path("7"))
+	}
+	if got := h.lastComment().Detail; !strings.Contains(got, core.ErrPRAmbiguous.Error()) {
+		t.Fatalf("needs-review detail = %q, want ErrPRAmbiguous", got)
 	}
 }
 

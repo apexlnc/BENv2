@@ -792,6 +792,32 @@ func (w *Watcher[R]) transaction(ctx context.Context, cur Snapshot[R]) (out outc
 			"it is process-lifetime configuration and a restart adopts it (SPEC §5.2.9, §10.1)",
 			ErrDeploymentChanged, cur.Definition.Config.Deployment.Mode, def.Config.Deployment.Mode)}
 	}
+	// The substrate declaration is process-lifetime for a related but distinct
+	// reason (#194). Deployment is an assertion a reload cannot make true; this
+	// is an identity outstanding *work* is bound to. A daemon holding remote
+	// claims has sandboxes, run bindings and event cursors addressed against one
+	// backend, and a reload that moved the substrate under them would leave every
+	// one of those unattachable — while a live agent kept running somewhere BEN
+	// had stopped looking. Same landing as above: last-known-good stands,
+	// dispatch blocks, a restart adopts it.
+	if cur.Definition != nil && cur.Definition.Config.SubstrateBinding() != def.Config.SubstrateBinding() {
+		return outcome[R]{err: fmt.Errorf("%w: substrate declaration changed (%s → %s); "+
+			"it is process-lifetime configuration and a restart adopts it, because outstanding claims "+
+			"address the backend they were dispatched to (#194, #46)",
+			ErrSubstrateChanged, cur.Definition.Config.Substrate.Kind, def.Config.Substrate.Kind)}
+	}
+	// The review controller is process-lifetime for both of those reasons at
+	// once (#204). Its outstanding work is addressed against a backend, like the
+	// substrate's; and its three identities are what make every author check on
+	// the forge mean anything, so moving one under an in-flight round could
+	// route on artifacts a different login wrote. Same landing: last-known-good
+	// stands, dispatch blocks, a restart adopts it.
+	if cur.Definition != nil && !sameReviewBinding(cur.Definition.Config.ReviewBinding(), def.Config.ReviewBinding()) {
+		return outcome[R]{err: fmt.Errorf("%w: review declaration changed (enabled %t → %t); "+
+			"it is process-lifetime configuration and a restart adopts it, because outstanding review runs "+
+			"address the reviewer they were dispatched to and its identities decide what the forge is read as (#204, #11)",
+			ErrReviewChanged, cur.Definition.Config.Review.Enabled, def.Config.Review.Enabled)}
+	}
 
 	runtime := cur.Runtime
 	if changed.Any() {

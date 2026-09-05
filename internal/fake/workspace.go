@@ -34,12 +34,19 @@ type Workspaces struct {
 	claimBases       map[string]core.ClaimBase
 	legacyBases      map[string]string
 	heads            map[string]string
-	failClaimBase    error
-	failBeginClaim   error
-	claimBaseGate    func()
-	ClaimBaseBegins  []BeginClaimBaseCall
+	priorWork        map[string]bool
+
+	failClaimBase      error
+	failClaimBaseState core.ClaimBase
+
+	failBeginClaim  error
+	claimBaseGate   func()
+	ClaimBaseBegins []BeginClaimBaseCall
 	// defaultBase is the head a fresh workspace pins to. See SetDefaultBase.
 	defaultBase string
+	// defaultTarget is the target selector a fresh assignment records atomically
+	// with defaultBase. Existing pins retain their value when it moves.
+	defaultTarget string
 
 	// markers is the §9.10 run marker store, keyed by workspace key.
 	markers map[string]core.RunMarker
@@ -75,6 +82,9 @@ type Workspaces struct {
 // identity, and a fake that handed out a distinct one per issue would let code
 // that confused the two pass here and fail in production.
 const DefaultBaseSHA = "1111111111111111111111111111111111111111"
+
+// DefaultTargetBranch is the target a fresh fake provider selects.
+const DefaultTargetBranch = "main"
 
 type PrepareCall struct {
 	Identifier string
@@ -112,13 +122,15 @@ func pathsFor(key string) core.WorkspacePaths {
 
 func NewWorkspaces() *Workspaces {
 	return &Workspaces{
-		claimBases:  map[string]core.ClaimBase{},
-		legacyBases: map[string]string{},
-		heads:       map[string]string{},
-		defaultBase: DefaultBaseSHA,
-		markers:     map[string]core.RunMarker{},
-		dirs:        map[string]bool{},
-		owners:      map[string]string{},
+		claimBases:    map[string]core.ClaimBase{},
+		legacyBases:   map[string]string{},
+		heads:         map[string]string{},
+		priorWork:     map[string]bool{},
+		defaultBase:   DefaultBaseSHA,
+		defaultTarget: DefaultTargetBranch,
+		markers:       map[string]core.RunMarker{},
+		dirs:          map[string]bool{},
+		owners:        map[string]string{},
 	}
 }
 
@@ -165,6 +177,7 @@ func (w *Workspaces) BeginClaimBase(_ context.Context, issue core.Issue, epoch i
 		w.claimBases[key] = core.ClaimBase{
 			State: core.ClaimBasePending, Epoch: epoch,
 			OutgoingEpoch: state.Epoch, OutgoingBaseSHA: state.BaseSHA,
+			OutgoingTargetBranch: state.TargetBranch,
 		}
 		return nil
 	default:
@@ -176,7 +189,7 @@ func (w *Workspaces) ClaimBase(_ context.Context, issue core.Issue) (core.ClaimB
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.failClaimBase != nil {
-		return core.ClaimBase{}, w.failClaimBase
+		return w.failClaimBaseState, w.failClaimBase
 	}
 	state, ok := w.claimBases["issue-"+issue.Identifier]
 	if !ok {
@@ -199,6 +212,7 @@ func (w *Workspaces) AbandonPendingClaimBase(_ context.Context, issue core.Issue
 	if state.OutgoingEpoch > 0 {
 		w.claimBases[key] = core.ClaimBase{
 			State: core.ClaimBasePinned, Epoch: state.OutgoingEpoch, BaseSHA: state.OutgoingBaseSHA,
+			TargetBranch: state.OutgoingTargetBranch,
 		}
 		return nil
 	}
@@ -275,6 +289,7 @@ func (w *Workspaces) PrepareClaim(_ context.Context, issue core.Issue, attempt i
 			probe := core.Workspace{
 				WorkspacePaths: pathsFor(key), Key: key, Branch: "ben/" + key,
 				ClaimEpoch: state.OutgoingEpoch, BaseSHA: state.OutgoingBaseSHA,
+				TargetBranch: state.OutgoingTargetBranch,
 			}
 			var err error
 			prior, err = w.prepareFacts(probe)
@@ -291,7 +306,10 @@ func (w *Workspaces) PrepareClaim(_ context.Context, issue core.Issue, attempt i
 			}
 			head = prior.Head
 		}
-		state = core.ClaimBase{State: core.ClaimBasePinned, Epoch: epoch, BaseSHA: head}
+		state = core.ClaimBase{
+			State: core.ClaimBasePinned, Epoch: epoch, BaseSHA: head,
+			TargetBranch: w.defaultTarget,
+		}
 		w.claimBases[key] = state
 		w.heads[key] = head
 	}
@@ -305,6 +323,8 @@ func (w *Workspaces) PrepareClaim(_ context.Context, issue core.Issue, attempt i
 		Branch:         "ben/" + key,
 		ClaimEpoch:     epoch,
 		BaseSHA:        base,
+		TargetBranch:   state.TargetBranch,
+		PriorWork:      w.priorWork[issue.Identifier],
 	}
 	if w.prepareErrWithWS != nil {
 		// The post-pin side: the worktree exists and is kept for forensics
@@ -345,6 +365,14 @@ func (w *Workspaces) SetDefaultBase(sha string) {
 	w.defaultBase = sha
 }
 
+// SetDefaultTarget changes the selector used only when a later pending claim
+// becomes pinned. It does not rewrite existing claim authority.
+func (w *Workspaces) SetDefaultTarget(branch string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.defaultTarget = branch
+}
+
 // SetLegacyBasePin installs a pre-epoch pin. BeginClaimBase may use it only as
 // the outgoing comparison fact of a newly created epoch.
 func (w *Workspaces) SetLegacyBasePin(identifier, sha string) {
@@ -382,6 +410,17 @@ func (w *Workspaces) SetFailBeginClaimBase(err error) {
 func (w *Workspaces) SetFailClaimBase(err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.failClaimBase = err
+	w.failClaimBaseState = core.ClaimBase{}
+}
+
+// SetClaimBaseError installs the state-plus-error shape a validated legacy
+// provider record returns. Ordinary read failures use SetFailClaimBase and
+// carry no state.
+func (w *Workspaces) SetClaimBaseError(state core.ClaimBase, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.failClaimBaseState = state
 	w.failClaimBase = err
 }
 
@@ -449,9 +488,10 @@ func (w *Workspaces) PublishFacts(_ context.Context, ws core.Workspace) (core.Pu
 	facts := w.facts
 	state, ok := w.claimBases[ws.Key]
 	w.mu.Unlock()
-	if !ok || state.State != core.ClaimBasePinned || state.Epoch != ws.ClaimEpoch || state.BaseSHA != ws.BaseSHA {
-		return core.PublishFacts{}, fmt.Errorf("fake: workspace epoch/base %d/%s does not match provider state %+v",
-			ws.ClaimEpoch, ws.BaseSHA, state)
+	if !ok || state.State != core.ClaimBasePinned || state.Epoch != ws.ClaimEpoch ||
+		state.BaseSHA != ws.BaseSHA || state.TargetBranch != ws.TargetBranch {
+		return core.PublishFacts{}, fmt.Errorf("fake: workspace epoch/base/target %d/%s/%s does not match provider state %+v",
+			ws.ClaimEpoch, ws.BaseSHA, ws.TargetBranch, state)
 	}
 	if facts == nil {
 		// Fail closed rather than answer the zero value. core.PublishFacts{} is
@@ -512,6 +552,16 @@ func (w *Workspaces) SetPrepareFacts(fn func(ws core.Workspace) (core.LocalBranc
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.prepareFacts = fn
+}
+
+// SetPriorWork scripts the trusted provider-owned prior-work fact returned by
+// PrepareClaim. It is separate from SetPrepareFacts because a remote provider
+// has no local branch observation and folds the prior publication into its new
+// claim-time base.
+func (w *Workspaces) SetPriorWork(identifier string, prior bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.priorWork[identifier] = prior
 }
 
 // PrepareCount reports how many attempts were prepared for an issue.
@@ -779,7 +829,7 @@ func (w *Workspaces) SetFailMarkerRead(err error) {
 }
 
 // ResolveWorkspace names the workspace an issue's work lives in and reports its
-// pinned claim epoch/base pair, preparing nothing (SPEC §9.10).
+// pinned claim epoch/base/target tuple, preparing nothing (SPEC §9.10).
 //
 // `false` means no authorizing pinned pair stands. ClaimBase separately exposes
 // absent versus pending so recovery cannot turn that absence into evidence.
@@ -800,6 +850,7 @@ func (w *Workspaces) ResolveWorkspace(_ context.Context, issue core.Issue) (core
 		Branch:         "ben/" + key,
 		ClaimEpoch:     state.Epoch,
 		BaseSHA:        state.BaseSHA,
+		TargetBranch:   state.TargetBranch,
 	}, true, nil
 }
 

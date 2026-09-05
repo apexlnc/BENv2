@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "packet_digest": "sha256:772099818aff9bd25682abe88cbc6852c8cb828b650c91fc4019b7dd7b6974be",
+  "subject_matches": true,
+  "repository_matches": true,
+  "sections": [
+    {
+      "section": "restated_outcome",
+      "binding": "subject",
+      "status": "matches_capture",
+      "reason": "packet subject matches the supplied comparison capture"
+    },
+    {
+      "section": "candidate_non_goals",
+      "binding": "subject",
+      "status": "matches_capture",
+      "reason": "packet subject matches the supplied comparison capture"
+    },
+    {
+      "section": "assumptions_to_confirm",
+      "binding": "subject",
+      "status": "matches_capture",
+      "reason": "packet subject matches the supplied comparison capture"
+    },
+    {
+      "section": "decision_queue",
+      "binding": "subject",
+      "status": "matches_capture",
+      "reason": "packet subject matches the supplied comparison capture"
+    },
+    {
+      "section": "applicable_constraints",
+      "binding": "subject_and_repository",
+      "status": "matches_capture",
+      "reason": "packet binding matches the supplied comparison capture"
+    },
+    {
+      "section": "acceptance_gaps",
+      "binding": "subject_and_repository",
+      "status": "matches_capture",
+      "reason": "packet binding matches the supplied comparison capture"
+    },
+    {
+      "section": "proposed_acceptance_tests",
+      "binding": "subject_and_repository",
+      "status": "matches_capture",
+      "reason": "packet binding matches the supplied comparison capture"
+    },
+    {
+      "section": "affected_area_hypotheses",
+      "binding": "subject_and_repository",
+      "status": "matches_capture",
+      "reason": "packet binding matches the supplied comparison capture"
+    },
+    {
+      "section": "decision_decomposition",
+      "binding": "subject_and_repository",
+      "status": "matches_capture",
+      "reason": "packet binding matches the supplied comparison capture"
+    },
+    {
+      "section": "candidate_delivery_splits",
+      "binding": "subject_and_repository",
+      "status": "matches_capture",
+      "reason": "packet binding matches the supplied comparison capture"
+    },
+    {
+      "section": "reasons",
+      "binding": "subject_and_repository",
+      "status": "matches_capture",
+      "reason": "packet binding matches the supplied comparison capture"
+    },
+    {
+      "section": "recommendation",
+      "binding": "subject_and_repository",
+      "status": "matches_capture",
+      "reason": "packet binding matches the supplied comparison capture"
+    }
+  ]
+}

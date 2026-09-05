@@ -39,7 +39,7 @@ func TestRecoveryClaimBaseGateIsClosedAndFailClosed(t *testing.T) {
 		case core.ClaimBasePending:
 			state.Epoch = anchor
 		case core.ClaimBasePinned:
-			state.Epoch, state.BaseSHA = anchor, "base"
+			state.Epoch, state.BaseSHA, state.TargetBranch = anchor, "base", "main"
 		}
 
 		for _, marker := range markers {
@@ -96,8 +96,9 @@ func TestRecoveryClaimBaseGateRejectsMismatchAndHistoricalRunningEvidence(t *tes
 		err   error
 	}{
 		{name: "pending another epoch", state: core.ClaimBase{State: core.ClaimBasePending, Epoch: anchor - 1}},
-		{name: "pinned another epoch", state: core.ClaimBase{State: core.ClaimBasePinned, Epoch: anchor - 1, BaseSHA: "base"}},
+		{name: "pinned another epoch", state: core.ClaimBase{State: core.ClaimBasePinned, Epoch: anchor - 1, BaseSHA: "base", TargetBranch: "main"}},
 		{name: "pinned without base", state: core.ClaimBase{State: core.ClaimBasePinned, Epoch: anchor}},
+		{name: "pinned without target", state: core.ClaimBase{State: core.ClaimBasePinned, Epoch: anchor, BaseSHA: "base"}},
 		{name: "read failed", err: errors.New("bad record")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -112,6 +113,44 @@ func TestRecoveryClaimBaseGateRejectsMismatchAndHistoricalRunningEvidence(t *tes
 	got, resolved := classifyRecoveryClaimBase(anchor, pending, nil, absent, nil, true)
 	if !resolved || !got.epochFault || got.action != recoveryActionPark {
 		t.Fatalf("pending plus historical running = (%+v, %v), want epoch-fault park", got, resolved)
+	}
+}
+
+func TestClaimAuthorityRequiresAnExactEpochBaseTargetTuple(t *testing.T) {
+	const epoch = int64(41)
+	state := core.ClaimBase{
+		State: core.ClaimBasePinned, Epoch: epoch, BaseSHA: "base", TargetBranch: "release/v2",
+	}
+	workspace := core.Workspace{
+		ClaimEpoch: epoch, BaseSHA: "base", TargetBranch: "release/v2",
+	}
+	if !claimBasePinsEpoch(state, epoch) || !claimBaseAuthorizesWorkspace(state, workspace) {
+		t.Fatal("the complete matching tuple did not authorize")
+	}
+
+	for _, tc := range []struct {
+		name      string
+		mutatePin func(*core.ClaimBase)
+		mutateWS  func(*core.Workspace)
+	}{
+		{name: "pin missing target", mutatePin: func(v *core.ClaimBase) { v.TargetBranch = "" }},
+		{name: "workspace missing target", mutateWS: func(v *core.Workspace) { v.TargetBranch = "" }},
+		{name: "target mismatch", mutateWS: func(v *core.Workspace) { v.TargetBranch = "main" }},
+		{name: "base mismatch", mutateWS: func(v *core.Workspace) { v.BaseSHA = "other" }},
+		{name: "epoch mismatch", mutateWS: func(v *core.Workspace) { v.ClaimEpoch++ }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotState, gotWorkspace := state, workspace
+			if tc.mutatePin != nil {
+				tc.mutatePin(&gotState)
+			}
+			if tc.mutateWS != nil {
+				tc.mutateWS(&gotWorkspace)
+			}
+			if claimBaseAuthorizesWorkspace(gotState, gotWorkspace) {
+				t.Fatalf("mismatched authority was accepted: state=%+v workspace=%+v", gotState, gotWorkspace)
+			}
+		})
 	}
 }
 

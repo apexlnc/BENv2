@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 )
 
 // The posture against the real sandbox runtime.
@@ -39,6 +41,7 @@ func TestSandboxCommitsInALinkedWorktree(t *testing.T) {
 	private := mkdir(t, wf, "private", "issue-7")
 
 	seedLinkedWorktree(t, git, shared, workspace)
+	worktreeAdmin := filepath.Clean(gitOut(t, git, "-C", workspace, "rev-parse", "--absolute-git-dir"))
 	origin := filepath.Join(private, "origin.git")
 	gitOut(t, git, "init", "--bare", "--initial-branch=main", origin)
 	gitOut(t, git, "--git-dir="+shared, "remote", "add", "origin", origin)
@@ -63,13 +66,15 @@ func TestSandboxCommitsInALinkedWorktree(t *testing.T) {
 	}
 
 	p := goldenProvider(t)
-	paths := sandboxPaths{
-		Workspace: workspace, SharedGitDir: shared, PrivateDir: private,
-		Binary: git, Canonical: git, GH: stubGH, Control: sandboxControlFor(private),
-	}
 	// add_dirs and sandbox_domains come from goldenProvider and are irrelevant
 	// here; what matters is that the three provider paths are the real ones.
 	p.AddDirs = nil
+	paths, err := p.sandboxPathsFor(core.RunSpec{Workspace: core.WorkspacePaths{
+		Path: workspace, SharedGitDir: shared, PrivateDir: private,
+	}}, git, stubGH)
+	if err != nil {
+		t.Fatalf("sandboxPathsFor: %v", err)
+	}
 	if err := p.writeSandbox(paths, gitIdentity{Name: "ben-test", Email: "ben@test.invalid"}); err != nil {
 		t.Fatalf("writeSandbox: %v", err)
 	}
@@ -92,13 +97,21 @@ func TestSandboxCommitsInALinkedWorktree(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workspace, "NOTE.md"), []byte("sandboxed\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := run(t, workspace, git, "add", "-A"); err != nil {
+	if out, err := run(t, workspace, git, "status", "--short", "--", "NOTE.md"); err != nil {
+		t.Fatalf("git status under the posture: %v: %s", err, out)
+	} else if got := strings.TrimSpace(out); got != "?? NOTE.md" {
+		t.Fatalf("git status under the posture emitted unexpected output %q; want only the untracked file", got)
+	}
+	if out, err := run(t, workspace, git, "add", "NOTE.md"); err != nil {
 		t.Fatalf("git add under the posture: %v: %s", err, out)
+	} else if out != "" {
+		t.Fatalf("successful git add under the posture emitted output: %q", out)
 	}
 	if out, err := run(t, workspace, git, "commit", "-m", "a2 under srt"); err != nil {
 		t.Fatalf("git commit under the posture: %v: %s\n\n"+
 			"This is the criterion: a linked worktree's .git is a pointer into the shared git "+
-			"dir, so a posture without it in allowWrite *and* allowRead cannot commit.", err, out)
+			"dir, so the common mutable roots and current admin must be writable while the required "+
+			"common metadata remains readable without granting the shared root.", err, out)
 	}
 	// Read back through the shared git dir, not the worktree: that the object
 	// is there is the whole claim.
@@ -113,12 +126,151 @@ func TestSandboxCommitsInALinkedWorktree(t *testing.T) {
 
 	// --- and the denials, each of which the commit above must not have needed ---
 
+	// #232's property, beyond the settings fixture: an agent tries the actual
+	// redirect against the real runtime, then a daemon-side git resolves the
+	// worktree. If commondir changed, Git would leave the reported shared dir
+	// before it ever consulted BEN's hook/config neutralization.
+	t.Run("commondir tamper cannot redirect daemon git", func(t *testing.T) {
+		commondir := filepath.Join(worktreeAdmin, "commondir")
+		before, err := os.ReadFile(commondir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rogue := mkdir(t, workspace, "agent-chosen-common.git")
+		registry := filepath.Join(shared, "worktrees")
+		replaceDirectory := func(target string) string {
+			moved := target + ".moved"
+			rel, err := filepath.Rel(target, worktreeAdmin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldAdmin := filepath.Join(moved, rel)
+			return strings.Join([]string{
+				"mv -- " + shellQuote(target) + " " + shellQuote(moved),
+				"mkdir -p -- " + shellQuote(worktreeAdmin),
+				"cp -- " + shellQuote(filepath.Join(oldAdmin, "gitdir")) + " " +
+					shellQuote(filepath.Join(oldAdmin, "HEAD")) + " " + shellQuote(worktreeAdmin) + "/",
+				"printf '%s\\n' " + shellQuote(rogue) + " > " + shellQuote(commondir),
+			}, " && ")
+		}
+		for _, attack := range []struct {
+			name, script, hostMoved string
+			mustRefuse              bool
+		}{
+			{"overwrite", "printf '%s\\n' " + shellQuote(rogue) + " > " + shellQuote(commondir), "", true},
+			{"remove", "rm -- " + shellQuote(commondir), "", true},
+			{"rename", "mv -- " + shellQuote(commondir) + " " + shellQuote(commondir+".moved"), "", true},
+			{"rename and recreate admin directory", replaceDirectory(worktreeAdmin), worktreeAdmin + ".moved", true},
+			// On Linux the registry's host directory is hidden by denyRead and a
+			// tmpfs skeleton may be renamed successfully. That is harmless only if
+			// the host directory did not move and no host pointer changed.
+			{"rename and recreate worktrees registry", replaceDirectory(registry), registry + ".moved", false},
+		} {
+			t.Run(attack.name, func(t *testing.T) {
+				out, err := run(t, workspace, "/bin/sh", "-c", attack.script)
+				if attack.mustRefuse && err == nil {
+					t.Errorf("tampering with %s succeeded; Git can now be pointed at agent-owned config and hooks\n%s",
+						commondir, out)
+				}
+				if attack.hostMoved != "" {
+					if _, statErr := os.Lstat(attack.hostMoved); !errors.Is(statErr, os.ErrNotExist) {
+						t.Errorf("host path %s exists after the sandboxed rename (lstat err=%v)",
+							attack.hostMoved, statErr)
+					}
+				}
+				after, readErr := os.ReadFile(commondir)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if string(after) != string(before) {
+					t.Errorf("%s changed despite the sandbox refusal", commondir)
+				}
+			})
+		}
+		got := gitOut(t, git, "-C", workspace, "rev-parse", "--git-common-dir")
+		if !filepath.IsAbs(got) {
+			got = filepath.Join(workspace, got)
+		}
+		if got = filepath.Clean(got); !sameTestPath(t, got, shared) {
+			t.Errorf("daemon-side git common dir = %s, want the provider-reported %s", got, shared)
+		}
+	})
+
+	// A path denial also has to hold when the run asks the kernel for another
+	// name for the same inode. Retained aliases are refused before composition;
+	// this measures that the runtime does not let a run create one across its
+	// read-only and writable roots and then mutate the denied file through it.
+	t.Run("denied git files cannot be rewritten through a hard link", func(t *testing.T) {
+		for _, target := range []struct{ name, path string }{
+			{"commondir", filepath.Join(worktreeAdmin, "commondir")},
+			{"shared config", filepath.Join(shared, "config")},
+			{"workspace pointer", filepath.Join(workspace, ".git")},
+		} {
+			t.Run(target.name, func(t *testing.T) {
+				before, err := os.ReadFile(target.path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				alias := filepath.Join(workspace, "hardlink-"+strings.ReplaceAll(target.name, " ", "-"))
+				out, err := run(t, workspace, "/bin/sh", "-c", strings.Join([]string{
+					"/bin/ln " + shellQuote(target.path) + " " + shellQuote(alias),
+					"printf pwned > " + shellQuote(alias),
+				}, " && "))
+				if err == nil {
+					t.Errorf("rewriting denied %s through a new hard link succeeded\n%s", target.path, out)
+				}
+				after, readErr := os.ReadFile(target.path)
+				if readErr != nil || string(after) != string(before) {
+					t.Errorf("denied %s changed through a hard link: read err=%v", target.path, readErr)
+				}
+				if removeErr := os.Remove(alias); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					t.Fatalf("remove hard-link probe: %v", removeErr)
+				}
+			})
+		}
+	})
+
+	// The settings were composed before this sibling existed. A snapshot-based
+	// deny list misses it; keeping the registry itself outside allowWrite makes
+	// its creation time irrelevant.
+	t.Run("worktree added after composition stays read only", func(t *testing.T) {
+		later := filepath.Join(wf, "issues", "issue-9")
+		gitOut(t, git, "--git-dir="+shared, "worktree", "add", "-b", "ben/issue-9", later, "main")
+		laterAdmin := filepath.Clean(gitOut(t, git, "-C", later, "rev-parse", "--absolute-git-dir"))
+		laterCommon := filepath.Join(laterAdmin, "commondir")
+		before, err := os.ReadFile(laterCommon)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := run(t, workspace, "/bin/sh", "-c",
+			"printf '%s\\n' /agent/chosen > "+shellQuote(laterCommon))
+		if err == nil {
+			t.Errorf("rewriting a later worktree's commondir succeeded; the older sandbox retained "+
+				"write authority over the shared registry\n%s", out)
+		}
+		if after, readErr := os.ReadFile(laterCommon); readErr != nil || string(after) != string(before) {
+			t.Errorf("later commondir changed despite the refusal: read err=%v", readErr)
+		}
+		pwned := filepath.Join(laterAdmin, "pwned")
+		out, err = run(t, workspace, "/bin/sh", "-c", "printf pwned > "+shellQuote(pwned))
+		if err == nil {
+			t.Errorf("writing a new file in the later admin directory succeeded\n%s", out)
+		}
+		if _, statErr := os.Lstat(pwned); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("later admin contains pwned after the refusal (lstat err=%v)", statErr)
+		}
+	})
+
 	for _, tc := range []struct{ name, path, why string }{
 		{"a shared hook", filepath.Join(shared, "hooks", "post-checkout"),
 			"code the next run executes, in a directory every workspace of this workflow shares"},
 		{"the shared config", sharedConfig,
 			"the shared repository's own configuration"},
-		{"the gitdir pointer", filepath.Join(workspace, ".git"),
+		{"the worktree admin reverse pointer", filepath.Join(worktreeAdmin, "gitdir"),
+			"stable administration can be redirected without participating in a commit"},
+		{"the per-worktree config", filepath.Join(worktreeAdmin, "config.worktree"),
+			"it can steer Git when extensions.worktreeConfig is enabled"},
+		{"the worktree .git pointer", filepath.Join(workspace, ".git"),
 			"§6.2 reattaches, so a rewrite would choose the next attempt's repository"},
 		{"BEN's git config", paths.Control.GitConfig,
 			"an agent that rewrites it can restore an insteadOf rewrite and redirect its next push"},
@@ -127,7 +279,8 @@ func TestSandboxCommitsInALinkedWorktree(t *testing.T) {
 	} {
 		t.Run("denies writing "+tc.name, func(t *testing.T) {
 			before, _ := os.ReadFile(tc.path)
-			out, err := run(t, workspace, "/bin/sh", "-c", "echo poisoned >> "+tc.path)
+			out, err := run(t, workspace, "/bin/sh", "-c",
+				"printf '%s\\n' poisoned >> "+shellQuote(tc.path))
 			if err == nil {
 				t.Errorf("writing %s succeeded — %s\n%s", tc.path, tc.why, out)
 			}
@@ -240,13 +393,9 @@ func TestRealSandboxAcceptsTheComposedSettings(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	private := mkdir(t, home, "private")
-	paths := sandboxPaths{
-		Workspace: mkdir(t, home, "ws"), SharedGitDir: mkdir(t, home, "base.git"),
-		PrivateDir: private, Binary: "/bin/sh", Canonical: "/bin/sh",
-		Control: sandboxControlFor(private),
-	}
 	p := goldenProvider(t)
 	p.AddDirs = nil
+	paths := p.probeSandboxPaths(private, "/bin/sh", "")
 	if err := p.writeSandbox(paths, gitIdentity{Name: "n", Email: "e@x.invalid"}); err != nil {
 		t.Fatal(err)
 	}
@@ -296,8 +445,8 @@ func requireGit(t *testing.T) string {
 
 // seedLinkedWorktree builds SPEC §6.2's shape with real git: a shared git dir
 // and a worktree whose `.git` is a *file* pointing into it. That the pointer is
-// a file rather than a directory is the whole reason the posture needs the
-// shared dir; a plain clone would pass a posture that cannot commit.
+// a file rather than a directory is the whole reason the posture needs paths
+// inside the shared dir; a plain clone would pass a posture that cannot commit.
 func seedLinkedWorktree(t *testing.T, git, shared, workspace string) {
 	t.Helper()
 	seed := t.TempDir()

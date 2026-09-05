@@ -578,7 +578,7 @@ func TestOutcomesReachTheSinkInOrder(t *testing.T) {
 	}
 }
 
-// holdStopUntilAccounted is a stopGate that keeps the signal ladder standing
+// holdStopUntilAccounted is a stopGate that keeps bounded teardown standing
 // until the loop has applied `events` run events.
 //
 // It exists because the fake's script loop and the stop race *by design*: each

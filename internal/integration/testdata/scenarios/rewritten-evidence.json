@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "name": "rewritten-evidence",
+  "issue": {
+    "identifier": "7"
+  },
+  "attempts": [
+    {
+      "outcome": "succeeded",
+      "session": "rewritten-1"
+    }
+  ],
+  "publication": "rewritten",
+  "steps": [
+    {
+      "action": "start",
+      "until": "needs-review"
+    }
+  ]
+}

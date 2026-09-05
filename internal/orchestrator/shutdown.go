@@ -13,6 +13,11 @@ import (
 // every in-flight run, waits for confirmed termination wherever a handle exists,
 // and lands the effects already ordered. Whatever claim or label has durably
 // landed stays standing, and §9.10 recovery resumes the work at the next start.
+// A remote provider may additionally apply its configured on_shutdown
+// allocation policy once the execution domain is quiet. That action never
+// releases the tracker claim or retires its workspace-cycle identity; it only
+// retains, suspends, or deletes the backend allocation recovery will reattach or
+// reacquire.
 //
 // What that rules out is worth stating, because both alternatives look
 // reasonable from inside a single record. Releasing each confirmed stop strands
@@ -24,17 +29,17 @@ import (
 // pinned base can walk past commits that were never pushed.
 //
 // The waiting is not symmetrical with that restraint, and deliberately so. A
-// possibly-live process is the one thing a restart cannot reason about (§9.8),
-// so the drain does insist on a confirmed termination — and BEN does not bound
-// how long that takes. The supervisor does, through TimeoutStopSec: a daemon
-// that cannot confirm is a daemon whose agent survived SIGKILL, and inventing a
-// deadline here would mean exiting while a process may still hold the worktree,
-// which is the trade §9.8 refuses everywhere else.
+// possibly-live execution domain is the one thing a restart cannot reason about
+// (§9.8), so the drain does insist on a confirmed termination — and BEN does not
+// bound how long that takes. The supervisor does, through TimeoutStopSec: a
+// daemon that cannot confirm is a daemon whose domain teardown did not settle,
+// and inventing a deadline here would mean exiting while a process may still
+// hold the worktree, which is the trade §9.8 refuses everywhere else.
 
 // Shutdown stops dispatch and winds the loop down to quiescence.
 //
 // It returns when nothing is left that a restart could not reconstruct: every
-// run's process group confirmed gone, and every tracker write the loop had
+// run's execution domain confirmed quiet, and every tracker write the loop had
 // already ordered landed. It does not stop the loop — the caller cancels the
 // context afterwards, and not before, because the context passed to
 // AgentRunner.Start descends from it and cancelling it is exactly the abandonment
@@ -146,6 +151,11 @@ func (o *Orchestrator) driveShutdown(ctx context.Context) {
 			// story is not finished; drained() refuses to complete on the same
 			// field, so waiting costs nothing and cannot strand the record.
 			o.recordAttempt(r, core.FailureKilled, VerdictUnknown)
+			// A remote substrate has a distinct allocation policy for process
+			// shutdown. It runs only after the process is confirmed gone and any
+			// earned after_run hook is already ahead of it on the effect queue;
+			// local providers expose no such surface and remain untouched.
+			o.completeShutdown(ctx, r)
 		}
 		// Everything the loop had already ordered — a label projection, a
 		// milestone, a release reconciliation decided before the signal — is
@@ -154,13 +164,12 @@ func (o *Orchestrator) driveShutdown(ctx context.Context) {
 		// which label a transition removed, so a projection abandoned halfway
 		// leaves recovery reading a state this daemon never reached.
 		o.driveOwed(ctx, r)
-		if r.handle != nil && !r.groupGone {
+		if r.handle != nil && !r.domainQuiet {
 			// StopInterrupt, not StopDiscard. Discard is deliberately less
-			// patient — the harness cuts the ladder's grace to a tenth — and
-			// impatience is the wrong trade when the only answer worth having is
-			// a confirmed one. It also aborts event emission, which would
-			// truncate the verbatim record §7.2 requires of a run that is being
-			// interrupted rather than thrown away.
+			// patient, and impatience is the wrong trade when the only answer
+			// worth having is a confirmed one. It also aborts event emission,
+			// which would truncate the verbatim record §7.2 requires of a run
+			// that is being interrupted rather than thrown away.
 			o.beginStop(ctx, r, core.StopInterrupt)
 		}
 	}
@@ -180,7 +189,7 @@ func (o *Orchestrator) driveShutdown(ctx context.Context) {
 //   - **A worker still out.** Its result would land on a record nobody owns —
 //     and a Start in flight is the sharp case, since abandoning it leaves a
 //     process running in a worktree with no handle anywhere to stop it.
-//   - **A process group not confirmed gone.** §9.8's rule, and the one thing the
+//   - **An execution domain not confirmed quiet.** §9.8's rule, and the one thing the
 //     drain insists on rather than merely tidies.
 //   - **A tracker write still owed.** The projection is what §9.10 classifies
 //     from; a half-written one is a state this daemon never reached.
@@ -195,24 +204,24 @@ func (o *Orchestrator) drained() bool {
 		case r.pending > 0, r.probeInFlight, r.stopInFlight:
 			return false
 		case r.handle != nil && !r.handleDone:
-			// Done, not merely a confirmed group. Stop answers about the process
-			// *group*; Done additionally means the process has been reaped and
-			// its transcript flushed and closed (SPEC §7.2, §7.4). Exiting on the
-			// group answer alone truncates the verbatim record of the run we just
+			// Done, not merely confirmed domain quiet. Done additionally means
+			// direct execution ended and its transcript flushed and closed
+			// (SPEC §7.2, §7.4). Exiting on the quiet answer alone truncates the
+			// verbatim record of the run we just
 			// interrupted — the same cost that ruled StopDiscard out one line
 			// above, arrived at from the other end.
 			//
-			// Bounded, because the group is confirmed gone by the time this is
-			// the only thing left: a reaped leader is one whose Wait has
-			// returned. #79's unbounded case is a leader that survives, and that
-			// shows up as an unconfirmed stop instead.
+			// Bounded, because confirmed local domain quiet proves the supervisor
+			// and provider exited, while boundStream independently bounds the
+			// remaining transcript drain. A remote adapter supplies the same Done
+			// obligation behind its own domain proof.
 			return false
-		case r.handle != nil && !r.groupGone:
-			// A live process group, and the drain's whole reason for waiting. It
+		case r.handle != nil && !r.domainQuiet:
+			// A possibly-live execution domain, and the drain's whole reason for waiting. It
 			// is load-bearing for the records driveShutdown does *not* re-arm —
 			// the ordered exits, whose stop is re-driven by retryPendingExits on
 			// the tick instead. Between those ticks stopInFlight is false, so
-			// without this clause a reaped leader with surviving descendants
+			// without this clause completed direct execution with surviving domain members
 			// reads as drained and the daemon leaves while a process still holds
 			// the worktree, which is the one thing §9.8 refuses.
 			//
@@ -224,13 +233,38 @@ func (o *Orchestrator) drained() bool {
 			return false
 		}
 	}
+	if len(o.endedCycles) > 0 {
+		// An ended workspace cycle's disposal (#252, cycle.go). Leaving on an
+		// unconfirmed one strands a sandbox and its volume — and for a gone or lost
+		// claim there is no standing assignment for §9.10 to re-derive the
+		// obligation from, so nothing anywhere would name them again.
+		//
+		// **The only clause that covers an obligation with no owner left**, which is
+		// a state that legitimately exists. A confirming read that says the issue is
+		// gone, or that the assignment is somebody else's, drops the held record —
+		// and if the same read's facts ended the cycle, the obligation is registered
+		// and then survives that drop (cycleEndedBy, dropHeld). At that point there
+		// is no record for `owesAnything` to catch and no held claim for the loop
+		// below, so without this the drain would complete and cancel the context out
+		// from under a delete in flight.
+		//
+		// The exposure is the one `owesAnything` already accepts — a backend that
+		// never answers holds the drain open — bounded the same way, by the
+		// supervisor's TimeoutStopSec (deploy/ben.service).
+		return false
+	}
 	for _, h := range o.held {
-		// A held claim owns no process and no workspace, so the only thing it
-		// can owe is a release reconciliation ordered before the signal — and the
-		// confirming Get that can resolve one the tracker will never accept, which
-		// the drain keeps offering for exactly that reason (#135, held.go). A
+		// A held claim owns no process, so what it can owe is a release
+		// reconciliation ordered before the signal — the confirming Get that can
+		// resolve one the tracker will never accept, which the drain keeps offering
+		// for exactly that reason (#135, held.go), and on a remote substrate the
+		// ended workspace cycle's disposal that release is ordered behind (#252). A
 		// releasing entry that could never be dropped would otherwise hold the
 		// drain open until the supervisor's TimeoutStopSec ended it.
+		//
+		// Both are covered by `releasing` alone: releaseHeld sets the disposal
+		// obligation with it and refuses to settle either during a drain, so
+		// shutdown initiates neither and waits only for what it already ordered.
 		if h.inFlight || h.releasing {
 			return false
 		}
@@ -259,15 +293,18 @@ func (o *Orchestrator) drained() bool {
 // confirmed. It is onStopped's first branch, ahead of the ones that exit the
 // record, because it must reach none of them.
 //
-// The group is gone, so the workspace has no process in it and the record's
-// in-memory life is over — but nothing is released, disposed, projected or
-// routed. The outcome the run reported is deliberately dropped rather than
-// applied: routing it is what produces `done`, `needs-review` or a continuation,
-// and each of those is a terminal projection or a new dispatch.
+// The domain is quiet, so the workspace has no attempt process in it and the record's
+// in-memory life is over — but no tracker claim or cycle identity is released,
+// disposed, projected or routed. driveShutdown may apply a remote allocation's
+// on_shutdown policy after this returns; that is backend resource management,
+// not an exit from the claim. The outcome the run reported is deliberately
+// dropped rather than applied: routing it is what produces `done`,
+// `needs-review` or a continuation, and each of those is a terminal projection
+// or a new dispatch.
 func (o *Orchestrator) suspendStopped(ctx context.Context, r *Record) {
-	r.groupGone = true
-	// Cleared even though the drain releases and projects nothing. The group is
-	// confirmed gone, so the workspace genuinely is free, and a marker left
+	r.domainQuiet = true
+	// Cleared even though the drain releases and projects nothing. The domain is
+	// confirmed quiet, so the workspace genuinely is free, and a marker left
 	// standing would make every gracefully stopped workspace read as
 	// unknown_launch at the next start — parking for a human exactly the issues
 	// §9.10 is meant to resume by itself.
@@ -276,8 +313,8 @@ func (o *Orchestrator) suspendStopped(ctx context.Context, r *Record) {
 }
 
 // finishSuspended completes a suspended record once both facts are in: the
-// group is confirmed gone, and the process has been reaped with its transcript
-// flushed (Done).
+// domain is confirmed quiet, and direct execution has reached Done with its
+// transcript flushed.
 //
 // Waiting for the second is what stops the daemon exiting mid-flush. The event
 // pump is deliberately left running until here — it is what drains Events, and a
@@ -290,7 +327,7 @@ func (o *Orchestrator) suspendStopped(ctx context.Context, r *Record) {
 // is why it can sit inside a drain at all — and it goes on the owed queue, so
 // the drain waits for it like any other effect.
 func (o *Orchestrator) finishSuspended(ctx context.Context, r *Record) {
-	if !r.groupGone || (r.handle != nil && !r.handleDone) {
+	if !r.domainQuiet || (r.handle != nil && !r.handleDone) {
 		return
 	}
 	if r.cancelRun != nil {
@@ -320,6 +357,6 @@ func (o *Orchestrator) finishSuspended(ctx context.Context, r *Record) {
 	// reason this is not: it runs on a record the drain has *already* suspended, so
 	// driveShutdown's pass has been and gone and its `killed` would otherwise be the
 	// reason a decided attempt is filed under.
-	o.log.Info("shutdown: run interrupted, process group gone and transcript closed",
+	o.log.Info("shutdown: run interrupted, execution domain quiet and transcript closed",
 		"issue", r.Issue.Identifier, "state", r.State, "attempt", r.Attempt)
 }

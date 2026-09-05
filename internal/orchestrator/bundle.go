@@ -41,6 +41,13 @@ type Bundle struct {
 	// provider from one bundle and a tracker from another would read one
 	// repository's worktree and another's pull requests.
 	Verifier Verifier
+	// ResolveRun is the authority-gated form of §9.10's run probe. It may turn
+	// an unanswered backend request into a running agent, so recovery reaches it
+	// only after the tracker, pinned-epoch, §9.7 and current-approval checks pass.
+	// The approval argument is the standing required-label event id from the
+	// same history read. Bound into this immutable bundle so a reload cannot pair
+	// authority read from one adapter generation with a replay through another.
+	ResolveRun func(core.Issue, core.RunEvidence, int64) (bool, error)
 
 	// ClaimPrincipal is the identity this bundle's claims are assigned to
 	// (SPEC §8.4). Without it §9.8 cannot tell our own claim from a human who

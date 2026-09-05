@@ -246,6 +246,37 @@ func TestApprovingInstantIsTheStandingLastLabel(t *testing.T) {
 	}
 }
 
+func TestApprovalCycleAnchorMovesOnSameAssignmentReapproval(t *testing.T) {
+	approved := labeled("ben-queue", approvedAtNoon)
+	approved.ID = 1
+	assigned := core.ClaimEvent{
+		Kind: core.ClaimEventAssigned, Actor: "a-controller", Subject: recoveryTestPrincipal,
+		At: approvedAtNoon.Add(time.Minute), ID: 2,
+	}
+	history := []core.ClaimEvent{approved, assigned}
+	original, ok := approvalCycleAnchor(history, []string{"ben-queue"})
+	if !ok || original != approved.ID {
+		t.Fatalf("original approval anchor = %d (ok=%v), want %d", original, ok, approved.ID)
+	}
+	assignment := claimCycleAnchor(history, recoveryTestPrincipal)
+
+	removed := unlabeled("ben-queue", approvedAtNoon.Add(2*time.Minute))
+	removed.ID = 3
+	if anchor, ok := approvalCycleAnchor(append(history, removed), []string{"ben-queue"}); ok {
+		t.Fatalf("removed approval returned anchor %d", anchor)
+	}
+	reapproved := labeled("ben-queue", approvedAtNoon.Add(3*time.Minute))
+	reapproved.ID = 4
+	history = append(history, removed, reapproved)
+	current, ok := approvalCycleAnchor(history, []string{"ben-queue"})
+	if !ok || current != reapproved.ID || current == original {
+		t.Fatalf("reapproval anchor = %d (ok=%v), want new event %d", current, ok, reapproved.ID)
+	}
+	if got := claimCycleAnchor(history, recoveryTestPrincipal); got != assignment {
+		t.Fatalf("assignment anchor moved from %d to %d during label-only reapproval", assignment, got)
+	}
+}
+
 // Sub-second digits on one side of the comparison and not the other must not
 // make an edit look safely older than the label it actually shares a second
 // with (SPEC §8.4).

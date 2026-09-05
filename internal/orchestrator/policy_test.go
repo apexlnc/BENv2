@@ -110,7 +110,7 @@ func TestUnconfirmedStopRetainsTheClaim(t *testing.T) {
 	}
 
 	// Retried next tick. Two barriers, and the first is the one that makes the
-	// tick meaningful: the ladder's answer has to be *applied* before the tick
+	// tick meaningful: the Stop answer has to be *applied* before the tick
 	// that is supposed to re-drive it, because `beginStop` refuses while one is
 	// in flight — a tick inside that window schedules nothing, and `onStopped`
 	// then clears the flag without scheduling a tick of its own, so there is no
@@ -139,13 +139,13 @@ func TestUnconfirmedStopRetainsTheClaim(t *testing.T) {
 
 // SPEC §7.4 + §7.5 + §9.8, the same rule for a run nobody stopped: a liveness
 // failure is retryable, and the retry *reattaches the same worktree* (§6.2), so
-// it must not begin until that attempt's process group is confirmed gone.
+// it must not begin until that attempt's execution domain is confirmed quiet.
 //
 // The two facts are separate and only one of them is in the event.
 // `failed(stalled)` says the runner gave up on the attempt; it says nothing
-// about whether the kernel gave up on the process, and the harness's liveness
-// kill has no channel to say so — it discards its signal ladder's answer on
-// purpose, because the fact worth acting on is whether the group is gone *now*
+// about whether the substrate made the domain quiet, and the harness's liveness
+// teardown has no channel to say so — it discards that operation's answer on
+// purpose, because the fact worth acting on is whether the domain is quiet *now*
 // (harness expire, core.Termination). So the loop asks that question itself,
 // with `Stop`, and an unconfirmed answer retains everything: the claim, the
 // record, the workspace, and the §9.5 slot.
@@ -153,23 +153,23 @@ func TestUnconfirmedStopRetainsTheClaim(t *testing.T) {
 // Every assertion below is barriered on an observed stop count or state. A
 // sleep would prove nothing here: "no retry happened yet" and "no retry will
 // ever happen" look identical from a timer.
-func TestUnconfirmedGroupAfterALivenessFailureBlocksTheRetry(t *testing.T) {
+func TestUnconfirmedDomainAfterALivenessFailureBlocksTheRetry(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues: []core.Issue{fake.Issue("1", epoch)},
 		script: func(core.RunSpec, int) []core.Event { return fake.Fail(core.FailureStalled) },
 		// The run ends here, so `stopUnconfirmed` needs its pair: without it the
-		// group is gone the moment the process is, the pre-Done probe says so,
-		// and the outcome routes before the ladder below is ever asked for
+		// domain is quiet the moment the process is, the pre-Done probe says so,
+		// and the outcome routes before the teardown below is ever asked for
 		// (harnessOpts.stopUnconfirmed, #100). Measured at 11 failures in 800
-		// under parallel load, reported as "timed out waiting for the group to
+		// under parallel load, reported as "timed out waiting for the domain to
 		// be probed" — the barrier was sound and the fixture was not.
-		descendants:     true,
+		domainMembers:   true,
 		stopUnconfirmed: true,
 	})
 
-	// The run reported and ended, and the loop asked about the group rather
+	// The run reported and ended, and the loop asked about the domain rather
 	// than acting on the event.
-	waitFor(t, "the group to be probed after the run ended", func() bool {
+	waitFor(t, "the domain to be observed after the run ended", func() bool {
 		hd := h.Runner.LastHandle()
 		return hd != nil && hd.StopCount() > 0
 	})
@@ -216,7 +216,7 @@ func TestUnconfirmedGroupAfterALivenessFailureBlocksTheRetry(t *testing.T) {
 		t.Errorf("released %d times; an unconfirmed group retains the claim", n)
 	}
 
-	// Once the group is confirmed gone the held outcome routes, and the retry
+	// Once the domain is confirmed quiet the held outcome routes, and the retry
 	// finally enters the worktree it had to wait for. The re-probe's own answer is
 	// acknowledged first, the same rule one ladder later (waitStopApplied).
 	h.waitStopApplied(2)
@@ -229,7 +229,7 @@ func TestUnconfirmedGroupAfterALivenessFailureBlocksTheRetry(t *testing.T) {
 	h.Clock.Advance(11 * time.Second)
 	waitFor(t, "the retry to start", func() bool { return h.Runner.StartCount() == 2 })
 	if got := h.Workspaces.PrepareCount("1"); got != 2 {
-		t.Errorf("Prepare called %d times after the group was confirmed gone, want 2", got)
+		t.Errorf("Prepare called %d times after the domain was confirmed quiet, want 2", got)
 	}
 }
 

@@ -5,9 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"strings"
-	"syscall"
 
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 )
@@ -20,20 +17,6 @@ import (
 // It returns no error by design. A malformed line is the harness's business,
 // and refusing to parse one must not end a run that is otherwise progressing.
 type Translator func(line []byte) []core.Event
-
-// SignalFunc delivers sig to a process group. Injectable so a test can simulate
-// a process the kernel will not kill for us.
-type SignalFunc func(pgid int, sig syscall.Signal) error
-
-// SignalGroup is the default sender, and the negation is the whole of it: SPEC
-// §7.5's ladder addresses the process *group*, never the leader.
-//
-// Named and exported rather than inlined as the default, so a test that needs to
-// *order* the ladder rather than withhold it can delay this exact call instead of
-// respelling `-pgid` itself (agenttest's Options.Signal, #138). A stub that
-// spelled the negation would be a fake carrying a guarantee the real sender does
-// not make, and it would pass while signalling one process instead of a group.
-func SignalGroup(pgid int, sig syscall.Signal) error { return syscall.Kill(-pgid, sig) }
 
 // Launch is one attempt's process, fully described. Every field is the
 // adapter's decision; what happens to the process afterwards is this package's.
@@ -87,8 +70,9 @@ type Launch struct {
 	// Timings are the lifecycle windows this package enforces; each unset field
 	// takes its DefaultTimings value.
 	Timings Timings
-	// Signal defaults to killing the real process group.
-	Signal SignalFunc
+	// Domain owns launch and termination. Production adapters use LocalDomain;
+	// tests inject a contract fake that still drives real stream processes.
+	Domain ExecutionDomain
 	// Name prefixes launch errors, e.g. "codex-exec".
 	Name string
 	// OnRun records this run's evidence the moment the run exists, so a later
@@ -126,19 +110,9 @@ func Start(ctx context.Context, l Launch) (core.RunHandle, error) {
 		return nil, fmt.Errorf("%s: %w", l.Name, err)
 	}
 	l.Timings = l.Timings.withDefaults()
-	if l.Signal == nil {
-		l.Signal = SignalGroup
+	if l.Domain == nil {
+		l.Domain = LocalDomain()
 	}
-
-	cmd := exec.Command(l.Argv[0], l.Argv[1:]...)
-	cmd.Dir = l.Dir
-	cmd.Env = l.Env
-	cmd.Stdin = strings.NewReader(l.Prompt)
-	// Own process group: Stop signals the whole group, so a harness that
-	// spawned tools of its own — or, for a harness shipped behind a launcher
-	// script, the launcher's own child — cannot be left behind mutating the
-	// workspace (SPEC §7.5).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	// The output pipes are this package's, not cmd's. cmd.StdoutPipe would hand
 	// ownership to Wait, which closes the read end the moment the process exits
@@ -146,56 +120,49 @@ func Start(ctx context.Context, l Launch) (core.RunHandle, error) {
 	// the run's ground truth (SPEC §7.4). Owning them keeps the drain strictly
 	// ahead of the decision (SPEC §7.5) and makes the post-exit bound ours to
 	// set.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		l.Transcript.Close()
+		return nil, fmt.Errorf("%s: stdin pipe: %w", l.Name, err)
+	}
 	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
+		closeAll(stdinR, stdinW)
 		l.Transcript.Close()
 		return nil, fmt.Errorf("%s: stdout pipe: %w", l.Name, err)
 	}
 	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
-		closeAll(stdoutR, stdoutW)
+		closeAll(stdinR, stdinW, stdoutR, stdoutW)
 		l.Transcript.Close()
 		return nil, fmt.Errorf("%s: stderr pipe: %w", l.Name, err)
 	}
-	cmd.Stdout, cmd.Stderr = stdoutW, stderrW
+	// A pipe rather than a temporary file: the prompt may contain credentials
+	// and must never acquire another retained copy. Writing concurrently avoids
+	// blocking Start on prompts larger than the pipe buffer while the provider is
+	// still gated behind its durable-domain handshake.
+	go func() {
+		_, _ = io.WriteString(stdinW, l.Prompt)
+		_ = stdinW.Close()
+	}()
 
-	if err := cmd.Start(); err != nil {
-		closeAll(stdoutR, stdoutW, stderrR, stderrW)
+	run, err := l.Domain.Start(ctx, DomainLaunch{
+		Argv: l.Argv, Env: l.Env, Dir: l.Dir,
+		Stdin: stdinR, Stdout: stdoutW, Stderr: stderrW,
+		OnDomain: l.OnRun, Timings: l.Timings,
+	})
+	// The execution domain owns duplicated child descriptors after Start. These
+	// parent copies must close even when setup refused, releasing the prompt
+	// writer and making provider/descendant ownership the only source of EOF.
+	closeAll(stdinR, stdoutW, stderrW)
+	if err != nil {
+		closeAll(stdoutR, stderrR)
 		l.Transcript.Close()
-		return nil, fmt.Errorf("%s: starting %s: %w", l.Name, l.Argv[0], err)
+		return nil, fmt.Errorf("%s: %w: %w", l.Name, ErrExecutionDomain, err)
 	}
-	// The child holds its own descriptors now. Dropping the parent's copies is
-	// what makes EOF mean "no descendant is still writing" — an *os.File passed
-	// as Stdout is not tracked by cmd, so this close is ours to make.
-	closeAll(stdoutW, stderrW)
 
-	h := newHandle(l, cmd, stdoutR, stderrR)
+	h := newHandle(l, run, stdoutR, stderrR)
 	h.run(ctx, l.Transcript)
-
-	// Past this point there is a process, so there is a handle: no path here may
-	// return an error. Every `return nil, err` above precedes the process
-	// existing, which is what makes "error returned" and "nothing is running"
-	// equivalent for the caller (SPEC §7.4) — and the marker upgrade is the first
-	// step that could fail *after* that equivalence is established. Returning an
-	// error from it would leave a live group with no handle, nobody to stop it,
-	// and the marker still un-upgraded: a workspace §9.10 must then park.
-	//
-	// So a sink failure is delivered as an outcome of a live run. expire is the
-	// ordinary runner-enforced verdict — the same ladder a stall or a timeout
-	// walks — which takes the group down and removes the marker by the one path
-	// that is allowed to (confirmed absence, §9.8).
-	//
-	// This runs *after* h.run and *before* the pump publishes: the readers and
-	// Wait must already be going, or the ladder would poll a zombie that answers
-	// signal 0 until its grace expired, while publication must not have started,
-	// or a fast child's `succeeded` would already be the run's outcome and no
-	// later verdict could replace it (see handle.recorded).
-	if l.OnRun != nil {
-		if err := l.OnRun(localEvidence(h.pgid)); err != nil {
-			h.expire(core.FailureLaunchError)
-		}
-	}
-	close(h.recorded)
 	return h, nil
 }
 

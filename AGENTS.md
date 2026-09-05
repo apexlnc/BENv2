@@ -18,30 +18,35 @@ is the entry point for any agent (or human) working on BEN's own code.
 
 | Path | What it is |
 |---|---|
-| `cmd/ben` | CLI entry point and assembly for `ben config effective`, `ben run`, and `ben status`. The place components that may not import each other are bound together — including the §9.7 checker and the loop that routes it (`verifier.go`) (SPEC §11) |
+| `cmd/ben` | CLI entry point and assembly for `ben config effective`, `ben run`, and `ben status`. The place components that may not import each other are bound together — including the §9.7 checker and the loop that routes it (`verifier.go`), and the v2 dispatch leg that binds the backend, the seams, the workspace strategy, the daemon-side evidence store and the provider argv (`remote.go`, #205) (SPEC §11) |
 | `internal/core` | Shared interfaces and closed enums (SPEC §6–8). Stdlib-only — imports nothing else |
 | `internal/config` | Strict `WORKFLOW.md` loader and hot-reload watcher (SPEC §5) |
 | `internal/template` | Strict Liquid template layer (SPEC §5.6) |
 | `internal/registry` | The one kind table: `tracker.kind`/`agent.kind`/`credential_sources[].kind` → registered kind, asked by both the loader and `ben config effective` (SPEC §5.7, §11) |
-| `internal/credential` | The credential source kinds behind `credential_sources` (SPEC §5.2.10, §10.2): `octo_sts`, and `static` for compatibility and development. Each kind's `Describe` is **pure** — no network, no filesystem, no instance — because it is what load-time validation and §5.4's reload comparison call, which is also what keeps `make workflow-check` credential-free. `credtest` is the conformance suite both kinds run unmodified, so a future `github_app` inherits the proof |
-| `internal/tracker/github` | GitHub tracker adapter: read kernel + closed write set (SPEC §8) |
-| `internal/workspace` | Git worktree lifecycle, safety invariants, hooks, the durable claim-epoch/base store, and publish-evidence git facts (SPEC §6, §9.7) |
-| `internal/agent/harness` | Shared process-per-attempt runtime behind both agent adapters: lifecycle, liveness, signal ladder, child-environment composition, transcripts (SPEC §7.2–§7.6). `lifecycle.go` is the pure decision layer — which terminal event, and when it may be published; `handle.go` is the I/O driver around it; `timings.go` is the one seam for its windows |
+| `internal/credential` | The credential source kinds behind `credential_sources` (SPEC §5.2.10, §10.2): `octo_sts`, direct `projected_oidc`, and `static` for compatibility and development. Each kind's `Describe` is **pure** — no network, no filesystem, no instance — because it is what load-time validation and §5.4's reload comparison call, which is also what keeps `make workflow-check` credential-free. `credtest` is the conformance suite all three kinds run unmodified, so a future `github_app` inherits the proof |
+| `internal/tracker/github` | GitHub tracker adapter: read kernel + closed write set (SPEC §8), plus the GraphQL content and remote-PR fact reads REST cannot answer |
+| `internal/gitcmd`, `internal/gitremote` | Shared Git boundaries: every invocation carries the no-background-maintenance overrides and child environment (#154), plus the neutralization of the surfaces a run can write inside `base.git` to steer a daemon-side git — hooks, fsmonitor, replace refs and legacy grafts (#228) — while stdlib-only remote syntax checks identically refuse credentials and transport helpers before either Git driver acts. `gitremote` also owns the **one** credential helper both drivers install (#230): it parses git's request and answers only for the protocol and host of the remote that invocation was built for, so a redirect or an `insteadOf` rewrite to another host gets silence rather than the token — shared rather than copied, because a per-package copy is what silently stops scoping |
+| `internal/workspace` | Git worktree lifecycle, safety invariants, hooks, the durable claim-epoch/base/target store, and publish-evidence git facts (SPEC §6, §9.7) |
+| `internal/agent/harness` | Shared process-per-attempt runtime behind both agent adapters: lifecycle, liveness, execution-domain boundary, child-environment composition, transcripts (SPEC §7.2–§7.6). `lifecycle.go` is the pure decision layer — which terminal event, and when it may be published; `handle.go` is the I/O driver around it; `timings.go` is the one seam for its windows, and `bound.go` the one discipline for its sizes — what is held of an untrusted child's output, with every cut stated (#235) |
 | `internal/agent/claudecode` | claude-code runner adapter: provider block, argv, stream translation, readiness probes (SPEC §7.7) |
 | `internal/agent/codexexec` | codex-exec runner adapter: the same, for `codex exec --json` (SPEC §7.7) |
-| `internal/agent/agenttest` | The AgentRunner conformance suite both adapters run unmodified (SPEC §7.1–§7.6) |
-| `internal/verify` | Publish-evidence check: the three legs of git and tracker fact behind `done` (SPEC §9.7) |
+| `internal/agent/agenttest`, `internal/agent/runnertest` | The local AgentRunner conformance suite both adapters run unmodified (SPEC §7.1–§7.6), and its universal `core.RunHandle` subset run by the local and remote fakes. Their source audits keep local OS facts out of the universal cases (#192) |
+| `internal/remote`, `internal/remote/remotetest` | The directly constructed v2 execution-substrate boundary and its scripted fake (#192, #46): opaque workspaces; sandbox-scoped, request-digested durable processes; recoverable event delivery and replay proofs; independent stream/process/domain evidence; and restart-safe hooks. No HTTP, config key, provider schema or second control loop: `internal/airlock` is the backend foundation that lands against it (#194). See `docs/REMOTE.md` |
+| `internal/airlock`, `internal/airlock/airlocktest` | BEN's opt-in v2 backend foundation behind those seams (#194): the stdlib HTTP client for Airlock's frozen v2 contract, the two durable addresses that contract deliberately does not answer — which sandbox a claim acquired, which run a dispatch resolved to — the end-of-claim disposal gated on domain quiet, startup reconciliation, and an in-process server faithful enough to script lost responses, restarts, replay, gaps and cross-tenant collisions. `internal/remotews` and the `cmd/ben` routing below are what make it dispatchable (#205). Stdlib-only, enforced by `internal/arch`. See [AIRLOCK.md](docs/AIRLOCK.md) |
+| `internal/remotews` | SPEC §6.1's workspace strategy for a claim running on a v2 substrate (#205) — the **sibling** of `internal/workspace`, not a layer over it: neither imports the other's lifecycle, and this one reads nothing inside the sandbox, because everything there is authored by the thing being judged (SPEC §3.5). Its **two clocks** are the design: the *workspace cycle* (repository + issue + the standing approval event) selects the sandbox and outlives an assignment, so a reassignment inside one approval revises the same tree; the *verification epoch* stays the assignment and pins the trusted base and target #193 measures against. Revocation then reapproval is a new cycle — a different address, so attaching the retained sandbox is unexpressible rather than discouraged — and #266 gives every replaced cycle its own durable disposal address so a downtime reapproval cannot strand it or let its cleanup act on the replacement. See [REMOTE.md](docs/REMOTE.md) |
+| `internal/verify`, `internal/mirror` | The local and remote publish-evidence checkers behind `done` (SPEC §9.7), selected without mixing their evidence. Remote verification reads the claim-time base/target pin and canonical branch head from a daemon-side bare store no run can reach; `mirrortest` covers the real and fake stores unmodified (#193) |
 | `internal/orchestrator` | The authority loop: states, tick, dispatch, retry, reconciliation (SPEC §9) |
 | `internal/fake` | In-memory tracker/workspace/runner + manual clock, shared by the orchestrator's tests, `cmd/ben`'s end-to-end acceptance tests, and B12. Not test files — several packages need them, so a fake's fidelity to the adapter it stands in for is a correctness concern (see Conventions) |
 | `internal/state` | The §10.3 white-box state dir: run records, the persisted §9.11 transition log, the per-attempt outcome log behind `ben status`'s aggregate (#60), and where transcripts go. Read by a *different process* than the one writing it, which is why every file here is replaced by rename or appended one whole record at a time — `jsonl.go` is the single append-only writer both logs use, and `internal/orchestrator/durable.go` the single off-loop queue that feeds them |
-| `internal/integration` | B12's §12.3 invariant suite: SPEC §3's design invariants as end-to-end scenarios. The loop, loader, watcher, template layer and §9.7 checker are real; only the world outside the process is faked, so the suite is green in CI with no network, no subprocesses and no wall-clock waits. Its `doc.go` carries the §12.3 coverage map — including the rows deliberately asserted at another package's boundary |
-| `internal/bench`, `cmd/benchreport` | The #62 fixed cohort, session join, matched-case arithmetic, and its documented query (`docs/BENCH.md`). Reads files only; the separate command is the sole importer, so the daemon cannot reach benchmark telemetry |
+| `internal/integration`, `internal/scenario` | B12's §12.3 invariant suite plus #220's strict JSON scenario vocabulary and byte-stable trace renderer. The loop, loader, watcher, template layer and §9.7 checker are real; only the world outside the process is faked, so both run in CI with no network, subprocesses or wall-clock waits. Scenario code describes diagnostics only; integration is its sole binding to the authority loop and conformant fakes (`docs/SCENARIO-LAB.md`). `internal/integration/doc.go` carries the §12.3 coverage map — including rows deliberately asserted at another package's boundary |
+| `internal/bench`, `cmd/benchreport`; `internal/ticketprep`, `cmd/ticketprep`, `.agents/skills/prep-ticket`, `.claude/skills/prep-ticket` | Developer-only analysis surfaces unreachable from the daemon: #62's fixed cohort comparison (`docs/BENCH.md`), and #222's shared explicit-only `prep-ticket` workflow (`$prep-ticket` in Codex, `/prep-ticket` in Claude Code), which binds exact issue content to committed Git facts and safely renders bounded advice ([TICKETPREP.md](docs/TICKETPREP.md)) |
+| `internal/review`, `internal/reviewctl`, `internal/reviewrun`, `cmd/benreview` | The #11 review controller, which #204 moved into the daemon (`docs/REVIEW.md`). `internal/review` is the unchanged pure per-issue reducer, the marker vocabulary and the validation behind every route — still the policy authority. `internal/reviewctl` is the trusted half that holds the controller credential, captures the exact base/head subject itself, validates one closed verdict and makes the bounded forge writes; `internal/reviewrun` is the substrate-neutral reviewer-execution boundary behind it — a credential-stripped local child or one durable Airlock run in the workspace-cycle sandbox — which publishes nothing and holds no forge credential. There is no repository workflow: the daemon's sweep is the availability mechanism and `cmd/benreview` is the operator's dry-run/reconcile window, which never invokes a model. The orchestrator neither imports nor is imported by the reducer: they meet only at SPEC §8.4's published milestone in and a `COMMENT` review plus one unassignment-or-revocation out. The forge client is stdlib rather than go-github deliberately — `internal/tracker` owns that dep |
 | `internal/arch` | Structural test enforcing the import boundaries below |
 | `internal/partest` | What keeps `make check`'s test time down without weakening it (#167): a gate bounding how many of a package's tests run at once, and the source audit deciding which may join one. The bound is the design — these suites drive real child processes, and unbounded `t.Parallel` would trade elapsed time for the load flakes they exist to expose. Used by `internal/agent/agenttest`, both adapters, and `internal/workspace` |
 | `deploy/ben.service` | Sample systemd unit. `KillMode=mixed`, `TimeoutStopSec` and the §10.1 mode statement are load-bearing — `cmd/ben`'s test holds the file to what the daemon claims about it |
-| `scripts` | The §12.4 real-integration smoke runner and exact workflow, plus #62's load-validated adapter/model benchmark profiles |
-| `docs` | Long-form references kept out of the root, because this guide is loaded into every agent's context and they are not. For an operator: `DEPLOY.md`, the §10.1/§10.2 unattended-operation runbook — the account, the credentials, the branch protection the review gate rests on; and `SMOKE.md`, the §12.4 smoke profile — one issue end to end against a canary repo, the one check that needs credentials and network; and `BENCH.md`, the #62 adapter benchmark — the cohort, the per-cell procedure, and how to read the comparison. For a contributor, the evidence behind three of this guide's rule sections, each linked from the section it belongs to: `WORKTREES.md`, `GO-ENV.md`, `TOOLCHAIN.md` |
-| `.github` | `workflows/ci.yml`, which runs exactly `make check` and nothing more; the BUILD.md-shaped issue templates; the Evidence-section PR template; and `CODEOWNERS`, which the §10.1 protected-mode topology in `docs/DEPLOY.md` depends on |
+| `scripts` | The §12.4 real-integration smoke runner and exact workflow, #62's load-validated adapter/model benchmark profiles, and #194's credential-gated Airlock kind smoke |
+| `docs` | Long-form references kept out of the root, because this guide is loaded into every agent's context and they are not. For an operator: `DEPLOY.md`, the §10.1/§10.2 unattended-operation runbook — the account, the credentials, the branch protection the review gate rests on; and `SMOKE.md`, the §12.4 smoke profile — one issue end to end against a canary repo, the one check that needs credentials and network; and `BENCH.md`, the #62 adapter benchmark — the cohort, the per-cell procedure, and how to read the comparison; and [`REVIEW.md`](docs/REVIEW.md), the #11/#204 review controller — its identities, its markers, its two substrates and two clocks, what it is structurally unable to do, and how to turn it on, with [`REVIEW-GUIDANCE.md`](docs/REVIEW-GUIDANCE.md) the deployment's own standard for what counts as a finding. For a contributor, [SCENARIO-LAB.md](docs/SCENARIO-LAB.md), #220's deterministic replay format and trust boundary; [TICKETPREP.md](docs/TICKETPREP.md), #222's offline advisory artifact; plus the evidence behind four rule sections, each linked from the section that states the rule: `WORKTREES.md`, `GO-ENV.md`, `TOOLCHAIN.md`; and [REMOTE.md](docs/REMOTE.md), the direct-construction v2 seams and unchanged v1 configuration boundary. For both: [AIRLOCK.md](docs/AIRLOCK.md), the #194 Airlock foundation — its `substrate:` declaration, its fourth credential identity, what it persists and what it refuses |
+| `.github` | `workflows/ci.yml`, which runs exactly `make check` and nothing more, and `workflows/publish-daemon-image.yml`, which builds, smokes and publishes the daemon image to ECR per commit (#180/#181) — the only two workflows: #204 retired the #11 reviewer's `reviewer/` prompt, wrapper and uninstalled workflow, and `internal/reviewctl` asserts none of them came back, because a workflow is arbitrary code holding repository credentials. Also the BUILD.md-shaped issue templates; the Evidence-section PR template; and `CODEOWNERS`, which the §10.1 protected-mode topology in `docs/DEPLOY.md` depends on |
 | `WORKFLOW.md` | BEN's own dogfood workflow config (see Dogfooding) |
 
 ## Canonical commands
@@ -59,6 +64,7 @@ go run ./cmd/ben config effective WORKFLOW.md   # validate + inspect a workflow 
 go run ./cmd/ben run WORKFLOW.md                # daemon; supervised only until the gates below close
 go run ./cmd/ben status WORKFLOW.md             # what a daemon for that config is doing
 go run ./cmd/benchreport session.json           # the #62 adapter comparison (docs/BENCH.md)
+go run ./cmd/benreview -repo o/r -issue 11 -dry-run   # the #11 review controller (docs/REVIEW.md)
 ```
 
 `make check` green is the definition of green — CI runs exactly this target, nothing more.
@@ -189,9 +195,9 @@ command in the shared object store, holding `gc.pid` and pack locks. `make check
 `TempDir` cleanup racing exactly that (#154).
 
 > **Every git BEN invokes carries `-c gc.auto=0 -c maintenance.auto=false`** — one place,
-> `gitArgv` in `internal/workspace/git.go` — because the daemon must account for every process
-> touching a workspace it owns (SPEC §9.10). Your shell has no such guard; [docs/WORKTREES.md](docs/WORKTREES.md#what-a-detached-maintenance-run-costs)
-> has the measurements.
+> `gitcmd.Argv` in `internal/gitcmd` (both daemon Git drivers and ticketprep share it), because BEN must account
+> for every process touching a repository it owns (SPEC §9.10). Your shell has no such guard;
+> [docs/WORKTREES.md](docs/WORKTREES.md#what-a-detached-maintenance-run-costs) has the measurements.
 
 ## Definition of done
 
@@ -199,11 +205,11 @@ command in the shared object store, holding `gc.pid` and pack locks. `make check
 2. `make check` is green. Paste its tail in the PR body — evidence over claims (SPEC §3.5)
    applies to us, not just to BEN's agents.
 3. No new dependencies beyond SPEC Appendix A's set without human sign-off in the ticket.
-4. Import boundaries hold (enforced by `internal/arch`): `internal/core` imports stdlib
-   only; third-party boundary deps (yaml, liquid, go-github, fsnotify) are each owned by
-   exactly one package. When a new adapter legitimately needs a dep, extend the allowlist
-   in `internal/arch/arch_test.go` deliberately, in the same PR, with a comment citing the
-   ticket.
+4. Import boundaries hold (enforced by `internal/arch`): `internal/core` imports stdlib only,
+   and **every third-party source import plus every direct `go.mod` requirement carries exactly one
+   recorded ownership decision** — a single owner or explicit unrestricted reason. `// indirect`
+   is no exemption. When a ticket legitimately needs a dependency, record that decision in
+   `internal/arch/arch_test.go` in the same PR, with a comment citing the ticket.
 
 ## Conventions
 
@@ -233,14 +239,14 @@ command in the shared object store, holding `gc.pid` and pack locks. `make check
 
 `WORKFLOW.md` is BEN's own workflow. `ben run` is assembled (B11), and B10 startup recovery has
 landed (#8, `707b8a7`), so §9.10 reconstructs the principal's claims after an interruption.
-Unattended dogfooding remains gated on [issue #76](https://github.com/srhg-ai-7cef3f93/ben/issues/76); its one open lane is the **forge
-control** (§10.1 requirement 3). Branch protection is applied and read back ([#83](https://github.com/srhg-ai-7cef3f93/ben/issues/83)).
-[#155](https://github.com/srhg-ai-7cef3f93/ben/issues/155) and [#156](https://github.com/srhg-ai-7cef3f93/ben/issues/156) landed the mechanism: an independent claim assignee and
-`credential_sources` whose tracker, base-fetch and publish credentials are minted at need under
-distinct workload identities. **The remaining step is deployment**: this repository's workflow
-still names the legacy token, so BEN publishes as whoever runs the daemon until an operator
-configures both Octo sources per [docs/DEPLOY.md](docs/DEPLOY.md). Until then, runs are supervised
-and `deploy/ben.service` remains blocked by its `ExecStartPre` gate.
+The unattended-dogfood gate, [issue #76](https://github.com/srhg-ai-7cef3f93/ben/issues/76), **closed on 2026-08-20**: branch protection is applied and
+read back ([#83](https://github.com/srhg-ai-7cef3f93/ben/issues/83)); [#155](https://github.com/srhg-ai-7cef3f93/ben/issues/155) and [#156](https://github.com/srhg-ai-7cef3f93/ben/issues/156) landed an independent claim assignee and
+`credential_sources` minted at need under distinct workload identities; the deployed canary publishes
+as a bot the reviewing human is not, with the four behavioural probes waived on record. **What that
+closure does not grant is an unattended mode**: this repository's committed workflow still declares
+`attended` and falls back to the legacy token, so a daemon run from it publishes as whoever runs it.
+Moving a deployment to `risk-accepted` is the explicit decision [docs/DEPLOY.md](docs/DEPLOY.md) describes; unattended
+dispatch on public input also waits on [#195](https://github.com/srhg-ai-7cef3f93/ben/issues/195). Until then, local runs are supervised and `deploy/ben.service` remains blocked by its `ExecStartPre` gate.
 Conventions that make dogfooding work:
 
 - **`WORKFLOW.md` must declare `deployment.mode`** (SPEC §5.2.9, §10.1) — `protected`,
@@ -251,7 +257,7 @@ Conventions that make dogfooding work:
   declared properties — §10.1 owes that to the deployment — so the declaration is an assertion
   BEN records, not one it checks. It is process-lifetime: a reload that changes it is refused and
   a restart adopts it.
-- Label **`ben-queue`** on an issue marks it dispatchable to BEN. Filed-but-unlabeled tickets are backlog.
+- Label **`ben-queue`** marks an issue dispatchable to BEN; filed-but-unlabeled tickets are backlog. **Only a human applies it** — SPEC §9.5's approval act — and it stays standing through every revision round. The #11 review controller may only *remove* it: revocation, which asserts nothing ([docs/REVIEW.md](docs/REVIEW.md)).
 - Labels **`ben:*`** (`ben:claimed`, `ben:running`, `ben:needs-review`, `ben:failed`) are BEN's state projection (SPEC §9.3) — never set or remove them manually.
 - `make workflow-check` load-validates `WORKFLOW.md` with BEN's own loader; CI catches schema drift without credentials, network access, or a harness.
 - Issues follow the BUILD.md ticket shape (see `.github/ISSUE_TEMPLATE/`); PRs carry an Evidence section (see `.github/PULL_REQUEST_TEMPLATE.md`) and `Fixes #<n>`.

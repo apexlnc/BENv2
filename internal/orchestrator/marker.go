@@ -100,7 +100,7 @@ func (p *pendingClear) matches(identifier string, store markerStore) bool {
 // freeWorkspaceMarker removes the run marker, at the one moment §9.10 permits:
 // the run that held the workspace is confirmed gone.
 //
-// Called from every place groupGone becomes true, plus the launch that never
+// Called from every place domainQuiet becomes true, plus the launch that never
 // happened, which is what keeps the marker's lifetime identical to the in-process
 // fact it stands in for — the same linearization point that frees a workspace at
 // run time (SPEC §9.8). Any other removal rule ("probably finished", "the read

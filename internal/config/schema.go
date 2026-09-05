@@ -8,6 +8,7 @@
 package config
 
 import (
+	"slices"
 	"strings"
 	"time"
 
@@ -57,6 +58,13 @@ type Config struct {
 	Publish           PublishConfig
 	Limits            LimitsConfig
 	Deployment        DeploymentConfig
+	// Substrate is where an attempt runs (#194, #46). An omitted section
+	// resolves to the locked v1 local substrate, so every workflow that
+	// predates it keeps working unchanged.
+	Substrate SubstrateConfig
+	// Review is the #204 review controller. Off by default and never arrived
+	// at by omission: it unassigns BEN and revokes a human's required label.
+	Review ReviewConfig
 	// Credentials is what the declared entries and the legacy spellings
 	// **compile to**: one descriptor per consumer. Derived, never written by an
 	// operator, and the only thing downstream of the loader reads.
@@ -143,6 +151,10 @@ type PollingConfig struct {
 type WorkspaceConfig struct {
 	// Root is normalized to an absolute path at load (SPEC §5.2.4).
 	Root string
+	// BaseBranch is the optional unqualified branch used for both a fresh
+	// workspace base and the required pull-request target. Empty means resolve
+	// the repository default when a claim epoch is first pinned.
+	BaseBranch string
 }
 
 type HooksConfig struct {
@@ -158,6 +170,10 @@ type HooksConfig struct {
 type AgentConfig struct {
 	Kind     string
 	Provider map[string]any
+	// providerEnvSources is derived from WorkflowDefinition.Provenance after the
+	// loader resolves the opaque block. It stays unexported because it is not a
+	// workflow field; AgentBinding is its only consumer boundary.
+	providerEnvSources []core.ProviderEnvSource
 }
 
 // AgentBinding is the slice of configuration the runner kind is bound to at New,
@@ -173,8 +189,9 @@ type AgentConfig struct {
 // logged as adopted.
 func (c Config) AgentBinding() core.AgentConfig {
 	return core.AgentConfig{
-		Provider: c.Agent.Provider,
-		Publish:  c.Publish.Credential(),
+		Provider:           c.Agent.Provider,
+		ProviderEnvSources: slices.Clone(c.Agent.providerEnvSources),
+		Publish:            c.Publish.Credential(),
 		// The publisher's source, name-free (SPEC §5.4, amendment 2).
 		PublishSource: c.Credentials.Publish.Binding(),
 		// And the TTL gate's other operand. It lives in `limits` and not here
@@ -354,8 +371,13 @@ func (d *WorkflowDefinition) promptLimits() template.Limits {
 // set-vs-unset drives defaults and provenance. Strict decoding
 // (KnownFields) rejects unknown keys everywhere except the two opaque
 // provider blocks (SPEC §5.3).
+//
+// Every numeric field is a yamlInt or a yamlFloat rather than a bare int or
+// float64: yaml.v3 truncates a float spelling into an int and admits `.nan` and
+// `.inf` into a float, both silently, and declaring the type is what refuses
+// them (see number.go).
 type rawConfig struct {
-	Version *int        `yaml:"version"`
+	Version *yamlInt    `yaml:"version"`
 	Tracker *rawTracker `yaml:"tracker"`
 	// CredentialSources is open per entry, like a provider block: the keys
 	// beneath a name belong to that entry's kind, which validates them
@@ -368,6 +390,8 @@ type rawConfig struct {
 	Publish           *rawPublish               `yaml:"publish"`
 	Limits            *rawLimits                `yaml:"limits"`
 	Deployment        *rawDeployment            `yaml:"deployment"`
+	Substrate         *rawSubstrate             `yaml:"substrate"`
+	Review            *rawReview                `yaml:"review"`
 }
 
 // rawDeployment is SPEC §5.2.9. Neither field is $VAR-resolved: a mode is a
@@ -386,19 +410,20 @@ type rawTracker struct {
 }
 
 type rawPolling struct {
-	IntervalMS *int `yaml:"interval_ms"`
+	IntervalMS *yamlInt `yaml:"interval_ms"`
 }
 
 type rawWorkspace struct {
-	Root *string `yaml:"root"`
+	Root       *string `yaml:"root"`
+	BaseBranch *string `yaml:"base_branch"`
 }
 
 type rawHooks struct {
-	AfterCreate  *string `yaml:"after_create"`
-	BeforeRun    *string `yaml:"before_run"`
-	AfterRun     *string `yaml:"after_run"`
-	BeforeRemove *string `yaml:"before_remove"`
-	TimeoutMS    *int    `yaml:"timeout_ms"`
+	AfterCreate  *string  `yaml:"after_create"`
+	BeforeRun    *string  `yaml:"before_run"`
+	AfterRun     *string  `yaml:"after_run"`
+	BeforeRemove *string  `yaml:"before_remove"`
+	TimeoutMS    *yamlInt `yaml:"timeout_ms"`
 }
 
 type rawAgent struct {
@@ -417,12 +442,12 @@ type rawPublish struct {
 }
 
 type rawLimits struct {
-	MaxConcurrentAgents *int     `yaml:"max_concurrent_agents"`
-	MaxTurns            *int     `yaml:"max_turns"`
-	MaxAttempts         *int     `yaml:"max_attempts"`
-	MaxRetryBackoffMS   *int     `yaml:"max_retry_backoff_ms"`
-	MaxCostUSD          *float64 `yaml:"max_cost_usd"`
-	StallTimeoutMS      *int     `yaml:"stall_timeout_ms"`
-	AttemptTimeoutMS    *int     `yaml:"attempt_timeout_ms"`
-	MaxPromptBytes      *int     `yaml:"max_prompt_bytes"`
+	MaxConcurrentAgents *yamlInt   `yaml:"max_concurrent_agents"`
+	MaxTurns            *yamlInt   `yaml:"max_turns"`
+	MaxAttempts         *yamlInt   `yaml:"max_attempts"`
+	MaxRetryBackoffMS   *yamlInt   `yaml:"max_retry_backoff_ms"`
+	MaxCostUSD          *yamlFloat `yaml:"max_cost_usd"`
+	StallTimeoutMS      *yamlInt   `yaml:"stall_timeout_ms"`
+	AttemptTimeoutMS    *yamlInt   `yaml:"attempt_timeout_ms"`
+	MaxPromptBytes      *yamlInt   `yaml:"max_prompt_bytes"`
 }

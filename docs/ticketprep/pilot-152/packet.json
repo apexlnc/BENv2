@@ -1,0 +1,277 @@
+{
+  "schema_version": 1,
+  "kernel_version": "ticketprep.v0",
+  "capture": {
+    "schema_version": 1,
+    "kernel_version": "ticketprep.v0",
+    "subject": {
+      "repository_identity": "github.com/srhg-ai-7cef3f93/ben",
+      "issue_number": 152,
+      "issue_url": "https://github.com/srhg-ai-7cef3f93/ben/issues/152",
+      "title": "Configurable per-workflow base/target branch (workspace cut from and PR opened against something other than the repo default branch)",
+      "body": "**Spec:** §5.2.4/§6.2 (workspace base derivation), §5.6 (canonical publish snippet) · **Depends on:** —\n\n## Problem\n\nBEN's workspace provider has no concept of a base branch other than the repository's actual\nGitHub default branch. `internal/workspace/workspace.go`'s `remoteDefaultBranch` reads the\nremote HEAD symref, and a fresh issue's workspace branch is always cut from that fetched head\n(`workspace.go:761,843,868`). The canonical publish snippet (SPEC §5.6) also hardcodes \"open a\npull request against the default branch.\"\n\nThis surfaced on a real deployment: `NFTYDoor/nftydoor-admin` mirrors a Bitbucket repository —\nGitHub `main` must stay a clean, GitHub-authored-commit-free mirror, and a whole stabilization\nepic requires every BEN-authored branch to be cut from, and every PR opened against, a\ndedicated `switchboard-stabilization` branch instead. Changing the repo's actual GitHub default\nbranch is explicitly a non-goal of that epic (it would violate the mirror invariant a different\nway). There is no other way today to make BEN base and publish against a non-default branch —\nnot a config key, not a documented workaround, and it isn't named in §13's deferred extensions\neither.\n\n## Proposal (for discussion, not a locked design)\n\nAdd an optional `workspace.base_branch` (or similar) config key: when set, `Prepare` fetches and\nbases fresh workspaces on that ref instead of the repository's default branch, and the canonical\npublish snippet's PR-target instruction uses it instead of \"the default branch.\" Needs a decision\non:\n\n- whether the base ref is validated to exist at `Ready`-time (readiness failure) or load time;\n- interaction with the remote-first reattach logic (§6.2) — reattaching to an existing\n  `ben/\u003cworkspace_key\u003e` branch should presumably still take precedence over the configured base\n  for a fresh prepare;\n- whether this belongs in `workspace` or is closer to a `publish`-block concern, since it affects\n  both the git base and the PR target.\n\n## Acceptance\n\n- [ ] A workflow can configure a non-default base/target branch and have BEN's workspace\n      provider and canonical publish snippet both honor it.\n- [ ] `ben config effective` surfaces the configured value (or its default-branch fallback)\n      with provenance, per §5.8.\n- [ ] Structural validation rejects an obviously malformed ref name at load; existence is a\n      readiness concern, not a load concern (mirrors how `publish.value` is handled, §5.5).\n- [ ] `make check` green (evidence in the PR)",
+      "content_digest": "sha256:573840a53d765816267c611bb78f50595f4498fe22387d58699748c8718e55ca"
+    },
+    "repository": {
+      "remote": "origin",
+      "identity": "github.com/srhg-ai-7cef3f93/ben",
+      "remote_fingerprint": "sha256:c211de43f2655f3cc0f117659fc4b6b67f4b2404cd057948f45752e8c731621a",
+      "commit": "87d01e949fcab4053df1ed34c74562bc22d340e7",
+      "tree": "3a1ecd8ba562a41a386ee1eede284010fc9072fd"
+    },
+    "facts": {
+      "paths": [
+        {
+          "reference": "internal/workspace/workspace.go",
+          "status": "exists",
+          "resolved_path": "internal/workspace/workspace.go",
+          "blob": "745fca9e1580e08a0ff5d6204a52bc2c101e9e5a",
+          "evidence": "git_tree:3a1ecd8ba562a41a386ee1eede284010fc9072fd"
+        },
+        {
+          "reference": "workspace.go:761,843,868",
+          "status": "unknown",
+          "evidence": "git_tree:3a1ecd8ba562a41a386ee1eede284010fc9072fd",
+          "reason": "basename is ambiguous across 4 committed paths"
+        }
+      ],
+      "symbols": [
+        {
+          "reference": "Prepare",
+          "status": "unknown",
+          "name": "Prepare",
+          "evidence": "go_syntax_at_commit:87d01e949fcab4053df1ed34c74562bc22d340e7",
+          "reason": "identifier is ambiguous across 3 committed declarations"
+        },
+        {
+          "reference": "Ready",
+          "status": "unknown",
+          "name": "Ready",
+          "evidence": "go_syntax_at_commit:87d01e949fcab4053df1ed34c74562bc22d340e7",
+          "reason": "identifier is ambiguous across 8 committed declarations"
+        },
+        {
+          "reference": "remoteDefaultBranch",
+          "status": "exists",
+          "name": "remoteDefaultBranch",
+          "path": "internal/workspace/workspace.go",
+          "line": 791,
+          "blob": "745fca9e1580e08a0ff5d6204a52bc2c101e9e5a",
+          "evidence": "go_syntax_at_commit:87d01e949fcab4053df1ed34c74562bc22d340e7"
+        }
+      ],
+      "instruction_files": [
+        {
+          "path": "AGENTS.md",
+          "blob": "2f64b8cdca8653fce3a6abb5bb87936d92746d4a"
+        }
+      ],
+      "validation_commands": [
+        {
+          "command": "make check",
+          "source": "AGENTS.md",
+          "line": 55,
+          "blob": "2f64b8cdca8653fce3a6abb5bb87936d92746d4a"
+        },
+        {
+          "command": "make test",
+          "source": "AGENTS.md",
+          "line": 57,
+          "blob": "2f64b8cdca8653fce3a6abb5bb87936d92746d4a"
+        },
+        {
+          "command": "make lint",
+          "source": "AGENTS.md",
+          "line": 58,
+          "blob": "2f64b8cdca8653fce3a6abb5bb87936d92746d4a"
+        },
+        {
+          "command": "go run ./cmd/ben config effective WORKFLOW.md",
+          "source": "AGENTS.md",
+          "line": 63,
+          "blob": "2f64b8cdca8653fce3a6abb5bb87936d92746d4a"
+        },
+        {
+          "command": "make race",
+          "source": "Makefile",
+          "line": 53,
+          "blob": "519cb037b749c9eaac7a70be6c00405c22b014ef"
+        },
+        {
+          "command": "make fmt-check",
+          "source": "Makefile",
+          "line": 70,
+          "blob": "519cb037b749c9eaac7a70be6c00405c22b014ef"
+        },
+        {
+          "command": "make vet",
+          "source": "Makefile",
+          "line": 76,
+          "blob": "519cb037b749c9eaac7a70be6c00405c22b014ef"
+        },
+        {
+          "command": "make workflow-check",
+          "source": "Makefile",
+          "line": 87,
+          "blob": "519cb037b749c9eaac7a70be6c00405c22b014ef"
+        },
+        {
+          "command": "make worktree-check",
+          "source": "Makefile",
+          "line": 111,
+          "blob": "519cb037b749c9eaac7a70be6c00405c22b014ef"
+        }
+      ],
+      "unknown": [
+        {
+          "reference": "NFTYDoor/nftydoor-admin",
+          "reason": "literal is not an unambiguous v0 path or Go symbol reference"
+        },
+        {
+          "reference": "ben/\u003cworkspace_key\u003e",
+          "reason": "literal is not an unambiguous v0 path or Go symbol reference"
+        },
+        {
+          "reference": "publish.value",
+          "reason": "literal is not an unambiguous v0 path or Go symbol reference"
+        },
+        {
+          "reference": "workspace.base_branch",
+          "reason": "literal is not an unambiguous v0 path or Go symbol reference"
+        }
+      ]
+    },
+    "sources": {
+      "issue": "declared_issue_snapshot",
+      "repository": "git_object_database",
+      "remote": "git_config:remote.origin.url"
+    }
+  },
+  "declared_provenance": {
+    "provider": "OpenAI",
+    "model": "unknown",
+    "command": "$prep-ticket (Codex; revised after four human pilot reviews)",
+    "prompt": "repository-local one-shot review of issue #152 plus four rounds of human pilot feedback"
+  },
+  "advice": {
+    "restated_outcome": "Let one workflow's single configured branch select both the source for a fresh workspace and the required pull-request target, with an explicit default fallback and preserved target semantics across retries and restarts.",
+    "candidate_non_goals": [
+      "Do not change the forge repository's configured default branch.",
+      "Do not rebase or recreate an existing ben/\u003cworkspace_key\u003e branch solely because the configured or default target moves.",
+      "Do not add a per-issue branch override or let issue-authored content select the base.",
+      "Do not move publishing from the agent to the daemon."
+    ],
+    "assumptions_to_confirm": [
+      "The configured value names a branch under origin rather than an arbitrary ref, tag, or commit."
+    ],
+    "decision_queue": [
+      {
+        "question": "Which public config path, exact branch grammar, effective representation, and readiness seam define the issue's single base/target branch?",
+        "kind": "human_decision",
+        "material_effect": "decision",
+        "changes": "the public configuration, load-time grammar, effective output, and startup-readiness contracts",
+        "options": [
+          "Use optional workspace.base_branch containing a 1-255-byte valid UTF-8 branch name, unchanged and untrimmed. It may contain slashes, must not start with -, refs/, or origin/, and refs/heads/\u003cvalue\u003e must pass git check-ref-format. A written value renders unchanged in effective text/JSON with file provenance; omission renders \u003crepository-default\u003e/null with default provenance. Add (*workspace.Provider).Ready(context.Context) error after CheckBaseCache on initial build and every workspace rebuild; its credentialed lookup returns workspace.ErrBaseBranchNotFound when the explicit branch, or current HEAD branch used for omission, is absent. buildWorkspace wraps cmd/ben.ErrNotReady before bundle publication or agent launch.",
+          "Use workspace.base_branch but require a fully qualified refs/heads/\u003cname\u003e that passes git check-ref-format. Preserve it verbatim in effective output, strip the prefix for forge comparisons, and use the same Ready, ErrBaseBranchNotFound, and ErrNotReady routing.",
+          "Use optional top-level target_branch with option 1's unqualified grammar, effective representation, readiness seam, and refusal behavior, even though the value also controls workspace ancestry."
+        ],
+        "recommended_option": 1
+      },
+      {
+        "question": "Is pull-request target compliance prompt guidance only, or a publication-evidence invariant; which trusted template binding and local PR fact carry it?",
+        "kind": "human_decision",
+        "material_effect": "decision",
+        "changes": "the locked SPEC §5.6 guidance contract and the local publication-evidence boundary",
+        "options": [
+          "Add a trusted root Liquid string target_branch from core.Workspace.TargetBranch. Add BaseBranch to core.PR, populate it at the tracker boundary, and require exact equality in the local verifier. Prompt text remains guidance; verifier evidence is authoritative. A single wrong-target PR is VerdictContradicted and §9.7 routes it to needs-review; no PR is VerdictIncomplete.",
+          "Add trusted run.target_branch from core.Workspace.TargetBranch with the same BaseBranch evidence, exact comparison, and verdict routing, placing claim-scoped configuration under the existing run object.",
+          "Keep target selection as prompt guidance only and do not extend local pull-request evidence."
+        ],
+        "recommended_option": 1
+      },
+      {
+        "question": "When the local tracker finds multiple open pull requests with the exact issue-branch head, including a correct- and wrong-target pair, what cardinality rule determines verification?",
+        "kind": "human_decision",
+        "material_effect": "acceptance_gap",
+        "changes": "local tracker enumeration, deterministic verification, and parity with the remote substrate",
+        "options": [
+          "Align both substrates on ambiguity refusal. Introduce shared core.ErrPRAmbiguous, retaining ErrRemotePRAmbiguous as an alias if needed, and make local FindPR examine every returned page until exhaustion or a second exact-branch open candidate. Zero returns nil, exactly one returns its full facts, and more than one returns ErrPRAmbiguous regardless of update order or target; it never chooses the newest or filters by target. Verification propagates the error and locked §9.7 parks needs-review.",
+          "Give correct-target precedence. Enumerate all exact-head open candidates in the verifier; exactly one matching the retained target wins even when wrong-target candidates exist, more than one correct-target candidate is ErrPRAmbiguous, and only wrong-target candidates produce VerdictContradicted.",
+          "Treat any exact-head wrong-target candidate as VerdictContradicted even when a correct-target PR also exists; multiple all-correct candidates remain ErrPRAmbiguous."
+        ],
+        "recommended_option": 1
+      },
+      {
+        "question": "Must the same single base/target contract apply to Airlock workflows; if so, which daemon-owned per-claim record stores the selected target and which trusted read seam supplies it to remote verification?",
+        "kind": "human_decision",
+        "material_effect": "split_boundary",
+        "changes": "the substrate scope and the remote target-selection boundary",
+        "options": [
+          "Define one local-and-Airlock contract. Configure the selector on mirror.Mirror, but on the first RecordClaim for an epoch resolve the explicit branch or then-current repository default and atomically persist TargetBranch with BaseSHA in mirror.claimRecord/core.RemoteClaim before any remote run; same-epoch retries return it unchanged. Add verify.RemoteClaimSource.Claim(context.Context, core.RemoteClaimRef), implemented by the mirror; RemoteChecker reads that trusted record for run.Claim and RemoteExpectation retains only workflow-scoped Repository. remotews persists the returned target in its cycle/workspace for restore and prompt use, but not as verifier authority. mirror.Ready returns mirror.ErrBaseBranchNotFound and buildRemoteWorkspace wraps ErrNotReady. Airlock wiring may ship as a dependent child; until then a configured non-default branch refuses rather than being ignored.",
+          "Scope the setting to local execution and make every Airlock workflow that writes workspace.base_branch refuse as unsupported."
+        ],
+        "recommended_option": 1
+      },
+      {
+        "question": "At what lifetime is the selected target fixed, and how does the upgrade handle existing local claim-base, mirror claim, and remote cycle records that contain no historical target?",
+        "kind": "human_decision",
+        "material_effect": "acceptance_gap",
+        "changes": "durable target retention, retry/restart behavior, and safe rollout over legacy records",
+        "options": [
+          "Resolve once per new assignment epoch before its first attempt and atomically persist TargetBranch with the base pin; retain it across retry, rollback, reload, restart, and default movement. Deploy only when ClaimedByPrincipal is empty for every affected workflow, matching §9.10's drain. Existing targetless records remain readable only as non-authorizing legacy state: workspace.ErrClaimTargetUnrecorded, mirror.ErrClaimTargetUnrecorded, or remotews.ErrClaimTargetUnrecorded prevents same-epoch prepare, restore, prompt, and verification; recovery parks epoch-faulted and never infers today's default. Only a later assignment with a new epoch may carry its trusted old base/cycle identity as outgoing state, resolve the then-current target, and atomically replace the record before hooks or a run.",
+          "Require the same empty-principal drain, then refuse startup while any legacy record exists. The operator must archive the old state and retire its retained local or remote workspaces before starting with empty versioned stores; no record is migrated or target inferred."
+        ],
+        "recommended_option": 1
+      }
+    ],
+    "applicable_constraints": [
+      "SPEC.md is locked; adding a config field or trusted template variable requires explicit human sign-off before implementation.",
+      "SPEC §6.2 already settles remote-first branch preservation and claim-pin immutability; neither is an open decision for this ticket.",
+      "The workflow loader and Liquid variable set are closed and strict; omission must preserve the current default while malformed written values refuse at load.",
+      "Issue title/body are untrusted template data, so a base or target branch cannot be derived from issue-authored text.",
+      "ben config effective must show resolved values and provenance consistently in text and JSON.",
+      "Base fetches continue to use the workspace repository's credential source at the moment of the remote Git invocation.",
+      "No new dependency is permitted without human sign-off.",
+      "SPEC §9.10 already requires an empty-principal upgrade drain and forbids minting historical claim state from today's branch; target rollout must preserve that rule."
+    ],
+    "acceptance_gaps": [
+      "The issue does not yet name the exact config path, branch grammar, normalized effective value, or callable readiness boundary.",
+      "The closed template contract exposes no trusted target branch, and core.PR carries no base branch, so prompt guidance cannot prove local target compliance.",
+      "Local FindPR returns the first exact-head open pull request by update order; correct- and wrong-target PRs together therefore produce an ordering-dependent verdict while remote verification refuses multiplicity.",
+      "Neither core.Workspace nor the local claim-base record retains the selected target, including the outgoing value a pending-epoch rollback must restore.",
+      "The local provider has no credentialed Ready seam or named missing-branch refusal; assembly currently calls only the intentionally offline CheckBaseCache.",
+      "Airlock's workflow-scoped RemoteExpectation cannot represent concurrent claims that retained different targets across a default-branch movement.",
+      "Mirror claim records retain BaseSHA but not the selected target, and mirror pinning independently falls back to the repository default instead of one claim-scoped selection.",
+      "Existing local claim-base, mirror claim, and remote cycle records contain no target; filling them from current configuration or the current repository default would fabricate historical claim state."
+    ],
+    "proposed_acceptance_tests": [
+      "Table-drive omitted, valid explicit, malformed, case-sensitive unknown, duplicate, and null configuration; assert effective text/JSON value and provenance without weakening the strict loader.",
+      "Prove local and mirror Ready use the remote credential, return their ErrBaseBranchNotFound for a valid absent branch, and assembly wraps ErrNotReady before bundle publication or agent launch while preserving authentication and transport failures.",
+      "In a real Git fixture with different default/configured branches, prove a fresh issue branch starts at the configured commit while an existing remote ben/\u003cworkspace_key\u003e branch reattaches unchanged and retains its claim target.",
+      "Prove trusted guidance names the target; one correct-target PR publishes, one wrong-target PR is VerdictContradicted and reaches needs-review, and no PR remains VerdictIncomplete.",
+      "Return correct- plus wrong-target local PRs in both update orders and prove FindPR returns ErrPRAmbiguous, the verifier never selects either, and the real route reaches needs-review; retain the equivalent remote multiplicity case.",
+      "Exercise local retry, pending rollback, reload, restart, and default movement, then feed a targetless legacy record: same-epoch use parks without inference while a new epoch retains only valid outgoing base state and writes a complete target before launch.",
+      "For Airlock, start concurrent claims across default movement and prove each mirror record retains its own target, RemoteChecker reads it through RemoteClaimSource, and wrong-target evidence is VerdictContradicted and reaches needs-review.",
+      "Feed targetless legacy local, mirror, and remote-cycle records through reload/restart: same-epoch paths return the respective package's ErrClaimTargetUnrecorded and park without prepare, restore, prompt, verification, or default inference; a post-drain new epoch preserves only valid cycle/base state and atomically writes its newly selected target before dispatch."
+    ],
+    "affected_area_hypotheses": [
+      "internal/config schema, strict load/defaulting, provenance, effective text/JSON, and reload bindings",
+      "internal/workspace target selection, credentialed Ready check, named absence refusal, fresh prepare, remote-first reattachment, durable claim target/rollback, and retry/restart tests",
+      "internal/template closed variable descriptors and strict rendering",
+      "internal/core PR facts and shared ambiguity error, internal/tracker/github complete local PR enumeration, internal/fake fidelity, and internal/verify target/cardinality evidence",
+      "internal/orchestrator, cmd/ben local assembly, and internal/integration coverage for the cross-component invariant",
+      "cmd/ben/remote and internal/remotews cycle/workspace projection for claim-scoped Airlock targets",
+      "internal/mirror claim-time target/base records, legacy refusal and readiness; internal/verify RemoteClaimSource verification; and their conformance/substrate tests",
+      "SPEC §5.2.4, §5.6, and §6.2 plus operator workflow guidance after explicit sign-off"
+    ],
+    "candidate_delivery_splits": [],
+    "recommendation": "requires_contract_decision",
+    "reasons": [
+      "The requested outcome is bounded, but its public field/grammar, evidence binding, multi-PR cardinality, remote seam, and legacy-state rollout are consequential contract choices.",
+      "Prompt guidance cannot establish target compliance while the local verifier lacks a pull-request base fact, and choosing the first of multiple PRs makes the verdict depend on update order.",
+      "Airlock's workflow-scoped RemoteExpectation cannot safely stand in for a claim target; the target must live beside the immutable mirror pin and be read back by claim identity.",
+      "Locked §9.7 already routes a single wrong-target PR as contradiction and verification ambiguity as needs-review; aligning both substrates preserves that distinction.",
+      "Existing durable records cannot acquire a historical target from current state; rollout needs an explicit drain and non-authorizing legacy path before implementation can be safe."
+    ]
+  }
+}

@@ -120,7 +120,8 @@ func (o *Orchestrator) parkCredential(ctx context.Context, r *Record, detail str
 }
 
 // driveVerifyRetry re-issues a verification whose publish credential failed
-// transiently or whose mandatory tracker epoch read failed (SPEC §8.5, §9.7).
+// transiently, whose protected-file publication awaits approval, or whose
+// mandatory tracker epoch read failed (SPEC §8.5, §9.7).
 //
 // Once per poll tick, from `verifying`, with the attempt neither ended nor
 // recorded and no verdict routed. §9.7's fail-closed rule covers evidence that

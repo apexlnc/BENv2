@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "name": "retry-to-success",
+  "issue": {
+    "identifier": "7"
+  },
+  "attempts": [
+    {
+      "outcome": "crashed",
+      "session": "retry-1"
+    },
+    {
+      "outcome": "succeeded",
+      "session": "retry-2"
+    }
+  ],
+  "publication": "complete",
+  "steps": [
+    {
+      "action": "start",
+      "until": "backoff"
+    },
+    {
+      "action": "advance",
+      "until": "done"
+    }
+  ]
+}

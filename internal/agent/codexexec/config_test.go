@@ -55,6 +55,40 @@ func TestParseProviderBinaryDefault(t *testing.T) {
 	}
 }
 
+func TestLocalWritesCoversEveryProviderGrant(t *testing.T) {
+	parallel(t)
+	for _, tt := range []struct {
+		name     string
+		provider map[string]any
+		want     core.LocalWriteScope
+	}{
+		{
+			name: "workspace-write names configured grants",
+			provider: map[string]any{
+				"sandbox_mode": "workspace-write",
+				"add_dirs":     []any{"/srv/shared"},
+				"env":          map[string]any{"TMPDIR": "/var/tmp/agent", "OTHER": "value"},
+			},
+			want: core.LocalWriteScope{Roots: []string{"/srv/shared", "/var/tmp/agent"}},
+		},
+		{
+			name:     "danger-full-access is explicitly unbounded",
+			provider: map[string]any{"sandbox_mode": "danger-full-access"},
+			want:     core.LocalWriteScope{Unbounded: true},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			scope, err := (Kind{}).LocalWrites(core.AgentConfig{Provider: tt.provider}, core.LocalRuntimePaths{})
+			if err != nil {
+				t.Fatalf("LocalWrites: %v", err)
+			}
+			if scope.Unbounded != tt.want.Unbounded || !slices.Equal(scope.Roots, tt.want.Roots) {
+				t.Errorf("LocalWrites = %+v, want %+v", scope, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseProviderRefusals(t *testing.T) {
 	parallel(t)
 	for _, tc := range []struct {
@@ -129,6 +163,18 @@ func TestParseProviderRefusals(t *testing.T) {
 			// workspace at exec time.
 			name:  "relative add_dirs entry",
 			block: map[string]any{"sandbox_mode": "workspace-write", "add_dirs": []any{"srv/a"}},
+			want:  ErrProviderValue,
+		},
+		{
+			// Assembly cannot prove daemon scratch lies outside a cwd-relative
+			// temp root selected by the provider.
+			name:  "relative TMPDIR override",
+			block: map[string]any{"sandbox_mode": "workspace-write", "env": map[string]any{"TMPDIR": "tmp/agent"}},
+			want:  ErrProviderValue,
+		},
+		{
+			name:  "empty TMPDIR override",
+			block: map[string]any{"sandbox_mode": "workspace-write", "env": map[string]any{"TMPDIR": ""}},
 			want:  ErrProviderValue,
 		},
 		{
@@ -280,6 +326,11 @@ func TestStructuralRefusalsNeverPrintTheValue(t *testing.T) {
 			name:  "add_dirs entry with an unquotable character",
 			block: map[string]any{"sandbox_mode": "workspace-write", "add_dirs": []any{`/srv/secret"quote`}},
 			field: "agent.provider.add_dirs[0]", value: `/srv/secret"quote`, want: ErrProviderValue,
+		},
+		{
+			name:  "relative TMPDIR override",
+			block: map[string]any{"sandbox_mode": "workspace-write", "env": map[string]any{"TMPDIR": "relative/secret"}},
+			field: "agent.provider.env.TMPDIR", value: "relative/secret", want: ErrProviderValue,
 		},
 		{
 			name:  "env_passthrough entry in the reserved namespace",

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,11 +69,22 @@ func load(absPath string) (*WorkflowDefinition, error) {
 		return nil, ErrFrontMatterNotMap
 	}
 	var versionProbe struct {
-		Version *int `yaml:"version"`
+		Version *yamlInt `yaml:"version"`
 	}
-	_ = yaml.Unmarshal([]byte(frontMatter), &versionProbe) // map-ness already established
-	if versionProbe.Version != nil && *versionProbe.Version != SupportedVersion {
-		return nil, &UnsupportedVersionError{Version: *versionProbe.Version}
+	// A failed probe is discarded rather than reported, and the version check is
+	// then skipped rather than made on what the failure left behind. The probe
+	// has one field and ignores unknown keys, so its only possible failure is
+	// `version` itself — and yaml.v3 allocates the pointer *before* handing the
+	// node to the decoder, so a refused value leaves Version non-nil at 0. Trusting
+	// that is how `version: "1"` and `version: one` both refused with "declares
+	// config version 0 … upgrade ben to use this file": a fabricated version, and
+	// an instruction to replace the binary over a quoted or mistyped value. Falling
+	// through hands the same key to the strict pass, which decodes it into the same
+	// type and states the actual defect.
+	if err := yaml.Unmarshal([]byte(frontMatter), &versionProbe); err == nil {
+		if versionProbe.Version != nil && versionProbe.Version.Int() != SupportedVersion {
+			return nil, &UnsupportedVersionError{Version: versionProbe.Version.Int()}
+		}
 	}
 	// The null-value shape checks also run on the lenient document: the strict
 	// pass decodes an explicit null to the field's zero value, indistinguishable
@@ -91,6 +103,13 @@ func load(absPath string) (*WorkflowDefinition, error) {
 	dec := yaml.NewDecoder(strings.NewReader(frontMatter))
 	dec.KnownFields(true)
 	if err := dec.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
+		// A numeric-spelling refusal already reads as a validation error and
+		// carries its own line; it is only missing the dotted path, which nothing
+		// below a scalar's decoder can see (number.go). Everything else is a YAML
+		// error about the front matter and is named as one.
+		if num, ok := locateNumeric(err, frontMatter); ok {
+			return nil, num
+		}
 		return nil, fmt.Errorf("WORKFLOW.md front matter: %w", err)
 	}
 
@@ -150,9 +169,9 @@ func resolve(raw *rawConfig, def *WorkflowDefinition) error {
 	cfg := &def.Config
 	prov := def.Provenance
 
-	setInt := func(path string, dst *int, src *int, def int) {
+	setInt := func(path string, dst *int, src *yamlInt, def int) {
 		if src != nil {
-			*dst, prov[path] = *src, FieldOrigin{Source: SourceFile}
+			*dst, prov[path] = src.Int(), FieldOrigin{Source: SourceFile}
 		} else {
 			*dst, prov[path] = def, FieldOrigin{Source: SourceDefault}
 		}
@@ -255,6 +274,12 @@ func resolve(raw *rawConfig, def *WorkflowDefinition) error {
 		cfg.Workspace.Root = filepath.Clean(root)
 		prov["workspace.root"] = FieldOrigin{Source: SourceDefault}
 	}
+	if ws.BaseBranch != nil {
+		if err := validateBaseBranch(*ws.BaseBranch); err != nil {
+			return &ValidationError{Field: "workspace.base_branch", Msg: err.Error()}
+		}
+	}
+	setStr("workspace.base_branch", &cfg.Workspace.BaseBranch, ws.BaseBranch)
 
 	// hooks: scripts are shell text — $VAR indirection deliberately does not
 	// apply; runtime expansion belongs to the shell (§5.5).
@@ -281,6 +306,7 @@ func resolve(raw *rawConfig, def *WorkflowDefinition) error {
 	if err := resolveProviderEnv(cfg.Agent.Provider, "agent.provider", prov); err != nil {
 		return err
 	}
+	cfg.Agent.providerEnvSources = providerEnvSources(prov, "agent.provider")
 
 	// publish: three plain strings, and `value` is deliberately not resolved.
 	// Reading the variable here would refuse the file on every host that does not
@@ -346,10 +372,17 @@ func resolve(raw *rawConfig, def *WorkflowDefinition) error {
 	setInt("limits.stall_timeout_ms", &cfg.Limits.StallTimeoutMS, lm.StallTimeoutMS, DefaultStallTimeoutMS)
 	setInt("limits.attempt_timeout_ms", &cfg.Limits.AttemptTimeoutMS, lm.AttemptTimeoutMS, DefaultAttemptTimeoutMS)
 	setInt("limits.max_prompt_bytes", &cfg.Limits.MaxPromptBytes, lm.MaxPromptBytes, DefaultMaxPromptBytes)
-	cfg.Limits.MaxCostUSD = lm.MaxCostUSD
+	cfg.Limits.MaxCostUSD = lm.MaxCostUSD.Float()
 	prov["limits.max_cost_usd"] = originOr(lm.MaxCostUSD != nil, SourceDefault)
 
-	return nil
+	// substrate: a closed key set this package owns end to end, and the one
+	// section whose *written-ness* decides a refusal — see resolveSubstrate.
+	if err := resolveSubstrate(raw.Substrate, cfg, prov); err != nil {
+		return err
+	}
+	// review: the #204 controller. After the tracker, because its required label
+	// defaults to the one that already dispatches this daemon.
+	return resolveReview(raw.Review, cfg, prov)
 }
 
 // rejectExplicitNulls refuses explicitly-null values whose strict decoding
@@ -363,6 +396,8 @@ func resolve(raw *rawConfig, def *WorkflowDefinition) error {
 //     block, null is a shape error like any other non-map value.
 //   - workspace.root — SPEC §5.2.4 types it as a path; a written key with no
 //     value is not a request for the default root.
+//   - workspace.base_branch — omission selects the repository default, while
+//     null is not a branch name and must not silently select that fallback.
 //   - publish — SPEC §5.2.8 types it as an object, and "absent" here means
 //     something: no publish credential is injected, so the agent publishes with
 //     whatever it can find under HOME. A written key with no value would select
@@ -389,10 +424,29 @@ func rejectExplicitNulls(doc map[string]any) error {
 		if v, present := ws["root"]; present && v == nil {
 			return &ValidationError{Field: "workspace.root", Msg: "must be a path; omit the key to use the default root"}
 		}
+		if v, present := ws["base_branch"]; present && v == nil {
+			return &ValidationError{Field: "workspace.base_branch", Msg: "must be a branch name; omit the key to use the repository default"}
+		}
 	}
 	if v, present := doc["publish"]; present {
 		if v == nil {
 			return &ValidationError{Field: "publish", Msg: "must be a map; omit the key entirely to inject no publish credential"}
+		}
+	}
+	// substrate — the same reasoning as `publish`, one step sharper: absence
+	// here means "run attempts on this host", and a written-but-null key would
+	// select that silently. `substrate.airlock` is caught too, because a null
+	// there decodes to a nil pointer and is indistinguishable from an omitted
+	// key by the strict pass — which is exactly the distinction the
+	// mixed-configuration refusal rests on.
+	if sb, present := doc["substrate"]; present {
+		if sb == nil {
+			return &ValidationError{Field: "substrate", Msg: "must be a map; omit the key entirely to run attempts on this host"}
+		}
+		if block, ok := sb.(map[string]any); ok {
+			if v, written := block["airlock"]; written && v == nil {
+				return &ValidationError{Field: "substrate.airlock", Msg: "must be a map; omit the key entirely under substrate.kind local"}
+			}
 		}
 	}
 	return nil
@@ -471,6 +525,11 @@ func validate(cfg *Config) error {
 			return &ValidationError{Field: "tracker.required_labels", Msg: "blank label entries are not allowed (a blank label matches no issue)"}
 		}
 	}
+	if cfg.Workspace.BaseBranch != "" {
+		if err := validateBaseBranch(cfg.Workspace.BaseBranch); err != nil {
+			return &ValidationError{Field: "workspace.base_branch", Msg: err.Error()}
+		}
+	}
 	positives := []struct {
 		field string
 		v     int
@@ -493,13 +552,39 @@ func validate(cfg *Config) error {
 			return &ValidationError{Field: p.field, Msg: "must be a positive integer"}
 		}
 	}
-	if cfg.Limits.MaxCostUSD != nil && *cfg.Limits.MaxCostUSD <= 0 {
-		return &ValidationError{Field: "limits.max_cost_usd", Msg: "must be positive when set (omit to disable the budget cap)"}
+	if v := cfg.Limits.MaxCostUSD; v != nil {
+		// Finiteness first, as its own refusal rather than folded into the
+		// positivity rule below: **every** comparison against NaN is false, so
+		// `<= 0` does not refuse it, `> 0` does not accept it, and a cap written
+		// as `.nan` was recorded with provenance `file`, printed by
+		// `config effective` as though set, and then inert at both consumers'
+		// gates — a budget ceiling switched off by a value that looks like one.
+		// `.inf` is the mirror image: it passes every gate and reaches the child
+		// argv as `+Inf`.
+		//
+		// Load refuses both spellings a layer earlier (yamlFloat), and this is
+		// still the rule rather than a restatement of it: validate takes a Config
+		// deliberately, so it can be called on one nobody read off disk, and the
+		// value rule has to hold there too.
+		if math.IsNaN(*v) || math.IsInf(*v, 0) {
+			return &ValidationError{Field: "limits.max_cost_usd", Msg: "must be a finite number"}
+		}
+		if *v <= 0 {
+			return &ValidationError{Field: "limits.max_cost_usd", Msg: "must be positive when set (omit to disable the budget cap)"}
+		}
 	}
 	if err := validatePublish(cfg.Publish); err != nil {
 		return err
 	}
-	return validateDeployment(cfg.Deployment)
+	if err := validateDeployment(cfg.Deployment); err != nil {
+		return err
+	}
+	// After the credential sources are resolved into cfg.CredentialSources, so
+	// `auth_source` can be validated against the entries that actually exist.
+	if err := validateSubstrate(cfg); err != nil {
+		return err
+	}
+	return validateReview(cfg)
 }
 
 func trimAll(in []string) []string {

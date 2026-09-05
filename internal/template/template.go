@@ -19,6 +19,7 @@ package template
 import (
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"sync"
 
 	"github.com/osteele/liquid"
@@ -36,7 +37,10 @@ type Vars struct {
 	Attempt int
 	// Workspace is the absolute workspace path.
 	Workspace string
-	Run       Run
+	// TargetBranch is the trusted, claim-scoped pull-request target selected by
+	// the workspace provider.
+	TargetBranch string
+	Run          Run
 }
 
 // Run is the `run` template variable.
@@ -81,10 +85,19 @@ var (
 func engines() (*liquid.Engine, *liquid.Engine) {
 	enginesOnce.Do(func() {
 		renderEngine = liquid.NewEngine()
+		renderEngine.RegisterFilter("shellescape", shellEscape)
 		renderEngine.StrictVariables()
 		probeEngine = liquid.NewEngine()
+		probeEngine.RegisterFilter("shellescape", shellEscape)
 	})
 	return renderEngine, probeEngine
+}
+
+// shellEscape renders one POSIX-shell argument. It always quotes, including
+// simple values, so a canonical command cannot become unsafe when an operator
+// later selects a Git-valid branch containing shell metacharacters.
+func shellEscape(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 // Load parses and validates one prompt template. path and line locate the

@@ -27,9 +27,11 @@ func TestFreshHookCommitRemainsAttemptOne(t *testing.T) {
 	origin := newAttemptFloorOrigin(t)
 
 	provider, err := workspace.New(workspace.Options{
-		Root:        t.TempDir(),
-		WorkflowKey: "wf",
-		Repository:  core.Repository{RemoteURL: origin},
+		Root:          t.TempDir(),
+		WorkflowKey:   "wf",
+		ScratchRoot:   t.TempDir(),
+		AgentTempRoot: t.TempDir(),
+		Repository:    core.Repository{RemoteURL: origin},
 		Hooks: workspace.Hooks{AfterCreate: "touch hook.txt && git add hook.txt && " +
 			"git -c user.name=hook -c user.email=hook@test.invalid " +
 			"-c commit.gpgSign=false commit --quiet -m hook"},
@@ -87,10 +89,12 @@ func TestPrePinFailureRetriesWithTheRealWorkspaceProvider(t *testing.T) {
 	})
 
 	provider, err := workspace.New(workspace.Options{
-		Root:        t.TempDir(),
-		WorkflowKey: "wf",
-		Repository:  core.Repository{RemoteURL: origin},
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Root:          t.TempDir(),
+		WorkflowKey:   "wf",
+		ScratchRoot:   t.TempDir(),
+		AgentTempRoot: t.TempDir(),
+		Repository:    core.Repository{RemoteURL: origin},
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)

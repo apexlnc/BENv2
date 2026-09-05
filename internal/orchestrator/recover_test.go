@@ -12,6 +12,7 @@ import (
 	"github.com/srhg-ai-7cef3f93/ben/internal/config"
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 	"github.com/srhg-ai-7cef3f93/ben/internal/fake"
+	"github.com/srhg-ai-7cef3f93/ben/internal/workspace"
 )
 
 // SPEC §9.10, the driver. Every restart test here drives the daemon to a state
@@ -66,6 +67,7 @@ func (h *harness) restart(opts harnessOpts) error {
 		Workspaces:     workspaces,
 		Runner:         h.Runner,
 		Verifier:       opts.verifier,
+		ResolveRun:     opts.resolveRun,
 		ClaimPrincipal: fake.DefaultPrincipal,
 	}
 	h.Source = newTestSource(h.def, h.Bundle)
@@ -110,6 +112,7 @@ func pinClaimBaseForRecovery(t *testing.T, h *harness, identifier string) int64 
 	}
 	h.Workspaces.SetClaimBase(identifier, core.ClaimBase{
 		State: core.ClaimBasePinned, Epoch: claimEpoch, BaseSHA: fake.DefaultBaseSHA,
+		TargetBranch: fake.DefaultTargetBranch,
 	})
 	return claimEpoch
 }
@@ -122,7 +125,7 @@ func pendClaimBaseForRecovery(t *testing.T, h *harness, identifier string) int64
 }
 
 // switchableProber and switchableFailures are the two §9.10 seams a test needs to
-// *move* while the loop is running — "the group has since died", "the log became
+// *move* while the loop is running — "the domain has since become quiet", "the log became
 // readable" — and Config is not the place to move them from: the authority
 // goroutine reads it, so assigning a field mid-run is a data race the detector
 // rightly rejects. The mutable cell belongs to the test, behind a lock, with only
@@ -173,15 +176,14 @@ func (f *switchableFailures) LastFailure(id string) (core.RunFailure, bool, erro
 	return f.cur.LastFailure(id)
 }
 
-// groupGone is the prober for a restart whose previous run really did die —
+// domainQuiet is the prober for a restart whose previous run really did die —
 // which is the overwhelmingly common case after a crash, and the one §9.10
 // option 1 was chosen to keep converging automatically.
-var groupGone = func(core.RunEvidence) (bool, error) { return true, nil }
+var domainQuiet = func(core.RunEvidence) (bool, error) { return true, nil }
 
-// groupAlive is the opposite: the process group outlived the daemon, which
-// `kill -9` makes reachable because every attempt runs in its own group
-// (harness run.go, Setpgid).
-var groupAlive = func(core.RunEvidence) (bool, error) { return false, nil }
+// domainLive is the opposite: the execution domain outlived an abrupt daemon
+// loss and recovery must retain it.
+var domainLive = func(core.RunEvidence) (bool, error) { return false, nil }
 
 // Run must refuse a loop that has not recovered. Without this, the mutation
 // "drop the gate" makes every duplicate-dispatch test below pass by accident:
@@ -264,7 +266,7 @@ func TestRestartAtEachKillPoint(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := tc.opts
 			opts.issues = []core.Issue{fake.Issue("1", epoch)}
-			opts.runGone = groupGone
+			opts.runGone = domainQuiet
 			opts.verifier = incompleteEvidence
 			h := start(t, opts)
 			h.WaitState("1", tc.waitFor)
@@ -284,7 +286,7 @@ func TestRestartAtEachKillPoint(t *testing.T) {
 			}
 			startsBefore := h.Runner.StartCount()
 
-			if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+			if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 				t.Fatalf("Recover: %v", err)
 			}
 
@@ -329,12 +331,12 @@ func TestARecoveredOrphanResumesOnTheSameBranch(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 	branchBefore := h.Workspaces.Prepares("1")[0]
 
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitState("1", StateBackoff)
@@ -370,7 +372,7 @@ func TestARecoveredOrphanResumesOnTheSameBranch(t *testing.T) {
 // parks rather than manufacturing a base and dispatching attempt one.
 func TestAnUnprojectedClaimWithoutPendingEpochParks(t *testing.T) {
 	issue := fake.Issue("1", epoch)
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 
 	// The tracker state a daemon killed in that window leaves: assigned, no ben:*
 	// label, and an assignment event to anchor the cycle. Written through Claim so
@@ -383,7 +385,7 @@ func TestAnUnprojectedClaimWithoutPendingEpochParks(t *testing.T) {
 		t.Fatalf("the fixture already carries %q; #15 is the window before any label", got)
 	}
 
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -399,6 +401,32 @@ func TestAnUnprojectedClaimWithoutPendingEpochParks(t *testing.T) {
 	}
 }
 
+func TestTargetlessLegacyClaimParksWithoutPreparingOrVerifying(t *testing.T) {
+	issue := fake.Issue("1", epoch)
+	h := start(t, harnessOpts{runGone: domainQuiet})
+	h.Tracker.Set(issue)
+	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	h.Workspaces.SetFailClaimBase(workspace.ErrClaimTargetUnrecorded)
+	starts, prepares := h.Runner.StartCount(), h.Workspaces.PrepareCount("1")
+
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	h.WaitState("1", StateNeedsReview)
+	h.waitLabel("1", core.StateLabelNeedsReview)
+	if got := h.Runner.StartCount(); got != starts {
+		t.Fatalf("legacy recovery started %d runs, want %d", got, starts)
+	}
+	if got := h.Workspaces.PrepareCount("1"); got != prepares {
+		t.Fatalf("legacy recovery prepared %d workspaces, want %d", got, prepares)
+	}
+	if got := h.Tracker.ReleaseCount("1"); got != 0 {
+		t.Fatalf("legacy recovery released the retained claim %d times", got)
+	}
+}
+
 // Fresh workspace storage under a standing assignment has lost the historical
 // epoch/base authority. Run-marker absence proves only that the workspace is
 // free now; it cannot recreate that authority, so the claim parks sticky.
@@ -407,7 +435,7 @@ func TestFreshWorkspaceStorageParksEpochFaulted(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
@@ -416,7 +444,7 @@ func TestFreshWorkspaceStorageParksEpochFaulted(t *testing.T) {
 	// since it lives beside issues/ (workspace marker.go).
 	h.Workspaces = fake.NewWorkspaces()
 
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: nil}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: nil}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitState("1", StateNeedsReview)
@@ -429,7 +457,7 @@ func TestFreshWorkspaceStorageParksEpochFaulted(t *testing.T) {
 }
 
 func TestEpochFaultedRecoveryParkCannotBeUnparkedIntoALaunch(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -438,7 +466,7 @@ func TestEpochFaultedRecoveryParkCannotBeUnparkedIntoALaunch(t *testing.T) {
 
 	// No provider record: this is the loss-of-storage fault, not a clean pending
 	// crash. Recovery must mark the park sticky under this assignment.
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitState("1", StateNeedsReview)
@@ -468,7 +496,7 @@ func TestEpochFaultedRecoveryParkCannotBeUnparkedIntoALaunch(t *testing.T) {
 }
 
 func TestEpochFaultedPendingIsAbandonedBeforeANewAssignment(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -478,7 +506,7 @@ func TestEpochFaultedPendingIsAbandonedBeforeANewAssignment(t *testing.T) {
 	// abandoned earlier transition. Recovery must park this assignment, then
 	// roll the stale pending state back only after the human removes the claim.
 	h.Workspaces.SetClaimBase("1", core.ClaimBase{State: core.ClaimBasePending, Epoch: 999})
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitState("1", StateNeedsReview)
@@ -511,7 +539,7 @@ func TestEpochFaultedPendingIsAbandonedBeforeANewAssignment(t *testing.T) {
 }
 
 func TestPendingClaimEpochMarkerReadFailureRetriesRecovery(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -526,7 +554,7 @@ func TestPendingClaimEpochMarkerReadFailureRetriesRecovery(t *testing.T) {
 		return VerifyResult{Verdict: VerdictPublished, PRURL: "https://example.test/pull/1"}, nil
 	})
 
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: verifier}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: verifier}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	if got := h.stateOf("1"); got != StateQueued {
@@ -560,7 +588,7 @@ func TestPendingClaimEpochWithRunEvidenceParksBeforeProbeOrVerifier(t *testing.T
 		{name: "a current-cycle running event", runningLog: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := start(t, harnessOpts{runGone: groupGone})
+			h := start(t, harnessOpts{runGone: domainQuiet})
 			issue := fake.Issue("1", epoch)
 			h.Tracker.Set(issue)
 			if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -581,7 +609,7 @@ func TestPendingClaimEpochWithRunEvidenceParksBeforeProbeOrVerifier(t *testing.T
 				verified++
 				return VerifyResult{Verdict: VerdictPublished, PRURL: "https://example.test/pull/old"}, nil
 			})
-			if err := h.restart(harnessOpts{runGone: groupGone, verifier: verifier}); err != nil {
+			if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: verifier}); err != nil {
 				t.Fatalf("Recover: %v", err)
 			}
 			h.WaitState("1", StateNeedsReview)
@@ -604,7 +632,7 @@ func TestPendingClaimEpochWithRunEvidenceParksBeforeProbeOrVerifier(t *testing.T
 // unknown, and waiting cannot end a question nobody will answer. Parks, with the
 // claim and workspace retained.
 func TestAnUnknownLaunchParksRatherThanWaiting(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -619,7 +647,7 @@ func TestAnUnknownLaunchParksRatherThanWaiting(t *testing.T) {
 	// and one of the three has a live run in it.
 	h.Workspaces.SetRunMarker("1", core.RunMarker{State: core.RunMarkerUnknownLaunch})
 
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitState("1", StateNeedsReview)
@@ -640,7 +668,7 @@ func TestAnUnknownLaunchParksRatherThanWaiting(t *testing.T) {
 func TestADoneIssueAwaitingMergeIsNotResurrected(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues:  []core.Issue{fake.Issue("1", epoch)},
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateDone)
 	// The claim converts to a held record and waits for the merge.
@@ -653,7 +681,7 @@ func TestADoneIssueAwaitingMergeIsNotResurrected(t *testing.T) {
 	}
 	startsBefore := h.Runner.StartCount()
 
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -699,7 +727,7 @@ func TestRecoveringTwiceIssuesEachMilestoneOnce(t *testing.T) {
 		{name: "a failure re-issues failed", label: core.StateLabelFailed, want: core.MilestoneFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := start(t, harnessOpts{runGone: groupGone})
+			h := start(t, harnessOpts{runGone: domainQuiet})
 			issue := fake.Issue("1", epoch)
 			h.Tracker.Set(issue)
 			if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -711,7 +739,7 @@ func TestRecoveringTwiceIssuesEachMilestoneOnce(t *testing.T) {
 			pinClaimBaseForRecovery(t, h, "1")
 
 			opts := harnessOpts{
-				runGone:  groupGone,
+				runGone:  domainQuiet,
 				verifier: incompleteEvidence,
 				failures: stubFailures{reason: core.FailureStalled, ok: true},
 			}
@@ -738,7 +766,7 @@ func TestGate1ReleasesOnACloseInsideTheCycle(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
@@ -747,7 +775,7 @@ func TestGate1ReleasesOnACloseInsideTheCycle(t *testing.T) {
 	h.Tracker.Mutate("1", func(i *core.Issue) { i.State = "closed" })
 	h.Tracker.Mutate("1", func(i *core.Issue) { i.State = "open" })
 
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -768,14 +796,14 @@ func TestAFailedHistoryReadRetainsRatherThanClassifies(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
 	boom := errors.New("tracker unavailable")
 	h.Tracker.SetFailHistory(boom)
 	startsBefore := h.Runner.StartCount()
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -804,7 +832,7 @@ func TestAFailedHistoryReadRetainsRatherThanClassifies(t *testing.T) {
 // §6.4: a candidate read that fails at startup is a warning, not a fatal error —
 // and it must not silently look like "this principal holds nothing".
 func TestAFailedCandidateReadWarnsAndContinues(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -813,7 +841,7 @@ func TestAFailedCandidateReadWarnsAndContinues(t *testing.T) {
 
 	boom := errors.New("tracker unavailable")
 	h.Tracker.SetFailClaimedByPrincipal(boom)
-	err := h.restart(harnessOpts{runGone: groupGone, recoverErr: true})
+	err := h.restart(harnessOpts{runGone: domainQuiet, recoverErr: true})
 	if !errors.Is(err, boom) {
 		t.Fatalf("Recover returned %v, want the candidate read's error — §6.4's soft failure has to be visible", err)
 	}
@@ -990,7 +1018,7 @@ func TestGate2ReleasesOnlyTheLoser(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := start(t, harnessOpts{runGone: groupGone})
+			h := start(t, harnessOpts{runGone: domainQuiet})
 			issue := fake.Issue("1", epoch)
 			h.Tracker.Set(issue)
 
@@ -1012,7 +1040,7 @@ func TestGate2ReleasesOnlyTheLoser(t *testing.T) {
 			}
 			pinClaimBaseForRecovery(t, h, "1")
 
-			if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+			if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 				t.Fatalf("Recover: %v", err)
 			}
 
@@ -1061,14 +1089,14 @@ func TestGate2ReleasesOnlyTheLoser(t *testing.T) {
 // TestAFailedHistoryReadRetainsRatherThanClassifies, and the two together are the
 // absence-vs-failure-to-ask rule.
 func TestGate3ParksAClaimTheLogCannotAccountFor(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	issue.Assignees = []string{fake.DefaultPrincipal}
 	h.Tracker.Set(issue)
 	// Assigned, and the log shows nothing that established it.
 	h.Tracker.SetHistory("1")
 
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitState("1", StateNeedsReview)
@@ -1089,7 +1117,7 @@ func TestGate3ParksAClaimTheLogCannotAccountFor(t *testing.T) {
 // set-based reading matches two table rows at once — returning contradictory
 // verdicts for one issue. The most recently labeled one is effective.
 func TestAnInterruptedProjectionClassifiesFromTheOrderedEvents(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -1112,7 +1140,7 @@ func TestAnInterruptedProjectionClassifiesFromTheOrderedEvents(t *testing.T) {
 			got.Labels)
 	}
 
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -1130,7 +1158,7 @@ func TestAnInterruptedProjectionClassifiesFromTheOrderedEvents(t *testing.T) {
 // verdict alone cannot supply it, which is why the whole VerifyResult travels.
 func TestARecoveredPublishCommentCarriesItsPullRequest(t *testing.T) {
 	const prURL = "https://example.test/pull/99"
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -1147,7 +1175,7 @@ func TestARecoveredPublishCommentCarriesItsPullRequest(t *testing.T) {
 	published := verifierFunc(func(context.Context, core.Issue, core.Workspace) (VerifyResult, error) {
 		return VerifyResult{Verdict: VerdictPublished, PRURL: prURL}, nil
 	})
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: published}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: published}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	got := h.waitComment("1", core.MilestonePublished)
@@ -1169,7 +1197,7 @@ func TestARecoveredPublishCommentCarriesItsPullRequest(t *testing.T) {
 // recovery refuses it rather than converting a detectable bug into a comment the
 // tracker rejects forever.
 func TestPublishedWithNoLinkIsRefusedRatherThanPosted(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -1183,7 +1211,7 @@ func TestPublishedWithNoLinkIsRefusedRatherThanPosted(t *testing.T) {
 	linkless := verifierFunc(func(context.Context, core.Issue, core.Workspace) (VerifyResult, error) {
 		return VerifyResult{Verdict: VerdictPublished}, nil
 	})
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: linkless}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: linkless}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -1204,7 +1232,7 @@ func TestPublishedWithNoLinkIsRefusedRatherThanPosted(t *testing.T) {
 // redone, every claim this principal holds sits unaccounted for until somebody
 // restarts the daemon.
 func TestAFailedCandidateScanIsRetriedOnLaterTicks(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -1214,7 +1242,7 @@ func TestAFailedCandidateScanIsRetriedOnLaterTicks(t *testing.T) {
 
 	boom := errors.New("tracker unavailable")
 	h.Tracker.SetFailClaimedByPrincipal(boom)
-	if err := h.restart(harnessOpts{runGone: groupGone, recoverErr: true}); !errors.Is(err, boom) {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, recoverErr: true}); !errors.Is(err, boom) {
 		t.Fatalf("Recover returned %v, want the candidate read's error", err)
 	}
 	if _, tracked := h.o.records["1"]; tracked {
@@ -1244,12 +1272,12 @@ func TestARetriedClassificationRefetchesTheIssue(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
 	h.Tracker.SetFailHistory(errors.New("tracker unavailable"))
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	if _, tracked := h.o.records["1"]; !tracked {
@@ -1275,12 +1303,12 @@ func TestARetriedCandidateThatVanishedIsDropped(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
 	h.Tracker.SetFailHistory(errors.New("tracker unavailable"))
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.Tracker.Delete("1")
@@ -1298,7 +1326,7 @@ func TestARetriedCandidateThatVanishedIsDropped(t *testing.T) {
 // not defer the needs-review projection §9.10 *requires* for the one state that
 // has no answer coming.
 func TestAnUnknownLaunchParksEvenWhenEvidenceIsUnreadable(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -1316,7 +1344,7 @@ func TestAnUnknownLaunchParksEvenWhenEvidenceIsUnreadable(t *testing.T) {
 	// And the failure-reason read is unavailable too, for the same reason: neither
 	// is consulted by a verdict that is already settled.
 	if err := h.restart(harnessOpts{
-		runGone:  groupGone,
+		runGone:  domainQuiet,
 		verifier: unreadable,
 		failures: stubFailures{err: errors.New("state file is corrupt")},
 	}); err != nil {
@@ -1343,13 +1371,13 @@ func TestGate1DisposesTheWorkspaceExactlyOnce(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 	// A human merged the PR and closed the issue while the daemon was down.
 	h.Tracker.Mutate("1", func(i *core.Issue) { i.State = "closed" })
 
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitGone("1")
@@ -1376,7 +1404,7 @@ func TestGate1DisposesTheWorkspaceExactlyOnce(t *testing.T) {
 // reconciles, because a timing-dependent version of this test is how the bug got
 // in: the window is one tracker round trip wide and closes on its own.
 func TestARecoveredParkIsNotUnparkedByItsOwnPendingProjection(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	issue.Assignees = []string{fake.DefaultPrincipal}
 	h.Tracker.Set(issue)
@@ -1392,7 +1420,7 @@ func TestARecoveredParkIsNotUnparkedByItsOwnPendingProjection(t *testing.T) {
 	t.Cleanup(unblock)
 	h.Tracker.SetLabelGate(func() { <-release })
 
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitState("1", StateNeedsReview)
@@ -1428,12 +1456,12 @@ func TestARetriedCandidateThatLostOurClaimIsDropped(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
 	h.Tracker.SetFailHistory(errors.New("tracker unavailable"))
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	if _, tracked := h.o.records["1"]; !tracked {
@@ -1466,7 +1494,7 @@ func TestARetriedCandidateThatLostOurClaimIsDropped(t *testing.T) {
 // same number naming a different issue — and project labels and releases onto
 // whatever happens to share it.
 func TestARecoveryScanOvertakenByAReloadIsDiscarded(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -1476,7 +1504,7 @@ func TestARecoveryScanOvertakenByAReloadIsDiscarded(t *testing.T) {
 
 	// The startup scan fails, so a retry is owed.
 	h.Tracker.SetFailClaimedByPrincipal(errors.New("tracker unavailable"))
-	if err := h.restart(harnessOpts{runGone: groupGone, recoverErr: true}); err == nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, recoverErr: true}); err == nil {
 		t.Fatal("the startup scan was supposed to fail, leaving a retry owed")
 	}
 	h.Tracker.SetFailClaimedByPrincipal(nil)
@@ -1515,16 +1543,16 @@ func TestARecoveryScanOvertakenByAReloadIsDiscarded(t *testing.T) {
 // retained, nothing is dispatched, nothing is projected, and §9.10 converges on its
 // own only if the run really does end. A run that never ends waits forever, so an
 // operator has to be able to see it — and to act, they need the worktree to inspect
-// and the group to check, neither of which is derivable from an issue number.
+// and the retained domain to check, neither of which is derivable from an issue number.
 func TestAPossiblyLiveWorkspaceIsWarnedAboutByName(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
-	if err := h.restart(harnessOpts{runGone: groupAlive, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainLive, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -1546,7 +1574,7 @@ func TestAPossiblyLiveWorkspaceIsWarnedAboutByName(t *testing.T) {
 			t.Errorf("%s: workspace attr = %q; an operator cannot inspect a worktree they were not told about", when, ws)
 		}
 		if last.Attrs["run"] == "" {
-			t.Errorf("%s: no run attr; the recorded group is what `ps` is pointed at", when)
+			t.Errorf("%s: no run attr; the recorded domain evidence is what an operator must inspect", when)
 		}
 	}
 	assertPossiblyLiveWarning("on the first pass")
@@ -1587,7 +1615,7 @@ func TestMissingRecoveryCapabilitiesAreNamedAtStartup(t *testing.T) {
 // An unknown launch is warned about by name too: it parks for a human, and the
 // human's first question is which workspace to look in.
 func TestAnUnknownLaunchIsWarnedAboutByName(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -1599,7 +1627,7 @@ func TestAnUnknownLaunchIsWarnedAboutByName(t *testing.T) {
 	pinClaimBaseForRecovery(t, h, "1")
 	h.Workspaces.SetRunMarker("1", core.RunMarker{State: core.RunMarkerUnknownLaunch})
 
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitState("1", StateNeedsReview)
@@ -1633,13 +1661,13 @@ func TestARetriedClassificationOvertakenByAReloadIsDiscarded(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
 	// Leave the candidate unclassified, so the tick retries it.
 	h.Tracker.SetFailHistory(errors.New("tracker unavailable"))
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.Tracker.SetFailHistory(nil)
@@ -1699,7 +1727,7 @@ func TestARetriedClassificationOvertakenByAReloadIsDiscarded(t *testing.T) {
 // so adopting the stale one launches an agent against a description a human has
 // since rewritten.
 func TestARetriedClassificationAdoptsTheFreshIssue(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	issue.Title = "the old title"
 	issue.Body = "the old body"
@@ -1712,7 +1740,7 @@ func TestARetriedClassificationAdoptsTheFreshIssue(t *testing.T) {
 	// Unclassifiable at first: #15's shape, so the eventual verdict is a dispatch and
 	// the prompt is rendered from whatever issue the verdict carried.
 	h.Tracker.SetFailHistory(errors.New("tracker unavailable"))
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -1745,7 +1773,7 @@ func TestARetriedClassificationAdoptsTheFreshIssue(t *testing.T) {
 // from under claims about to be classified, and the next pass reads the *new* root's
 // absent marker as a free workspace while the old root's process is still running.
 func TestAnIdentityReloadIsRefusedWhileTheRecoveryScanIsUnresolved(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -1754,7 +1782,7 @@ func TestAnIdentityReloadIsRefusedWhileTheRecoveryScanIsUnresolved(t *testing.T)
 	pendClaimBaseForRecovery(t, h, "1")
 
 	h.Tracker.SetFailClaimedByPrincipal(errors.New("tracker unavailable"))
-	if err := h.restart(harnessOpts{runGone: groupGone, recoverErr: true}); err == nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, recoverErr: true}); err == nil {
 		t.Fatal("the startup scan was supposed to fail, leaving it owed")
 	}
 	if len(h.o.Status()) != 0 {

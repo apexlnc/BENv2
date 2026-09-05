@@ -14,13 +14,16 @@ import (
 	"os"
 	"strings"
 
+	agentharness "github.com/srhg-ai-7cef3f93/ben/internal/agent/harness"
 	"github.com/srhg-ai-7cef3f93/ben/internal/config"
 	"github.com/srhg-ai-7cef3f93/ben/internal/registry"
 )
 
 // structural is the whole of `ben config effective`'s adapter validation: the
-// kind lookups and both pure Structural checks, and deliberately nothing after
-// them (see structuralKinds in runtime.go, which `ben run` continues past).
+// kind lookups and every applicable pure structural check, and deliberately
+// nothing after them (see structuralKinds in runtime.go, which `ben run`
+// continues past). A remote workflow includes its kind's RemoteStructural
+// check; a local one does not.
 //
 // Structural only — never New or Ready — so inspecting a config needs no
 // credentials, no network, and no installed harness, which is what lets
@@ -47,6 +50,9 @@ path defaults to ./WORKFLOW.md.
 `
 
 func main() {
+	if handled, code := agentharness.InternalMain(os.Args); handled {
+		os.Exit(code)
+	}
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 

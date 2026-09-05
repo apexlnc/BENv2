@@ -15,8 +15,8 @@ import (
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 )
 
-// The process runtime in this package — liveness windows, the signal ladder,
-// the pump, transcript retention — is deliberately not tested here: it is only
+// The process runtime in this package — liveness windows, domain teardown, the
+// pump, transcript retention — is deliberately not tested here: it is only
 // real against a real harness process, and both adapters exercise it through
 // the shared conformance suite (internal/agent/agenttest). What is tested here
 // is the part that is pure, where a table says more than a subprocess can.
@@ -28,6 +28,7 @@ var (
 	errValue     = errors.New("test: value")
 	errKey       = errors.New("test: key")
 	errBinary    = errors.New("test: binary")
+	errResume    = errors.New("test: continuation")
 )
 
 var testErrors = SpecErrors{EnvNamespace: errNamespace, PromptEmpty: errPrompt, WorkspacePath: errWorkspace}
@@ -94,6 +95,62 @@ func TestCheckSpecNamesOneKeyDeterministically(t *testing.T) {
 	}
 }
 
+// The shared half of the two anchors on a resume token (SPEC §7.1, §9.6). Each
+// adapter mints the token from the child's own stream and checks its shape
+// there; this is the check that stands between whatever reached a RunSpec and
+// the argv element it becomes, and it is deliberately narrower — the elements
+// are passed whole to the harness, so a leading `-` is the one character that
+// changes what an element *means*. Neither `--resume <id>` nor `resume <id>`
+// offers a `--` terminator, so there is nothing else to lean on.
+func TestCheckContinuationArgv(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		token   string
+		refused bool
+	}{
+		{name: "a uuid, which is what both harnesses mint", token: "019fe267-3027-73b2-95fc-09a5467477db"},
+		{name: "an opaque token with no argv meaning", token: "thread_ABC-123"},
+		{
+			// Not this layer's question: an element is passed whole, so an
+			// interior `=` is part of the value the harness looks up. The shape
+			// gate that refuses it lives in each adapter's translator.
+			name:  "an interior equals is still one element",
+			token: "abc=def",
+		},
+		{name: "empty is no continuation at all, and callers do not reach here", token: ""},
+		{name: "a bare flag", token: "-p", refused: true},
+		{name: "a long flag carrying its own value", token: "--config=sandbox_workspace_write.network_access=true", refused: true},
+		{name: "the separator that would end an option list", token: "--", refused: true},
+		{name: "a lone dash, which several CLIs read as stdin", token: "-", refused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckContinuationArgv(tc.token, errResume)
+			if got := errors.Is(err, errResume); got != tc.refused {
+				t.Errorf("CheckContinuationArgv(%q) = %v, want refusal=%v", tc.token, err, tc.refused)
+			}
+		})
+	}
+}
+
+// The refusal must not reproduce the token. It arrived on the child's stdout,
+// whose retained copy is redacted (SPEC §10.3), and an error string is not: an
+// agent that names its own session id would otherwise have an unredacted route
+// into the state directory. The length is reported instead, because "too long"
+// is the one refusal a reader cannot otherwise diagnose.
+func TestCheckContinuationArgvDoesNotEchoTheToken(t *testing.T) {
+	const token = "--settings=/tmp/UNREDACTED-MARKER.json"
+	err := CheckContinuationArgv(token, errResume)
+	if !errors.Is(err, errResume) {
+		t.Fatalf("CheckContinuationArgv = %v, want %v", err, errResume)
+	}
+	if strings.Contains(err.Error(), "UNREDACTED-MARKER") {
+		t.Errorf("the refusal reproduces the token: %v", err)
+	}
+	if !strings.Contains(err.Error(), "38") {
+		t.Errorf("the refusal reports no length: %v", err)
+	}
+}
+
 func TestCheckProviderEnv(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -141,6 +198,90 @@ func TestCheckOwnedEnv(t *testing.T) {
 				t.Errorf("CheckOwnedEnv = %v, want refusal=%v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// #194's remote boundary is stricter than the local child boundary: a worker
+// profile may provide publication identity, but BEN may not serialize a
+// reusable GitHub credential into the substrate request. This table is
+// deliberately independent of remoteGitHubCredentialEnv so deleting or
+// misspelling one production entry makes the test fail.
+func TestRemoteEnvironRefusesEveryReusableGitHubCredentialVariable(t *testing.T) {
+	const secret = "ghp-reusable-MUST-NOT-CROSS"
+	for _, name := range []string{
+		"GITHUB_TOKEN",
+		"GH_TOKEN",
+		"GITHUB_API_TOKEN",
+		"GH_ENTERPRISE_TOKEN",
+		"GITHUB_ENTERPRISE_TOKEN",
+	} {
+		t.Run(name, func(t *testing.T) {
+			env, err := RemoteEnviron(
+				map[string]string{name: secret}, nil,
+				core.RunSpec{Env: map[string]string{"BEN_ISSUE": "194"}}, errValue,
+			)
+			if !errors.Is(err, errValue) {
+				t.Fatalf("RemoteEnviron = %v, want %v", err, errValue)
+			}
+			if env != nil {
+				t.Fatalf("RemoteEnviron returned environment %v with its refusal", env)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("refusal printed the credential value: %v", err)
+			}
+		})
+	}
+
+	// This is a name-based authority boundary, not a heuristic over anything
+	// secret-looking: provider API keys and ordinary configuration still travel.
+	env, err := RemoteEnviron(
+		map[string]string{"AGENT_FLAG": "on", "gh_token": "not consumed by GitHub tooling"},
+		map[string]string{"PROVIDER_API_KEY": "provider-key"},
+		core.RunSpec{Env: map[string]string{"BEN_ISSUE": "194"}}, errValue,
+	)
+	if err != nil {
+		t.Fatalf("RemoteEnviron over provider configuration: %v", err)
+	}
+	for name, want := range map[string]string{
+		"AGENT_FLAG": "on", "gh_token": "not consumed by GitHub tooling",
+		"PROVIDER_API_KEY": "provider-key", "BEN_ISSUE": "194",
+	} {
+		if got := env[name]; got != want {
+			t.Fatalf("env[%s] = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// Destination checks are insufficient once a credential is renamed or placed
+// in argv. Anchor the complete source set independently from the production map
+// and prove the refusal cites provenance without ever holding a secret value.
+func TestCheckRemoteProviderSourcesRefusesEveryReusableGitHubCredentialVariable(t *testing.T) {
+	for _, name := range []string{
+		"GITHUB_TOKEN",
+		"GH_TOKEN",
+		"GITHUB_API_TOKEN",
+		"GH_ENTERPRISE_TOKEN",
+		"GITHUB_ENTERPRISE_TOKEN",
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := CheckRemoteProviderSources([]core.ProviderEnvSource{{
+				Variable: name,
+				Field:    "agent.provider.model",
+			}}, errValue)
+			if !errors.Is(err, errValue) {
+				t.Fatalf("CheckRemoteProviderSources = %v, want %v", err, errValue)
+			}
+			for _, want := range []string{"agent.provider.model", "$" + name} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("refusal %q does not name %q", err, want)
+				}
+			}
+		})
+	}
+	if err := CheckRemoteProviderSources([]core.ProviderEnvSource{{
+		Variable: "MODEL_NAME", Field: "agent.provider.model",
+	}}, errValue); err != nil {
+		t.Fatalf("ordinary provider source refused: %v", err)
 	}
 }
 

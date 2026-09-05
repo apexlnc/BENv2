@@ -24,7 +24,7 @@ import (
 // workspace rather than re-listing the directory.
 //
 // Split out of recover_test.go by #160. The §9.10 fixtures these share with the
-// rest of the family — `harness.restart`, `newProber`, `groupGone`/`groupAlive`,
+// rest of the family — `harness.restart`, `newProber`, `domainQuiet`/`domainLive`,
 // `incompleteEvidence` — stay in recover_test.go, which owns them;
 // `deferredResidue` and `rootedDefinition` are sweep-only and moved here with
 // their tests.
@@ -41,7 +41,7 @@ func TestARetainedFailureWorkspaceSurvivesALaterRecovery(t *testing.T) {
 		script: func(core.RunSpec, int) []core.Event {
 			return fake.Fail(core.FailureBudgetExceeded)
 		},
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	// `failed` releases the claim and keeps the workspace — by not disposing at all
 	// (enterFailed) — and then forgets the record.
@@ -55,7 +55,7 @@ func TestARetainedFailureWorkspaceSurvivesALaterRecovery(t *testing.T) {
 
 	// A restart with nothing assigned: the issue is not a candidate at all, so
 	// nothing recovery does may touch its workspace.
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	if got := h.Workspaces.Disposals("1"); len(got) != 0 {
@@ -80,7 +80,7 @@ func TestRecoverySweepsTheWorkspaceOfAnIssueClosedWhileDown(t *testing.T) {
 		script: func(core.RunSpec, int) []core.Event {
 			return fake.Fail(core.FailureBudgetExceeded)
 		},
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitGone("1")
 	if got := h.Workspaces.Disposals("1"); len(got) != 0 {
@@ -90,7 +90,7 @@ func TestRecoverySweepsTheWorkspaceOfAnIssueClosedWhileDown(t *testing.T) {
 	// A human closes the issue while the daemon is down. It is no longer assigned,
 	// so recovery will not see it as a candidate at all.
 	h.Tracker.Mutate("1", func(i *core.Issue) { i.State = "closed" })
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -156,7 +156,7 @@ func TestTheSweepLeavesEveryWorkspaceItCannotProveTerminal(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := start(t, harnessOpts{runGone: groupGone})
+			h := start(t, harnessOpts{runGone: domainQuiet})
 			// A workspace on disk for an issue nothing holds. The queue label is
 			// stripped so the loop cannot simply dispatch it — an unassigned, labelled,
 			// open issue is ordinary work, and its workspace would then be disposed by
@@ -171,7 +171,7 @@ func TestTheSweepLeavesEveryWorkspaceItCannotProveTerminal(t *testing.T) {
 			}
 			tc.setup(h)
 
-			if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+			if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 				t.Fatalf("Recover: %v", err)
 			}
 
@@ -202,7 +202,7 @@ func TestTheSweepNeverTouchesAWorkspaceARecordHolds(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
@@ -211,7 +211,7 @@ func TestTheSweepNeverTouchesAWorkspaceARecordHolds(t *testing.T) {
 	h.Tracker.Mutate("1", func(i *core.Issue) { i.State = "closed" })
 	h.Tracker.SetFailHistory(errors.New("tracker unavailable"))
 
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	if _, tracked := h.o.records["1"]; !tracked {
@@ -229,7 +229,7 @@ func TestTheSweepNeverTouchesAWorkspaceARecordHolds(t *testing.T) {
 // One pass at startup answers it only for the runs that had already ended by then,
 // and never for the case the precondition exists to handle.
 func TestTheTerminalSweepRetriesUntilTheRunIsConfirmedGone(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 
 	// A closed issue whose workspace carries a marker identifying a run that is
 	// still going. Nothing else will ever look at it: it is not a candidate, so the
@@ -247,7 +247,7 @@ func TestTheTerminalSweepRetriesUntilTheRunIsConfirmedGone(t *testing.T) {
 		Evidence: core.RunEvidence{Scheme: core.RunEvidenceLocal, ID: "999", Boot: "boot-1"},
 	})
 
-	probe := newProber(groupAlive)
+	probe := newProber(domainLive)
 	if err := h.restart(harnessOpts{runGone: probe.probe}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestTheTerminalSweepRetriesUntilTheRunIsConfirmedGone(t *testing.T) {
 
 	// The run ends. No restart, no human: the next tick's probe answers, and the
 	// marker comes off with the workspace.
-	probe.set(groupGone)
+	probe.set(domainQuiet)
 	h.tickUntil("the workspace to be swept once its run is confirmed gone", func() bool {
 		return len(h.Workspaces.Disposals("9")) > 0
 	})
@@ -273,7 +273,7 @@ func TestTheTerminalSweepRetriesUntilTheRunIsConfirmedGone(t *testing.T) {
 // after the classification pass because it needs the ownership set — so the sweep
 // has to be owed too, not skipped for the life of the process.
 func TestAFailedScanLeavesTheSweepOwedRatherThanSkipped(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	residue := fake.Issue("9", epoch)
 	residue.Labels = nil
 	residue.Dispatchable = false
@@ -284,7 +284,7 @@ func TestAFailedScanLeavesTheSweepOwedRatherThanSkipped(t *testing.T) {
 	}
 
 	h.Tracker.SetFailClaimedByPrincipal(errors.New("tracker unavailable"))
-	if err := h.restart(harnessOpts{runGone: groupGone, recoverErr: true}); err == nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, recoverErr: true}); err == nil {
 		t.Fatal("the startup scan was supposed to fail")
 	}
 	if got := h.Workspaces.Disposals("9"); len(got) != 0 {
@@ -309,7 +309,7 @@ func TestAFailedScanLeavesTheSweepOwedRatherThanSkipped(t *testing.T) {
 // would mean nothing ever removes the workspace, because no candidate accounts for
 // it and no pin will ever appear.
 func TestATerminalWorkspaceWithNoBasePinIsStillSwept(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	residue := fake.Issue("9", epoch)
 	residue.Labels = nil
 	residue.Dispatchable = false
@@ -322,7 +322,7 @@ func TestATerminalWorkspaceWithNoBasePinIsStillSwept(t *testing.T) {
 	// older backup — while the directory remains.
 	h.Workspaces.ForgetBasePin("9")
 
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	if got := h.Workspaces.Disposals("9"); len(got) != 1 {
@@ -334,7 +334,7 @@ func TestATerminalWorkspaceWithNoBasePinIsStillSwept(t *testing.T) {
 // tracker read every tick. Deferrals are per workspace, so an unknown-launch
 // directory is examined once and the rest are not re-listed on its account.
 func TestAnUnresolvableWorkspaceDoesNotReSweepTheRest(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 
 	// Two terminal residues: one whose launch outcome is unknowable, and one whose
 	// run is still going. Only the second can converge.
@@ -354,7 +354,7 @@ func TestAnUnresolvableWorkspaceDoesNotReSweepTheRest(t *testing.T) {
 		Evidence: core.RunEvidence{Scheme: core.RunEvidenceLocal, ID: "999", Boot: "boot-1"},
 	})
 
-	probe := newProber(groupAlive)
+	probe := newProber(domainLive)
 	if err := h.restart(harnessOpts{runGone: probe.probe}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestAnUnresolvableWorkspaceDoesNotReSweepTheRest(t *testing.T) {
 	}
 
 	// And the one that can converge still does.
-	probe.set(groupGone)
+	probe.set(domainQuiet)
 	h.tickUntil("the resolvable workspace to be swept", func() bool {
 		return len(h.Workspaces.Disposals("9")) > 0
 	})
@@ -404,7 +404,7 @@ func TestTheTerminalSweepDoesNotBlockTheAuthorityGoroutine(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
@@ -423,7 +423,7 @@ func TestTheTerminalSweepDoesNotBlockTheAuthorityGoroutine(t *testing.T) {
 		Evidence: core.RunEvidence{Scheme: core.RunEvidenceLocal, ID: "999", Boot: "boot-1"},
 	})
 
-	if err := h.restart(harnessOpts{runGone: groupAlive, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainLive, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	waitFor(t, "the startup pass to defer the residue", func() bool {
@@ -480,12 +480,12 @@ func TestTheSweepReservesTheWorkspaceItIsAboutToDisposeOf(t *testing.T) {
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(unblock)
 
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	deferredResidue(t, h, "9")
 
 	// The startup pass defers the residue: its run is not confirmed gone, so a later
 	// tick is what re-examines it, and that pass is the one this test wedges.
-	probe := newProber(groupAlive)
+	probe := newProber(domainLive)
 	if err := h.restart(harnessOpts{runGone: probe.probe}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -571,10 +571,46 @@ func TestADisposalIsNeverReservedForAnIssueSomethingOwns(t *testing.T) {
 	if o.grantDisposal("3") {
 		t.Error("granted for a retained `done` claim; §9.8 releases it on the close and its PR is awaiting review")
 	}
+	o.endedCycles = map[string]*endedCycle{"remote:acme#issue-5@7": {issue: "5", workspace: core.Workspace{Key: "issue-5"}}}
+	if o.grantDisposal("5") {
+		t.Error("granted for an ended workspace cycle whose disposal is still owed; " +
+			"two completions over one cycle is what this reservation prevents (#252)")
+	}
 
 	o.draining = true
 	if o.grantDisposal("4") {
 		t.Error("granted during a drain; shutdown initiates no new cleanup (SPEC §9.8 as amended)")
+	}
+}
+
+// The reservation's own reason, over the owner that can appear latest.
+//
+// plan.owned is a snapshot taken before the directory listing, and the pass is I/O
+// all the way down — so the two guards on an ended workspace cycle protect
+// different windows. ownedIssues keeps the ref out of the pass entirely and costs
+// no tracker read; this one catches an obligation registered *after* that snapshot,
+// which is the ordinary way these arise: a held claim dropped on a confirming read
+// that landed while the pass was out.
+func TestADisposalIsRefusedForAnObligationRegisteredAfterTheSnapshot(t *testing.T) {
+	o := idleOrchestrator(t, fake.NewTracker())
+
+	// The pass's ownership snapshot, taken while nothing owns the issue.
+	owned := o.ownedIssues()
+	if owned["1"] {
+		t.Fatal("the snapshot already owns the issue; the window this test is about would not open")
+	}
+
+	// The obligation arrives after it — a held claim dropped while the pass was out.
+	o.oweEndedCycle("1", &lifecycleWorkspaces{}, core.Workspace{
+		Key: "issue-1", WorkspacePaths: core.WorkspacePaths{Path: "remote:acme#issue-1@7"},
+	}, "issue went terminal")
+
+	if owned["1"] {
+		t.Fatal("the snapshot changed under the pass; then it would not be a snapshot")
+	}
+	if o.grantDisposal("1") {
+		t.Fatal("granted against a snapshot that predates the obligation; the pass would dispose a cycle " +
+			"a disposal already has in flight")
 	}
 }
 
@@ -637,7 +673,7 @@ func TestARecoveryVerdictIsHeldWhileACleanupPassHoldsTheWorkspace(t *testing.T) 
 // it and no pass owed. What closes the hole is the forget itself: the ownership set
 // shrank, so the directory is worth listing again.
 func TestAWorkspaceOutlivingARecordDroppedAsGoneIsStillSwept(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 
 	// A claim this daemon holds, with a workspace on disk from a previous tenure.
 	issue := fake.Issue("9", epoch)
@@ -653,7 +689,7 @@ func TestAWorkspaceOutlivingARecordDroppedAsGoneIsStillSwept(t *testing.T) {
 	// unclassified, which is a record, which is enough to keep the startup pass off its
 	// workspace.
 	h.Tracker.SetFailHistory(errors.New("changelog unavailable"))
-	if err := h.restart(harnessOpts{runGone: groupGone}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitState("9", StateQueued)
@@ -690,7 +726,7 @@ func TestAWorkspaceOutlivingARecordDroppedAsGoneIsStillSwept(t *testing.T) {
 // two properties together: no tick spends more than the bound, and every workspace is
 // eventually swept.
 func TestTheSweepPacesItselfAndRotatesRatherThanStarvingTheTail(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 
 	// Three times the per-pass bound, and *none* of them resolve: every run is still
 	// going, so every one stays deferred and comes back on the next tick. That is the
@@ -716,7 +752,7 @@ func TestTheSweepPacesItselfAndRotatesRatherThanStarvingTheTail(t *testing.T) {
 		})
 	}
 
-	probe := newProber(groupAlive)
+	probe := newProber(domainLive)
 	if err := h.restart(harnessOpts{runGone: probe.probe}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -749,7 +785,7 @@ func TestTheSweepPacesItselfAndRotatesRatherThanStarvingTheTail(t *testing.T) {
 
 	// And the pacing delays work rather than dropping it: the runs end, and every one
 	// of them converges with no human.
-	probe.set(groupGone)
+	probe.set(domainQuiet)
 	h.tickUntil("every deferred workspace to be swept", func() bool {
 		for _, id := range ids {
 			if len(h.Workspaces.Disposals(id)) == 0 {
@@ -871,10 +907,10 @@ func rootedDefinition(t *testing.T, root string) *config.WorkflowDefinition {
 // publication that never went through that barrier, which is what publishing straight
 // into the source models.
 func TestDeferredSweepWorkIsAbandonedWhenItsRootMoves(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	deferredResidue(t, h, "9")
 
-	if err := h.restart(harnessOpts{runGone: groupAlive}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainLive}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	waitFor(t, "the residue to be deferred", func() bool {
@@ -911,10 +947,10 @@ func TestDeferredSweepWorkIsAbandonedWhenItsRootMoves(t *testing.T) {
 // — and it did so on the reloads §5.4 never refuses, a hook edit or a credential
 // rotation, so it happened whenever an operator saved the file.
 func TestDeferredSweepWorkSurvivesAReloadThatKeepsTheRoot(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	deferredResidue(t, h, "9")
 
-	probe := newProber(groupAlive)
+	probe := newProber(domainLive)
 	if err := h.restart(harnessOpts{runGone: probe.probe}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -938,7 +974,7 @@ func TestDeferredSweepWorkSurvivesAReloadThatKeepsTheRoot(t *testing.T) {
 
 	// And the promise is kept: the run ends, and the workspace it was holding is swept
 	// with no human and no full pass.
-	probe.set(groupGone)
+	probe.set(domainQuiet)
 	h.tickUntil("the deferred workspace to be swept through the rebuilt provider", func() bool {
 		return len(h.Workspaces.Disposals("9")) > 0
 	})

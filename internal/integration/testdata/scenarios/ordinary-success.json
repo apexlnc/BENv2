@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "name": "ordinary-success",
+  "issue": {
+    "identifier": "7"
+  },
+  "attempts": [
+    {
+      "outcome": "succeeded",
+      "session": "ordinary-1"
+    }
+  ],
+  "publication": "complete",
+  "steps": [
+    {
+      "action": "start",
+      "until": "done"
+    }
+  ]
+}

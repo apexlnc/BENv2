@@ -74,6 +74,55 @@ func (d Dir) TransitionsPath() string { return filepath.Join(d.root, "transition
 // AttemptsPath is the append-only attempt-outcome log (#60).
 func (d Dir) AttemptsPath() string { return filepath.Join(d.root, "attempts.jsonl") }
 
+// Substrate is where a v2 execution backend keeps the durable addresses a
+// restart needs — which sandbox a claim acquired, and which backend run a
+// dispatch resolved to (#194, #46). This package never writes it either; the
+// assembly points internal/airlock's store here.
+//
+// Beside the transcripts rather than inside them, because the two have opposite
+// lifetimes: a transcript is forensics that outlives the claim, and these are
+// addresses that must be removed the moment the workspace they name is
+// confirmed gone.
+func (d Dir) Substrate() string { return filepath.Join(d.root, "substrate") }
+
+// The four subtrees the v2 dispatch path keeps under Substrate (#205). Named
+// here rather than composed at the assembly for the reason every other path on
+// this type is: the §10.3 layout is this package's, and a second speller of
+// `<state>/substrate/journal` is how a rolling upgrade comes to read one
+// directory and write another.
+//
+// They are separate directories rather than one because they are retired at
+// different moments and by different rules. A run journal dies when its run's
+// termination is confirmed; a workspace-cycle record outlives every run in the
+// cycle; the sandbox addresses are the backend's own and are removed only on a
+// confirmed deletion; and the mirror is not a cache at all — it holds the one
+// fact a restart cannot reconstruct from the outside world (internal/mirror).
+
+// SubstrateJournals is where a remote run's durable dispatch record lives
+// (remote.Store), with its lifecycle-hook records beneath it.
+func (d Dir) SubstrateJournals() string { return filepath.Join(d.Substrate(), "journal") }
+
+// SubstrateCycles is where live workspace-cycle records and their independently
+// addressed ended-cycle disposal obligations live (remotews.Store).
+func (d Dir) SubstrateCycles() string { return filepath.Join(d.Substrate(), "cycles") }
+
+// SubstrateMirror is the root of the daemon-side bare stores publication
+// evidence is read from (#193, internal/mirror). Under the substrate tree
+// because it exists only for a claim that ran somewhere else — and never
+// reachable from a run, which is what makes its contents evidence.
+func (d Dir) SubstrateMirror() string { return filepath.Join(d.Substrate(), "mirror") }
+
+// Reviews is where the #204 review controller's durable execution records live
+// (reviewrun.Store): the derived run identity, the committed event cursor, and
+// the validated verdict a resumed publication is completed from.
+//
+// A sibling of Substrate rather than a subtree of it, deliberately. A review
+// runs on whichever substrate the workflow declares — including the local one,
+// where there is no `substrate/` tree at all — and filing its record under a
+// directory that exists only for the remote case would put the local path's
+// durable state somewhere its own name says it is not.
+func (d Dir) Reviews() string { return filepath.Join(d.root, "reviews") }
+
 // Prepare creates the directory and its transcript subdirectory.
 //
 // 0700 throughout: a run record names branches and issues, a transcript is the

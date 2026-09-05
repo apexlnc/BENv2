@@ -19,6 +19,7 @@ import (
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 	"github.com/srhg-ai-7cef3f93/ben/internal/fake"
 	"github.com/srhg-ai-7cef3f93/ben/internal/orchestrator"
+	"github.com/srhg-ai-7cef3f93/ben/internal/state"
 	"github.com/srhg-ai-7cef3f93/ben/internal/workspace"
 )
 
@@ -45,6 +46,7 @@ const (
 	stepTrackerReady      step = "tracker.Ready"
 	stepClaimPrincipal    step = "tracker.ClaimPrincipal"
 	stepRepository        step = "tracker.Repository"
+	stepWorkspaceReady    step = "workspace.Ready"
 	stepRunnerNew         step = "runner.New"
 	stepRunnerReady       step = "runner.Ready"
 )
@@ -235,6 +237,57 @@ func (k *fakeRunnerKind) Structural(cfg core.AgentConfig) error {
 	return k.structural
 }
 
+func (k *fakeRunnerKind) LocalWrites(cfg core.AgentConfig, paths core.LocalRuntimePaths) (core.LocalWriteScope, error) {
+	scope := core.LocalWriteScope{}
+	if raw, ok := cfg.Provider["unbounded"]; ok {
+		unbounded, ok := raw.(bool)
+		if !ok {
+			return core.LocalWriteScope{}, fmt.Errorf("fake runner: unbounded has type %T", raw)
+		}
+		scope.Unbounded = unbounded
+	}
+	if raw, ok := cfg.Provider["add_dirs"]; ok {
+		entries, ok := raw.([]any)
+		if !ok {
+			return core.LocalWriteScope{}, fmt.Errorf("fake runner: add_dirs has type %T", raw)
+		}
+		for _, entry := range entries {
+			root, ok := entry.(string)
+			if !ok {
+				return core.LocalWriteScope{}, fmt.Errorf("fake runner: add_dirs entry has type %T", entry)
+			}
+			scope.Roots = append(scope.Roots, root)
+		}
+	}
+	if raw, ok := cfg.Provider["home_write_dirs"]; ok {
+		entries, ok := raw.([]any)
+		if !ok {
+			return core.LocalWriteScope{}, fmt.Errorf("fake runner: home_write_dirs has type %T", raw)
+		}
+		for _, entry := range entries {
+			dir, ok := entry.(string)
+			if !ok {
+				return core.LocalWriteScope{}, fmt.Errorf("fake runner: home_write_dirs entry has type %T", entry)
+			}
+			scope.Roots = append(scope.Roots, filepath.Join(paths.DaemonHomeDir, dir))
+		}
+	}
+	if raw, ok := cfg.Provider["env"]; ok {
+		env, ok := raw.(map[string]any)
+		if !ok {
+			return core.LocalWriteScope{}, fmt.Errorf("fake runner: env has type %T", raw)
+		}
+		if rawTMP, ok := env["TMPDIR"]; ok {
+			tmp, ok := rawTMP.(string)
+			if !ok {
+				return core.LocalWriteScope{}, fmt.Errorf("fake runner: TMPDIR has type %T", rawTMP)
+			}
+			scope.Roots = append(scope.Roots, tmp)
+		}
+	}
+	return scope, nil
+}
+
 func (k *fakeRunnerKind) ForwardedEnvVars(map[string]any) []string { return nil }
 
 func (k *fakeRunnerKind) SensitiveFields(map[string]any) [][]string {
@@ -273,12 +326,13 @@ func (r *fakeRunner) Start(context.Context, core.RunSpec) (core.RunHandle, error
 
 // harness is one builder wired to one pair of fake kinds.
 type harness struct {
-	t       *testing.T
-	j       *journal
-	tracker *fakeTrackerKind
-	runner  *fakeRunnerKind
-	b       *builder
-	root    string
+	t              *testing.T
+	j              *journal
+	tracker        *fakeTrackerKind
+	runner         *fakeRunnerKind
+	b              *builder
+	workspaceReady error
+	root           string
 	// path is one WORKFLOW.md, rewritten in place for each generation. A reload
 	// is the same file changing, and the workflow key derives from that file's
 	// path (SPEC §5.1) — so a fixture that wrote each generation to a fresh temp
@@ -311,8 +365,15 @@ func newHarness(t *testing.T) *harness {
 			}
 			return h.runner, true
 		},
-		log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
-		transcriptDir: filepath.Join(t.TempDir(), "transcripts"),
+		log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		transcriptDir:        filepath.Join(t.TempDir(), "transcripts"),
+		workspaceScratchRoot: t.TempDir(),
+		agentTempRoot:        t.TempDir(),
+		agentHomeRoot:        t.TempDir(),
+		workspaceReady: func(context.Context, *workspace.Provider) error {
+			h.j.note(stepWorkspaceReady)
+			return h.workspaceReady
+		},
 	}
 	return h
 }
@@ -326,7 +387,7 @@ func (h *harness) def(opts ...func(*workflowSpec)) *config.WorkflowDefinition {
 	h.t.Helper()
 	spec := workflowSpec{
 		root: h.root, permissionMode: "bypassPermissions", model: "opus",
-		deployment: "deployment:\n  mode: attended\n",
+		deployment: "deployment:\n  mode: attended\n", requiredLabels: `["ben-queue"]`,
 	}
 	for _, fn := range opts {
 		fn(&spec)
@@ -336,7 +397,7 @@ tracker:
   kind: github
   provider:
     repo: acme/widgets
-%s  required_labels: ["ben-queue"]
+%s  required_labels: %s
 workspace:
   root: %s
 hooks:
@@ -346,13 +407,14 @@ agent:
   provider:
     permission_mode: %s
     model: %s
+%s
 publish:
   kind: token
   env: GH_TOKEN
   value: $BEN_TEST_PUBLISH_TOKEN
-%s---
+%s%s---
 Work issue {{ issue.identifier }}.
-`, spec.trackerProvider, spec.root, spec.afterCreate, spec.permissionMode, spec.model, spec.deployment)
+`, spec.trackerProvider, spec.requiredLabels, spec.root, spec.afterCreate, spec.permissionMode, spec.model, spec.agentProvider, spec.review, spec.deployment)
 
 	if err := os.WriteFile(h.path, []byte(content), 0o644); err != nil {
 		h.t.Fatal(err)
@@ -372,15 +434,34 @@ type workflowSpec struct {
 	// Stated by the fixture rather than omitted, so the descriptor a daemon test
 	// exercises is the non-empty one an operator's workflow has.
 	model string
+	// agentProvider is spliced below the fixture's required provider keys, with
+	// its own indentation. Tests use it for adapter-specific writable roots.
+	agentProvider string
 	// trackerProvider is spliced into the tracker's provider block, indented to
 	// its level. It exists so a test can put a real credential reference in the
 	// configuration the daemon runs under.
 	trackerProvider string
+	// requiredLabels is the YAML flow sequence used by the tracker and by the
+	// review controller's workspace-cycle identity.
+	requiredLabels string
 	// deployment overrides the §5.2.9 block. Empty keeps the fixture's own.
 	deployment string
+	// review is the #204 `review:` block plus any `credential_sources` it needs,
+	// spliced whole. Empty declares no review controller, which is what every
+	// workflow that predates the section says.
+	review string
 }
 
 func withRoot(root string) func(*workflowSpec) { return func(s *workflowSpec) { s.root = root } }
+func withRequiredLabels(labels ...string) func(*workflowSpec) {
+	return func(s *workflowSpec) {
+		quoted := make([]string, len(labels))
+		for i, label := range labels {
+			quoted[i] = fmt.Sprintf("%q", label)
+		}
+		s.requiredLabels = "[" + strings.Join(quoted, ", ") + "]"
+	}
+}
 func withHook(script string) func(*workflowSpec) {
 	return func(s *workflowSpec) { s.afterCreate = script }
 }
@@ -390,6 +471,10 @@ func withHook(script string) func(*workflowSpec) {
 // the harness picks its own default (#60).
 func withModel(model string) func(*workflowSpec) {
 	return func(s *workflowSpec) { s.model = model }
+}
+
+func withAgentProvider(lines string) func(*workflowSpec) {
+	return func(s *workflowSpec) { s.agentProvider = lines }
 }
 
 // withTrackerProvider adds entries to the tracker's provider block, e.g.
@@ -422,7 +507,7 @@ func TestBuildOrdersTheAssembly(t *testing.T) {
 	want := []step{
 		stepTrackerStructural, stepRunnerStructural,
 		stepTrackerNew, stepTrackerReady, stepClaimPrincipal, stepRepository,
-		stepRunnerNew, stepRunnerReady,
+		stepWorkspaceReady, stepRunnerNew, stepRunnerReady,
 	}
 	if got := h.j.seen(); !slices.Equal(got, want) {
 		t.Errorf("assembly order:\n got %v\nwant %v", got, want)
@@ -696,6 +781,12 @@ func TestEachStageRefusesWithItsOwnErrorAndStopsThere(t *testing.T) {
 			want:     ErrNotReady,
 			notAfter: stepRunnerNew,
 		},
+		{
+			name:     "the workspace target is not ready",
+			arrange:  func(h *harness) { h.workspaceReady = boom },
+			want:     ErrNotReady,
+			notAfter: stepRunnerNew,
+		},
 	}
 
 	for _, tc := range cases {
@@ -770,10 +861,12 @@ func TestReloadRebuildsTheCascadeAndCarriesTheRestForward(t *testing.T) {
 		same []string
 	}{
 		{
-			name:    "agent only",
+			// A local agent's provider block selects writable roots, so the
+			// workspace and verifier are rebuilt to revalidate daemon scratch.
+			name:    "local agent cascades to workspace and verifier",
 			changed: config.AdapterChange{Agent: true},
 			next:    func(h *harness) *config.WorkflowDefinition { return h.def() },
-			same:    []string{"tracker", "workspaces", "verifier"},
+			same:    []string{"tracker"},
 		},
 		{
 			// Tracker ⇒ workspace ⇒ verifier, and workspace ⇒ runner, so a tracker
@@ -840,6 +933,86 @@ func TestReloadRebuildsTheCascadeAndCarriesTheRestForward(t *testing.T) {
 				t.Error("the rebuild published the previous definition")
 			}
 		})
+	}
+}
+
+// Agent provider roots are part of the workspace's security input even though
+// config.AdapterChange classifies their edit under Agent. Reusing the prior
+// provider would preserve a validation result for the old write set and let a
+// reload grant the state tree to concurrent runs.
+func TestAgentReloadRevalidatesDaemonScratchIsolation(t *testing.T) {
+	h := newHarness(t)
+	first, err := h.b.build(context.Background(), h.def(), nil, everything)
+	if err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+
+	root := filepath.Dir(h.b.workspaceScratchRoot)
+	line := fmt.Sprintf("    add_dirs: [%q]\n", root)
+	_, err = h.b.build(context.Background(), h.def(withAgentProvider(line)), first, config.AdapterChange{Agent: true})
+	if !errors.Is(err, workspace.ErrScratchRoot) {
+		t.Fatalf("agent reload granting %q = %v, want workspace.ErrScratchRoot", root, err)
+	}
+}
+
+// Filesystem-wide adapter postures are explicit, but they are not a literal
+// host root: an external deployment boundary may separate the run's namespace
+// from daemon state, and attended/risk-accepted workflows deliberately permit
+// no such boundary (SPEC §10.1). Assembly must therefore preserve the posture
+// without turning every possible scratch location into a startup refusal.
+func TestUnboundedLocalAgentScopeCanAssemble(t *testing.T) {
+	h := newHarness(t)
+	if _, err := h.b.build(context.Background(), h.def(withAgentProvider("    unbounded: true\n")), nil, everything); err != nil {
+		t.Fatalf("build with an explicitly unbounded local agent: %v", err)
+	}
+}
+
+// Runtime-owned home-relative grants are part of the same security input as
+// provider add_dirs. This drives the assembly seam with a fake grant matching
+// srt's ~/.claude/debug path; the real Claude kind independently owns the list.
+func TestImplicitHomeWriteRootParticipatesInScratchValidation(t *testing.T) {
+	h := newHarness(t)
+	h.b.workspaceScratchRoot = filepath.Join(h.b.agentHomeRoot, ".claude", "debug", "state")
+	line := "    home_write_dirs: [\".claude/debug\", \".npm/_logs\"]\n"
+	_, err := h.b.build(context.Background(), h.def(withAgentProvider(line)), nil, everything)
+	if !errors.Is(err, workspace.ErrScratchRoot) {
+		t.Fatalf("build with scratch beneath an implicit HOME grant = %v, want workspace.ErrScratchRoot", err)
+	}
+}
+
+// ResolveRun is the runner's authority-gated sibling: the two close over the
+// same provider and adapter generation. A reload that carries the runner must
+// therefore carry that resolver with it, rather than dropping recovery or
+// rebuilding a closure against a different generation. The local harness does
+// not normally populate the remote-only seam, so install a sentinel after the
+// first build to exercise the common carry-forward branch directly.
+func TestReloadCarriesTheRunResolverWithItsRunner(t *testing.T) {
+	h := newHarness(t)
+	first, err := h.b.build(context.Background(), h.def(), nil, everything)
+	if err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	calls := 0
+	first.ResolveRun = func(core.Issue, core.RunEvidence, int64) (bool, error) {
+		calls++
+		return false, nil
+	}
+
+	second, err := h.b.build(context.Background(), h.def(), first, config.AdapterChange{})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if second.Runner != first.Runner {
+		t.Fatal("a non-adapter reload rebuilt the runner")
+	}
+	if second.ResolveRun == nil {
+		t.Fatal("a reload carried the runner without its authority-gated resolver")
+	}
+	if _, err := second.ResolveRun(core.Issue{}, core.RunEvidence{}, 1); err != nil {
+		t.Fatalf("carried resolver: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("carried resolver called sentinel %d times, want 1", calls)
 	}
 }
 
@@ -933,7 +1106,17 @@ func TestAnUnusableBaseCacheFailsTheBuild(t *testing.T) {
 // Structural only, so this stays inside the environment §5.8 guarantees — no
 // credentials, no network, no installed harness.
 func TestTheProductionBuilderResolvesTheRealKinds(t *testing.T) {
-	b := newBuilder(slog.New(slog.NewTextHandler(io.Discard, nil)), "")
+	stateRoot := t.TempDir()
+	b := newBuilder(slog.New(slog.NewTextHandler(io.Discard, nil)), state.At(stateRoot))
+	if b.workspaceScratchRoot != stateRoot {
+		t.Fatalf("workspace scratch root = %q, want daemon state root %q", b.workspaceScratchRoot, stateRoot)
+	}
+	if b.agentTempRoot != filepath.Clean(os.TempDir()) {
+		t.Fatalf("agent temp root = %q, want forwarded TMPDIR %q", b.agentTempRoot, os.TempDir())
+	}
+	if b.agentHomeRoot != os.Getenv("HOME") {
+		t.Fatalf("agent home root = %q, want forwarded HOME %q", b.agentHomeRoot, os.Getenv("HOME"))
+	}
 
 	for name, want := range map[string]bool{"github": true, "gitlab": false} {
 		if _, ok := b.tracker(name); ok != want {
@@ -1236,4 +1419,9 @@ func TestTheRunEvidenceSinkRefusesAForeignWorkspace(t *testing.T) {
 	if err == nil {
 		t.Error("the sink accepted a workspace outside the provider's tree")
 	}
+}
+
+// withReview declares the #204 review controller, credential sources and all.
+func withReview(block string) func(*workflowSpec) {
+	return func(s *workflowSpec) { s.review = block }
 }

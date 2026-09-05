@@ -29,8 +29,8 @@ import (
 //	                           exactly one terminal event, and the right one
 //
 // The conformance suite still owns everything that is only true of a real
-// process: that the stream really is drained before it is judged, that the
-// signal ladder really reaches a descendant, that the transcript really lands.
+// process: that the stream really is drained before it is judged, that domain
+// teardown really reaches a descendant, that the transcript really lands.
 
 // --- inputs, for readable tables ---
 
@@ -169,6 +169,15 @@ func TestLifecycleTransitions(t *testing.T) {
 			before: []input{verdict(core.FailureStalled), cleanupDone(), procExited()},
 			in:     streamEnded(),
 			want:   step{kind: stepTerminal, event: failed(core.FailureStalled)},
+		},
+		{
+			// The reader's own verdict (#235): a line past the scanner ceiling is
+			// claimed exactly as a liveness window is, and outranks the crash the
+			// dead stream would otherwise read as.
+			name:   "the reader's overflow verdict outranks the crash default too",
+			before: []input{verdict(core.FailureOutputOverflow), cleanupDone(), procExited()},
+			in:     streamEnded(),
+			want:   step{kind: stepTerminal, event: failed(core.FailureOutputOverflow)},
 		},
 		{
 			name:   "publication waits for the ladder the verdict promised (SPEC §9.8)",
@@ -607,9 +616,9 @@ func drive(order []input) driveResult {
 //
 //   - every line is handed up before the reader closes the channel, so no event
 //     can follow the stream's end (handle.readStdout);
-//   - only a claimed verdict promises a signal ladder, so no cleanup can finish
-//     before one (handle.claim). reap walks the ladder without claiming, but that
-//     is after publication and is not among these facts.
+//   - only a claimed verdict promises domain teardown, so no cleanup can finish
+//     before one (handle.claim). reap may tear down without claiming, but that is
+//     after publication and is not among these facts.
 func causal(order []input) bool {
 	streamOver, claimed := false, false
 	for _, in := range order {

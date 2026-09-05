@@ -47,16 +47,17 @@ func TestShutdownInterruptsTheRunAndLeavesTheClaimStanding(t *testing.T) {
 
 	h.shutdown()
 
-	// Interrupt, not discard. Discard cuts the ladder's grace to a tenth and
-	// aborts event emission, which truncates the verbatim record §7.2 requires
+	// Interrupt, not discard. Discard is less patient and aborts event emission,
+	// which truncates the verbatim record §7.2 requires
 	// of a run that is being interrupted rather than thrown away.
 	handle := h.Runner.LastHandle()
 	if got := handle.Stops(); len(got) != 1 || got[0] != core.StopInterrupt {
 		t.Errorf("stops = %v, want exactly one StopInterrupt", got)
 	}
 
-	// Nothing was released, disposed or projected onward. This is the whole of
-	// the amendment: what has landed stays landed, and §9.10 resumes from it.
+	// Nothing was released, disposed or projected onward by the local provider.
+	// This is the whole of the amendment: what has landed stays landed, and
+	// §9.10 resumes from it. Remote allocation policy is covered separately.
 	if n := h.Tracker.ReleaseCount("7"); n != 0 {
 		t.Errorf("released %d times; shutdown initiates no release", n)
 	}
@@ -130,7 +131,7 @@ func TestShutdownWaitsForAConfirmedTerminationAndReProbes(t *testing.T) {
 			t.Fatalf("Shutdown: %v", got.err)
 		}
 		if got.beforeConfirm {
-			t.Error("Shutdown returned while the process group was still unconfirmed")
+			t.Error("Shutdown returned while the execution domain was still unconfirmed")
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Shutdown did not return once the termination was confirmed")
@@ -989,16 +990,16 @@ func TestShutdownResolvesAnUnlandableReleaseOrderedBeforeTheDrain(t *testing.T) 
 	}
 }
 
-// Finding 5 (#101 review). Stop answers about the process *group*; Done
-// additionally means the process is reaped and its transcript flushed and
-// closed. Exiting on the group answer alone truncates the verbatim record of the
+// Finding 5 (#101 review). Stop answers whether the execution domain is quiet;
+// Done additionally means direct execution ended and its transcript flushed and
+// closed. Exiting on the quiet answer alone truncates the verbatim record of the
 // run the daemon has just interrupted (SPEC §7.2).
 func TestShutdownWaitsForTheTranscriptToClose(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues: []core.Issue{fake.Issue("7", epoch)},
 		script: startedOnly,
 		hang:   true,
-		// The group goes quiet on the interrupt while the record is still being
+		// The domain goes quiet on the interrupt while the record is still being
 		// written — the ordinary harness's shape, and the one a confirmed Stop
 		// says nothing about.
 		holdDone: true,
@@ -1018,7 +1019,7 @@ func TestShutdownWaitsForTheTranscriptToClose(t *testing.T) {
 		done <- outcome{err: err, beforeFlushed: !flushed.Load()}
 	}()
 
-	// The interrupt lands and the group is confirmed gone; Done is still open.
+	// The interrupt lands and the domain is confirmed quiet; Done is still open.
 	waitFor(t, "the interrupt", func() bool {
 		hd := h.Runner.LastHandle()
 		return hd != nil && hd.StopCount() >= 1
@@ -1119,11 +1120,6 @@ func TestAFailedStartDuringTheDrainDoesNotPumpANilHandle(t *testing.T) {
 	}
 }
 
-// Finding 8 (#101 re-review). driveShutdown deliberately does not re-arm an
-// ordered exit — retryPendingExits drives those on the tick — so between ticks
-// `stopInFlight` is false and it is `!groupGone` that has to hold the drain
-// open. A reaped leader with surviving descendants is exactly that shape: Done
-// has closed, and the group has not gone.
 // The drain waits out a run-marker removal that is *executing*.
 //
 // Waiting for it is what the synchronous version gave for free, and losing it is not
@@ -1147,11 +1143,11 @@ func TestTheDrainWaitsOutAMarkerRemovalAlreadyExecuting(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
-	// The drain's own interrupt is what confirms the group gone, and confirming it is
+	// The drain's own interrupt is what confirms the domain quiet, and confirming it is
 	// what clears the marker (suspendStopped). That removal wedges here.
 	h.Workspaces.SetMarkerClearGate(func() {
 		once.Do(func() { close(clearing) })
@@ -1202,13 +1198,18 @@ func TestTheDrainWaitsOutAMarkerRemovalAlreadyExecuting(t *testing.T) {
 	}
 }
 
-func TestAnOrderedExitWithALiveGroupHoldsTheDrainOpen(t *testing.T) {
+// Finding 8 (#101 re-review). driveShutdown deliberately does not re-arm an
+// ordered exit — retryPendingExits drives those on the tick — so between ticks
+// `stopInFlight` is false and it is `!domainQuiet` that has to hold the drain
+// open. Completed direct execution with surviving domain members is exactly
+// that shape: Done has closed, and the domain is not quiet.
+func TestAnOrderedExitWithALiveDomainHoldsTheDrainOpen(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues: []core.Issue{fake.Issue("7", epoch)},
 		// The process ends and is reaped, so Done closes...
 		script: func(core.RunSpec, int) []core.Event { return fake.Succeed("session-1") },
-		// ...while its group outlives it, so only a confirmed Stop can settle it.
-		descendants:     true,
+		// ...while its domain outlives it, so only a confirmed Stop can settle it.
+		domainMembers:   true,
 		stopUnconfirmed: true,
 	})
 	h.WaitState("7", StateVerifying)
@@ -1251,10 +1252,10 @@ func TestAnOrderedExitWithALiveGroupHoldsTheDrainOpen(t *testing.T) {
 			t.Fatalf("Shutdown: %v", got.err)
 		}
 		if got.beforeConfirm {
-			t.Error("Shutdown returned while an ordered exit's process group was still live")
+			t.Error("Shutdown returned while an ordered exit's execution domain was still live")
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("Shutdown did not return once the group was confirmed gone")
+		t.Fatal("Shutdown did not return once the domain was confirmed quiet")
 	}
 	// And the exit it was waiting on completed, rather than being suspended.
 	if n := h.Tracker.ReleaseCount("7"); n != 1 {

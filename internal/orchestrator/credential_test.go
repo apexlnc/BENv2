@@ -269,6 +269,30 @@ func TestATransientVerificationCredentialFailureRetriesInVerifying(t *testing.T)
 	})
 }
 
+func TestAPendingPublishApprovalRetriesInVerifying(t *testing.T) {
+	v := &mutableVerifier{err: core.ErrPublishApprovalPending}
+	h := start(t, harnessOpts{issues: []core.Issue{fake.Issue("1", epoch)}, verifier: v})
+	h.WaitState("1", StateVerifying)
+
+	before := v.Calls()
+	h.tickUntil("publication is retried while approval is pending", func() bool { return v.Calls() > before })
+	if got := h.stateOf("1"); got != StateVerifying {
+		t.Fatalf("state = %q, want verifying while approval is pending (path: %v)",
+			got, h.o.Transitions.Path("1"))
+	}
+	if got := len(h.o.Attempts.For("1")); got != 0 {
+		t.Errorf("recorded %d attempts while publication approval is pending, want none", got)
+	}
+
+	v.setErr(nil)
+	h.tickUntil("the approved publication routes", func() bool {
+		return h.stateOf("1") == StateDone || h.stateOf("1") == ""
+	})
+	waitFor(t, "the approved attempt to be recorded", func() bool {
+		return len(h.o.Attempts.For("1")) == 1
+	})
+}
+
 // An unknown or permanent verification credential failure parks, exactly as
 // §9.7's fail-closed rule already did.
 func TestANonTransientVerificationCredentialFailureParks(t *testing.T) {

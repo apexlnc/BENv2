@@ -11,7 +11,7 @@ import (
 )
 
 // ResolveWorkspace names the workspace an issue's work lives in and reads back
-// its pinned claim epoch/base, preparing nothing (SPEC §9.10).
+// its pinned claim epoch/base/target, preparing nothing (SPEC §9.10).
 //
 // Recovery needs a `core.Workspace` to ask §9.7's question, and it needs one
 // *before* any verdict says an attempt is owed — so calling Prepare would run
@@ -20,7 +20,7 @@ import (
 // update-ref, no worktree, no hooks.
 //
 // `false` is non-authorizing: the record is absent or pending, so there is no
-// pinned epoch/base pair against which §9.7 may be asked. The caller reads the
+// pinned epoch/base/target tuple against which §9.7 may be asked. The caller reads the
 // closed ClaimBase state to distinguish resume from epoch-faulted park (§9.10).
 //
 // Fresh storage includes an absent base repository. Claim-record absence is
@@ -71,6 +71,7 @@ func (p *Provider) ResolveWorkspace(ctx context.Context, issue core.Issue) (core
 		Branch:         branchPrefix + key,
 		ClaimEpoch:     claimBase.Epoch,
 		BaseSHA:        claimBase.BaseSHA,
+		TargetBranch:   claimBase.TargetBranch,
 	}, true, nil
 }
 
@@ -285,10 +286,11 @@ func (p *Provider) validateWorkspaceClaimBaseLocked(ctx context.Context, ws core
 	if err != nil {
 		return err
 	}
-	if state.State != core.ClaimBasePinned || state.Epoch != ws.ClaimEpoch || state.BaseSHA != ws.BaseSHA {
-		return fmt.Errorf("%w: workspace %s carries epoch/base %d/%s, provider has %s %d/%s",
-			ErrClaimBaseState, ws.Key, ws.ClaimEpoch, ws.BaseSHA,
-			state.State, state.Epoch, state.BaseSHA)
+	if state.State != core.ClaimBasePinned || state.Epoch != ws.ClaimEpoch ||
+		state.BaseSHA != ws.BaseSHA || state.TargetBranch != ws.TargetBranch {
+		return fmt.Errorf("%w: workspace %s carries epoch/base/target %d/%s/%s, provider has %s %d/%s/%s",
+			ErrClaimBaseState, ws.Key, ws.ClaimEpoch, ws.BaseSHA, ws.TargetBranch,
+			state.State, state.Epoch, state.BaseSHA, state.TargetBranch)
 	}
 	return nil
 }

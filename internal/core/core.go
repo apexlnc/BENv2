@@ -46,6 +46,16 @@ import (
 // write asks Get, which is the call whose not-found means one thing.
 var ErrIssueNotFound = errors.New("issue not found on the tracker")
 
+// ErrClaimTargetUnrecorded marks a validated pre-#152 claim record. Its epoch
+// and base may be carried into a later assignment's pending transition, but it
+// cannot authorize same-epoch prepare, recovery, prompt rendering, or
+// verification because the pull-request target was never recorded.
+//
+// The sentinel lives at the shared contract boundary so the orchestrator can
+// distinguish this retryable rollout state from unreadable provider state
+// without importing either workspace implementation.
+var ErrClaimTargetUnrecorded = errors.New("claim target is not recorded")
+
 // ErrClaimNotAttempted marks a TrackerAdapter.Claim refusal reached before any
 // assignment could have been written: a spent request budget, a standing
 // rate-limit refusal, an identifier that would not parse. It is a statement
@@ -59,6 +69,14 @@ var ErrIssueNotFound = errors.New("issue not found on the tracker")
 // write, so paying it for a refusal that never wrote spends exactly the capacity
 // the refusal was reporting gone.
 var ErrClaimNotAttempted = errors.New("claim was refused before any assignment was attempted")
+
+// ErrPublishApprovalPending says a trusted publisher validated the proposed
+// graph but policy requires an out-of-band approval before it may mutate the
+// remote. It is neither a failed coding attempt nor a completed publication.
+// The orchestrator keeps the claim in verifying and retries on a later poll;
+// the publisher is responsible for retaining one operation identity while
+// giving each retry a fresh execution identity.
+var ErrPublishApprovalPending = errors.New("publish approval is pending")
 
 // ConfigValueError is a structural refusal (SPEC §5.7) anchored to one
 // config field, carrying the offending value as data — Error() never prints
@@ -247,10 +265,11 @@ type ContentApprovalSource interface {
 
 // PR is the publish evidence returned by TrackerAdapter.FindPR (SPEC §9.7).
 type PR struct {
-	Number int
-	URL    string
-	State  string // "open", "closed", "merged"
-	Branch string
+	Number     int
+	URL        string
+	State      string // "open", "closed", "merged"
+	Branch     string
+	BaseBranch string
 }
 
 // StateLabel is the tracker-visible projection of orchestrator state
@@ -799,12 +818,17 @@ func (s ClaimBaseState) String() string {
 // enough for the first claim-aware prepare to derive §9.6's prior-work fact.
 // An outgoing epoch of zero denotes a legacy pre-epoch pin and is evidence for
 // that comparison only — it never authorizes a hook, launch, or verdict.
+// A validated pre-#152 pinned record is returned together with
+// ErrClaimTargetUnrecorded so a later assignment can retry its atomic upgrade;
+// the error keeps that targetless epoch/base pair non-authorizing everywhere else.
 type ClaimBase struct {
-	State           ClaimBaseState
-	Epoch           int64
-	BaseSHA         string
-	OutgoingEpoch   int64
-	OutgoingBaseSHA string
+	State                ClaimBaseState
+	Epoch                int64
+	BaseSHA              string
+	TargetBranch         string
+	OutgoingEpoch        int64
+	OutgoingBaseSHA      string
+	OutgoingTargetBranch string
 }
 
 // Workspace is the prepared per-issue working directory (SPEC §6).
@@ -817,6 +841,16 @@ type Workspace struct {
 	// event that established the current claim; zero authorizes nothing.
 	ClaimEpoch int64
 	BaseSHA    string
+	// TargetBranch is selected once for the claim epoch and retained beside
+	// BaseSHA. It is both trusted prompt guidance and the pull-request target
+	// the verifier requires.
+	TargetBranch string
+	// PriorWork reports that the trusted provider reattached a workspace cycle
+	// whose canonical branch already contains work from an earlier claim epoch.
+	// It raises only the presentation floor for the next attempt; it is never
+	// publication evidence or authority. Local providers leave this false and
+	// return LocalBranchFacts for their separately observed branch instead.
+	PriorWork  bool
 	CreatedNow bool
 }
 
@@ -995,6 +1029,14 @@ const (
 	// means. An unknown or permanent credential failure is not a run failure at
 	// all: it parks (SPEC §9.2), so it never reaches this taxonomy.
 	FailureCredential FailureReason = "credential"
+	// FailureOutputOverflow is the harness ending a run whose child wrote one
+	// stdout line past the scanner ceiling (SPEC §7.3, §7.5; #235). It is the
+	// runner's own verdict, like `stalled` and `timeout`, and non-retryable:
+	// the condition is not transient — the same agent on the same input
+	// reproduces it — and without a verdict of its own the run would sit on a
+	// full pipe until the stall window read it as `stalled`, retryable, and the
+	// retry burned another attempt on the same line.
+	FailureOutputOverflow FailureReason = "output_overflow"
 )
 
 // Retryable is the static verdict per reason (SPEC §7.3). The orchestrator
@@ -1104,19 +1146,19 @@ const (
 	StopDiscard
 )
 
-// Termination reports whether a run's process *group* is gone. An unconfirmed
-// termination retains the claim: a possibly-alive process must never share a
-// workspace with a replacement (SPEC §9.8).
+// Termination reports whether the execution substrate positively confirmed the
+// run's execution domain quiet. An unconfirmed termination retains the claim:
+// a possibly-live run must never share a workspace with a replacement
+// (SPEC §9.8).
 //
-// It is a probe's answer, never a memory. The question a caller asks is whether
-// the group is gone *now* — a verdict remembered from a ladder that ran a moment
-// ago would be a second, staler answer to it, and a sticky unconfirmed would
-// retain a claim forever over a group that has since died.
+// The evidence is substrate-owned. A local run uses a Linux kernel domain; a
+// remote run consumes the backend's domain-quiet evidence. Core carries only
+// the closed verdict both expose and interprets neither mechanism (#192, #234).
 //
-// Two operations answer it and they are not interchangeable (#79): Probe
-// *observes*, Stop *acts and then observes*. Both own the same evidence — only
-// ESRCH on the group proves disappearance — but only one of them signals, so a
-// caller that merely wants to know must not reach for the one that kills.
+// Probe and Stop answer the same question but are not interchangeable (#79):
+// Probe only observes the substrate's evidence, while Stop performs bounded
+// teardown and then observes. A caller that merely needs the answer must not
+// reach for the operation that acts.
 type Termination int
 
 const (
@@ -1126,8 +1168,9 @@ const (
 	// another tick, the other one costs two agent processes in one worktree
 	// (SPEC §9.8). Same reasoning as verify.VerdictUnknown.
 	TerminationUnconfirmed Termination = iota
-	// TerminationConfirmed means a probe of the process group answered that it
-	// is gone. It is only ever stated, never arrived at by omission.
+	// TerminationConfirmed means the substrate supplied positive evidence that
+	// the execution domain is quiet. It is only ever stated, never arrived at
+	// by omission.
 	TerminationConfirmed
 )
 
@@ -1147,26 +1190,22 @@ type RunHandle interface {
 	// Events yields the normalized stream; the adapter closes it after the
 	// terminal event (succeeded/failed), which is ground truth (SPEC §7.4).
 	Events() <-chan Event
-	// Done is closed when the underlying process has fully ended.
+	// Done closes at the underlying execution's terminal phase edge. It does
+	// not by itself confirm that the whole execution domain is quiet.
 	Done() <-chan struct{}
-	// Probe reports whether the run's process group is gone, without touching
-	// it: one fresh observation, no signal beyond the existence check, no
-	// verdict claimed and no lifecycle effect (SPEC §7.1, §7.5).
+	// Probe reports whether the execution domain is quiet without acting on it:
+	// one fresh observation, no teardown, no verdict claimed, no cleanup
+	// enqueued, and no lifecycle effect (SPEC §7.1, §7.5).
 	//
 	// It exists because the caller that needs this answer soonest is the one
-	// that must not act (#79). A run whose event stream has closed may still
-	// have a process finishing its transcript, and asking with Stop would send
-	// SIGTERM to a group that was about to exit on its own — trading a
-	// truncated forensic record for an answer Probe gives for free.
+	// that must not act (#79). A run whose event stream has closed may still be
+	// finishing its transcript, and asking with Stop could disturb it.
 	//
-	// Only ESRCH is confirmation. A cancelled context, or any other answer,
-	// is unconfirmed: the safe direction costs a retained claim and another
-	// tick (SPEC §9.8).
+	// A cancelled context, unavailable substrate, or absent positive evidence is
+	// unconfirmed: the safe direction costs a retained claim and another tick.
 	Probe(ctx context.Context) Termination
-	// Stop walks the signal ladder and then reports the same fact Probe does.
-	// It is what cleans a group that will not leave on its own; Done having
-	// closed is what makes it safe to use on an ordinary run, since by then
-	// anything left in the group has outlived the process that owned it.
+	// Stop asks the substrate to perform bounded teardown and then reports the
+	// same execution-domain predicate Probe does.
 	Stop(ctx context.Context, mode StopMode) Termination
 }
 
@@ -1233,6 +1272,15 @@ type AgentConfig struct {
 	// Provider is the verbatim agent.provider block, $VAR-resolved by the
 	// loader and validated by the adapter — the core never inspects it.
 	Provider map[string]any
+	// ProviderEnvSources carries the loader provenance that resolution removed
+	// from Provider: every environment variable referenced by every leaf in the
+	// block, paired with the field that referenced it. Values never appear here.
+	//
+	// A remote adapter needs the whole block rather than an enumeration of its
+	// credential-shaped keys: `env.AGENT_FLAG: $GH_TOKEN` reaches the sandbox
+	// under a new name, while `model: $GH_TOKEN` reaches it through argv. Keeping
+	// this in the binding also makes a provenance-only reload rebuild the runner.
+	ProviderEnvSources []ProviderEnvSource
 	// Publish is the publish credential, or the zero value when the workflow
 	// configures none (SPEC §5.2.8). The zero value is not an error: an agent
 	// may authenticate its push from what §7.6's allowlist already carries.
@@ -1247,6 +1295,14 @@ type AgentConfig struct {
 	// timeout is something the runner is *bound to*, so an edit to it must
 	// rebuild the runner and re-run Ready.
 	AttemptTimeout time.Duration
+}
+
+// ProviderEnvSource is one non-secret source-provenance edge from an
+// environment variable into an agent.provider leaf. Field uses the loader's
+// structural path spelling so a refusal can name the exact configuration site.
+type ProviderEnvSource struct {
+	Variable string
+	Field    string
 }
 
 // PublishCredential is the credential the *agent* publishes with, as a
@@ -1304,7 +1360,7 @@ type RunnerOptions struct {
 	// TranscriptDir is where the adapter retains raw per-run harness streams
 	// (SPEC §10.3). Empty disables retention.
 	TranscriptDir string
-	// StopGrace overrides the adapter's default SIGTERM→SIGKILL grace.
+	// StopGrace overrides the adapter's default cooperative teardown grace.
 	StopGrace time.Duration
 	// OnRun receives the run's evidence once the run exists (SPEC §9.10).
 	// Nil disables the upgrade, which is right for a caller with no workspace
@@ -1312,31 +1368,26 @@ type RunnerOptions struct {
 	OnRun RunEvidenceSink
 }
 
-// RunEvidence identifies a launched run well enough for a *different process*
-// to ask, later, whether that run is still going (SPEC §9.10's run marker).
+// RunEvidence identifies a launched execution domain well enough for its
+// substrate owner in a *different process* to evaluate quiet later (SPEC
+// §9.10's run marker).
 //
-// Deliberately not a pid. §9.10 says "evidence" throughout precisely so a remote
-// substrate (#46) can answer the same question with a session id and no wording
-// change, so the mechanism is named rather than assumed.
-//
-// Boot is what makes the answer trustworthy across a restart: a process id is
-// unique only within one boot of one host, and a reboot reuses it freely. Asking
-// "is pid 4242 alive" after a reboot is not a stale answer but a wrong one — it
-// can name an unrelated process and report a dead run as live forever, which
-// under §9.10 retains a claim nothing will ever release.
+// Deliberately opaque: a local provider encodes its complete kernel identity,
+// while a remote provider may use a durable backend identity. Core stores and
+// routes the fields but interprets none of them (#192, #234).
 type RunEvidence struct {
-	// Scheme names the mechanism, e.g. "pgid" for the local process substrate.
+	// Scheme names the substrate-owned evidence encoding. Core does not parse it.
 	Scheme string
 	// ID is the identifier within that scheme.
 	ID string
-	// Boot identifies the host boot the ID belongs to. Empty when the scheme
-	// does not need one — a remote session id is already globally unique.
+	// Boot is the scheme-owned epoch when one is needed. Empty is valid for a
+	// scheme whose ID is already durable across host boots.
 	Boot string
 }
 
-// RunEvidenceSink durably records a run's evidence against the workspace it
-// belongs to. It is called once, after the run exists and before its handle
-// reaches the caller.
+// RunEvidenceSink durably records a run domain's evidence against the workspace
+// it belongs to. It is called once after the trusted domain exists and before
+// untrusted provider execution is released.
 //
 // The RunSpec is not context — it is the address. One sink is installed on a
 // runner that serves every issue, and §9.10's marker is *per workspace*, so a
@@ -1345,16 +1396,13 @@ type RunEvidence struct {
 // wrong workspace is worse than one never upgraded: it reports a live run's
 // workspace as free while parking an idle one.
 //
-// An error means the run is real and its evidence could not be recorded — the
-// worst of the three states §9.10 reads, because the marker is then present
-// without evidence and recovery must park for a human. The runner therefore
-// fails the attempt through its ordinary ladder rather than returning an error:
-// once a process exists, "error returned" must never imply "nothing is running"
-// (SPEC §7.4).
+// An error leaves the marker at unknown_launch. The substrate tears down the
+// still-trusted, unreleased domain and may return an error only after no
+// unowned process can remain.
 type RunEvidenceSink func(RunSpec, RunEvidence) error
 
-// RunEvidenceLocal is the scheme for the local process substrate: ID is the
-// process group id, Boot the host boot it belongs to.
+// RunEvidenceLocal is the legacy pre-#234 local scheme. Same-boot pgid evidence
+// can no longer confirm quiet; it remains only for safe marker migration.
 const RunEvidenceLocal = "pgid"
 
 // WorkspaceRef names one workspace on disk and the issue it belongs to
@@ -1411,6 +1459,32 @@ type RunMarker struct {
 	Evidence RunEvidence
 }
 
+// LocalRuntimePaths are process-lifetime path facts assembly supplies to a
+// local runner kind. They are explicit inputs so a kind can report implicit
+// runtime grants without consulting the process environment from a method
+// whose answer must remain pure.
+type LocalRuntimePaths struct {
+	// DaemonHomeDir is the daemon HOME value made available to a local run by
+	// the core allowlist. A provider environment may replace it; the kind owns
+	// applying that overlay when it reports its effective write scope.
+	DaemonHomeDir string
+}
+
+// LocalWriteScope is the host filesystem write set of one local runner
+// configuration outside its workspace and inherited TMPDIR.
+type LocalWriteScope struct {
+	// Unbounded means the runner posture does not impose a finite filesystem
+	// write boundary. It is deliberately not represented by "/": an external
+	// deployment boundary may still separate the run's root from daemon state,
+	// and no daemon scratch path could be disjoint from a literal host root.
+	Unbounded bool
+	// Roots are the concrete absolute roots a bounded posture additionally
+	// grants. Assembly validates them together with the workspace and TMPDIR.
+	// They must be empty when Unbounded: a finite list cannot refine an
+	// unbounded set, and mixing both forms would restore sentinel ambiguity.
+	Roots []string
+}
+
 // RunnerKind is one agent.kind, registered at package level: the two entry
 // points that exist before any instance does (SPEC §5.7, §7.1). It mirrors
 // TrackerKind — validation cannot be a method on the constructed runner,
@@ -1423,6 +1497,17 @@ type RunnerKind interface {
 	// answerable with no harness installed, since `ben config effective` must
 	// report a bad block for an adapter it could never have built (SPEC §5.8).
 	Structural(cfg AgentConfig) error
+	// LocalWrites reports the complete local filesystem write scope outside the
+	// run's workspace and inherited daemon TMPDIR. Assembly combines its concrete
+	// roots with those two roots before placing daemon-only state. It includes
+	// explicit filesystem grants such as add_dirs, directory-valued environment
+	// overrides such as TMPDIR, and adapter/runtime implicit grants.
+	//
+	// PURE: cfg and paths only, with no filesystem, process-environment,
+	// subprocess, or network access. It must parse through the same path as
+	// Structural so a provider key cannot grant write access without appearing
+	// in this answer.
+	LocalWrites(cfg AgentConfig, paths LocalRuntimePaths) (LocalWriteScope, error)
 	// New constructs the runner, binding the configuration to the instance.
 	// Structural failures surface here too; nothing else does — which requires
 	// New to parse through the same path Structural does, or it could build a

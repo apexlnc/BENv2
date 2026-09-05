@@ -19,10 +19,15 @@ import (
 )
 
 // octoFixture is a stand-in issuer plus the projected OIDC token beside it.
+//
+// The issuer speaks TLS because the kind refuses a plaintext one (#245), and
+// `transport` carries the only trust that admits httptest's self-signed
+// certificate.
 type octoFixture struct {
-	url      string
-	oidc     string
-	requests atomic.Int64
+	url       string
+	transport http.RoundTripper
+	oidc      string
+	requests  atomic.Int64
 	// last is what the most recent exchange carried, read off the wire.
 	lastQuery  atomic.Value // url.Values
 	lastBearer atomic.Value // string
@@ -41,7 +46,7 @@ func newOctoFixture(t *testing.T) *octoFixture {
 	f := &octoFixture{}
 	f.status.Store(int64(http.StatusOK))
 	f.body.Store(`{"token":"ghs-exchanged"}`)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.requests.Add(1)
 		if f.started != nil {
 			f.started <- struct{}{}
@@ -59,7 +64,7 @@ func newOctoFixture(t *testing.T) *octoFixture {
 		fmt.Fprint(w, f.body.Load().(string))
 	}))
 	t.Cleanup(srv.Close)
-	f.url = srv.URL
+	f.url, f.transport = srv.URL, srv.Client().Transport
 
 	f.oidc = filepath.Join(t.TempDir(), "oidc-token")
 	f.writeOIDC(t, "eyJ-projected")
@@ -90,11 +95,14 @@ func (f *octoFixture) block(mutate ...func(map[string]any)) map[string]any {
 func (f *octoFixture) source(t *testing.T, mutate ...func(map[string]any)) core.CredentialSource {
 	t.Helper()
 	block := f.block(mutate...)
-	d, err := credential.OctoSTSKind{}.Describe(block)
+	// The registered kind's schema and exchange, with the fixture's certificate
+	// trusted — the one thing an httptest TLS server needs and nothing else has.
+	kind := credential.OctoKindTrustingForTest(f.transport)
+	d, err := kind.Describe(block)
 	if err != nil {
 		t.Fatalf("Describe: %v", err)
 	}
-	src, err := credential.OctoSTSKind{}.New(d, block)
+	src, err := kind.New(d, block)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -412,6 +420,10 @@ func TestDescriptorFieldsCannotCrossTheirSeparators(t *testing.T) {
 
 	a := describe("org#ben", "tracker", `/run/oidc`)
 	b := describe("org", "ben#tracker", `/run/oidc`)
+	if a.PrincipalKey != a.Authority || b.PrincipalKey != b.Authority {
+		t.Fatalf("principal keys = %q and %q, want each source's trust-policy identity",
+			a.PrincipalKey, b.PrincipalKey)
+	}
 	if a.Authority == b.Authority {
 		t.Errorf("distinct scope/identity tuples share authority %q", a.Authority)
 	}
@@ -444,7 +456,9 @@ func TestIssuerURLCanonicalization(t *testing.T) {
 			{"https://octo.example.com", "https://OCTO.Example.COM"},
 			{"https://octo.example.com", "https://octo.example.com:443"},
 			{"https://octo.example.com", "https://octo.example.com/"},
-			{"http://octo.example.com/sts", "http://OCTO.example.com:80/sts/"},
+			// Was an `http://` pair until #245: the same canonicalization, now
+			// stated over the only scheme the kind admits.
+			{"https://octo.example.com/sts", "https://OCTO.example.com:443/sts/"},
 		} {
 			a, err := describe(t, pair[0])
 			if err != nil {
@@ -478,8 +492,14 @@ func TestIssuerURLCanonicalization(t *testing.T) {
 		name, url string
 		want      error
 	}{
-		{"a scheme that is not http(s)", "ftp://octo.example.com", credential.ErrSourceURLScheme},
+		{"a scheme that is not https", "ftp://octo.example.com", credential.ErrSourceURLScheme},
 		{"no scheme at all", "octo.example.com", credential.ErrSourceURLScheme},
+		// #245: the exchange presents the projected OIDC token in an
+		// `Authorization: Bearer` header, so plaintext is a refusal, in every
+		// spelling — including the one the canonicalizer used to normalize away.
+		{"a plaintext issuer", "http://octo.example.com/sts", credential.ErrSourceURLScheme},
+		{"a plaintext issuer on the default port", "http://octo.example.com:80/sts", credential.ErrSourceURLScheme},
+		{"a plaintext issuer spelled in uppercase", "HTTP://octo.example.com", credential.ErrSourceURLScheme},
 		{"userinfo", "https://user:pass@octo.example.com", credential.ErrSourceURL},
 		{"a query", "https://octo.example.com?scope=org", credential.ErrSourceURL},
 		{"a fragment", "https://octo.example.com#frag", credential.ErrSourceURL},
@@ -503,6 +523,97 @@ func TestIssuerURLCanonicalization(t *testing.T) {
 			t.Errorf("refusal = %v, want one that quotes no part of the URL", err)
 		}
 	})
+}
+
+// A plaintext issuer is refused at **load**, by both entry points, and the
+// refusal is what an operator reads rather than a warning they scroll past
+// (#245).
+//
+// The exchange sends the projected workload-identity JWT in an
+// `Authorization: Bearer` header, and that JWT federates to GitHub write access:
+// an on-path observer who captures one replays it to the real issuer for the
+// whole of its life, which `OctoMinFreshTTL` puts at roughly fifty minutes per
+// capture. The rule already held one package apart, in `projected_oidc`'s issuer
+// and `internal/airlock`'s base URL; this is the third statement of it, and
+// credtest is where it stopped being three.
+//
+// Asserted against a **live plaintext issuer**, not a made-up hostname: the
+// point is that no request is made, not that a request failed.
+func TestAPlaintextIssuerIsRefusedBeforeAnyExchange(t *testing.T) {
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		fmt.Fprint(w, `{"token":"ghs-exchanged"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	block := map[string]any{
+		"kind": "octo_sts", "url": srv.URL, "scope": "org", "identity": "ben",
+		"oidc_token_path": "/var/run/secrets/octo/oidc-token",
+	}
+	if _, err := (credential.OctoSTSKind{}).Describe(block); !errors.Is(err, credential.ErrSourceURLScheme) {
+		t.Errorf("Describe(%q) = %v, want ErrSourceURLScheme", srv.URL, err)
+	}
+	// New must refuse whatever Describe refuses, or a source could be built from
+	// a configuration load-validation would have rejected (SPEC §5.7).
+	if _, err := (credential.OctoSTSKind{}).New(core.SourceDescriptor{}, block); !errors.Is(err, credential.ErrSourceURLScheme) {
+		t.Errorf("New(%q) = %v, want ErrSourceURLScheme", srv.URL, err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Errorf("the plaintext issuer was contacted %d times; the refusal is load-time and Describe is pure", got)
+	}
+}
+
+// Validating only the configured URL is not enough: net/http follows redirects
+// by default and preserves Authorization when the destination is the same host
+// (even on another port and after an HTTPS-to-HTTP scheme downgrade). The
+// projection must therefore never leave the exact HTTPS endpoint whose
+// authority Describe recorded.
+func TestTheExchangeDoesNotFollowAPlaintextRedirect(t *testing.T) {
+	var plaintextRequests atomic.Int64
+	var plaintextBearer atomic.Value
+	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		plaintextRequests.Add(1)
+		plaintextBearer.Store(r.Header.Get("Authorization"))
+		fmt.Fprint(w, `{"token":"ghs-stolen"}`)
+	}))
+	t.Cleanup(plaintext.Close)
+
+	var secureRequests atomic.Int64
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secureRequests.Add(1)
+		http.Redirect(w, r, plaintext.URL, http.StatusFound)
+	}))
+	t.Cleanup(secure.Close)
+
+	oidc := filepath.Join(t.TempDir(), "oidc-token")
+	if err := os.WriteFile(oidc, []byte("eyJ-projected"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	block := map[string]any{
+		"kind": "octo_sts", "url": secure.URL, "scope": "org", "identity": "ben",
+		"oidc_token_path": oidc,
+	}
+	kind := credential.OctoKindTrustingForTest(secure.Client().Transport)
+	descriptor, err := kind.Describe(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := kind.New(descriptor, block)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := source.FetchFresh(context.Background(), core.PurposeTracker); err == nil {
+		t.Fatal("FetchFresh followed the redirect and accepted the plaintext response")
+	}
+	if got := secureRequests.Load(); got != 1 {
+		t.Errorf("HTTPS issuer requests = %d, want 1", got)
+	}
+	if got := plaintextRequests.Load(); got != 0 {
+		bearer, _ := plaintextBearer.Load().(string)
+		t.Errorf("plaintext redirect received %d requests with Authorization %q", got, bearer)
+	}
 }
 
 // Every `octo_sts` field must be a **literal**: a $VAR there would make a

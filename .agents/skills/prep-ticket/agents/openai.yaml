@@ -1,0 +1,7 @@
+interface:
+  display_name: "Prepare Ticket"
+  short_description: "Bounded read-only ticket readiness review"
+  default_prompt: "Use $prep-ticket to produce a one-shot advisory packet for this issue."
+
+policy:
+  allow_implicit_invocation: false

@@ -78,6 +78,19 @@ func TestTheSampleUnitSaysWhatTheDaemonReliesOn(t *testing.T) {
 		t.Errorf("KillMode = %q, want mixed; otherwise systemd signals the agents behind BEN's back (SPEC §9.8)", got)
 	}
 
+	// The production local-domain manager needs ownership of this service's
+	// cgroup subtree. Any non-false RestrictNamespaces value makes systemd deny
+	// clone3 wholesale, including BEN's required atomic-placement call.
+	if got := only("Service", "Delegate"); got != "yes" {
+		t.Errorf("Delegate = %q, want yes; local execution must refuse without writable cgroup-v2 delegation", got)
+	}
+	if got := only("Service", "RestrictNamespaces"); got != "no" {
+		t.Errorf("RestrictNamespaces = %q, want no; systemd cannot inspect clone3 flags", got)
+	}
+	if got := only("Service", "NoNewPrivileges"); got != "yes" {
+		t.Errorf("NoNewPrivileges = %q, want yes", got)
+	}
+
 	// TimeoutStopSec, which supervise names as the *only* bound on a drain it
 	// deliberately does not bound itself.
 	raw := only("Service", "TimeoutStopSec")

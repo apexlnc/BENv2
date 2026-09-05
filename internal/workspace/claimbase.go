@@ -15,22 +15,25 @@ import (
 
 // The claim-base record is the one local authority for which assignment epoch
 // a verification base belongs to. Git refs below are reachability roots only:
-// the whole epoch/base state changes with one durable rename of this record.
+// the whole epoch/base/target state changes with one durable rename of this record.
 const (
 	claimBaseDirName   = "claims"
-	claimBaseVersion   = 1
+	claimBaseVersion   = 2
+	legacyClaimVersion = 1
 	claimBasePending   = "pending"
 	claimBasePinned    = "pinned"
 	claimBaseRefPrefix = "refs/ben/claim-base/"
 )
 
 type claimBaseFile struct {
-	Version         int    `json:"version"`
-	State           string `json:"state"`
-	Epoch           int64  `json:"epoch"`
-	BaseSHA         string `json:"base_sha,omitempty"`
-	OutgoingEpoch   int64  `json:"outgoing_epoch,omitempty"`
-	OutgoingBaseSHA string `json:"outgoing_base_sha,omitempty"`
+	Version              int    `json:"version"`
+	State                string `json:"state"`
+	Epoch                int64  `json:"epoch"`
+	BaseSHA              string `json:"base_sha,omitempty"`
+	TargetBranch         string `json:"target_branch,omitempty"`
+	OutgoingEpoch        int64  `json:"outgoing_epoch,omitempty"`
+	OutgoingBaseSHA      string `json:"outgoing_base_sha,omitempty"`
+	OutgoingTargetBranch string `json:"outgoing_target_branch,omitempty"`
 }
 
 // BeginClaimBase durably records the pending intent for one tracker-native
@@ -49,7 +52,7 @@ func (p *Provider) BeginClaimBase(ctx context.Context, issue core.Issue, epoch i
 	unlock := p.lock(key)
 	defer unlock()
 
-	current, err := p.readClaimBaseLocked(ctx, key)
+	current, legacy, err := p.readClaimBaseForTransitionLocked(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -59,17 +62,24 @@ func (p *Provider) BeginClaimBase(ctx context.Context, issue core.Issue, epoch i
 			return fmt.Errorf("%w: workspace %s is pending for epoch %d, not %d",
 				ErrClaimBaseState, key, current.Epoch, epoch)
 		}
+		if legacy {
+			return fmt.Errorf("%w: workspace %s is pending for epoch %d", ErrClaimTargetUnrecorded, key, epoch)
+		}
 		return nil
 	case core.ClaimBasePinned:
 		if current.Epoch == epoch {
+			if legacy {
+				return fmt.Errorf("%w: workspace %s is pinned for epoch %d", ErrClaimTargetUnrecorded, key, epoch)
+			}
 			return nil
 		}
 		return p.writeClaimBaseLocked(key, claimBaseFile{
-			Version:         claimBaseVersion,
-			State:           claimBasePending,
-			Epoch:           epoch,
-			OutgoingEpoch:   current.Epoch,
-			OutgoingBaseSHA: current.BaseSHA,
+			Version:              claimBaseVersion,
+			State:                claimBasePending,
+			Epoch:                epoch,
+			OutgoingEpoch:        current.Epoch,
+			OutgoingBaseSHA:      current.BaseSHA,
+			OutgoingTargetBranch: current.TargetBranch,
 		})
 	case core.ClaimBaseAbsent:
 		outgoing, err := p.legacyOutgoingBaseLocked(ctx, key)
@@ -137,11 +147,16 @@ func (p *Provider) AbandonPendingClaimBase(ctx context.Context, issue core.Issue
 	}
 
 	if current.OutgoingEpoch > 0 {
+		version := claimBaseVersion
+		if current.OutgoingTargetBranch == "" {
+			version = legacyClaimVersion
+		}
 		return p.writeClaimBaseLocked(key, claimBaseFile{
-			Version: claimBaseVersion,
-			State:   claimBasePinned,
-			Epoch:   current.OutgoingEpoch,
-			BaseSHA: current.OutgoingBaseSHA,
+			Version:      version,
+			State:        claimBasePinned,
+			Epoch:        current.OutgoingEpoch,
+			BaseSHA:      current.OutgoingBaseSHA,
+			TargetBranch: current.OutgoingTargetBranch,
 		})
 	}
 	return p.removeClaimBaseLocked(key)
@@ -167,23 +182,37 @@ func claimBaseRef(key string, epoch int64) string {
 }
 
 func (p *Provider) readClaimBaseLocked(ctx context.Context, key string) (core.ClaimBase, error) {
+	state, legacy, err := p.readClaimBaseForTransitionLocked(ctx, key)
+	if err != nil {
+		return core.ClaimBase{}, err
+	}
+	if legacy {
+		return state, fmt.Errorf("%w: workspace %s", ErrClaimTargetUnrecorded, key)
+	}
+	return state, nil
+}
+
+// readClaimBaseForTransitionLocked is the one tolerant read of a pre-#152
+// record. BeginClaimBase may carry its base into a later epoch; every public
+// and same-epoch consumer goes through readClaimBaseLocked and refuses it.
+func (p *Provider) readClaimBaseForTransitionLocked(ctx context.Context, key string) (core.ClaimBase, bool, error) {
 	path := p.claimBasePath(key)
 	raw, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		if _, lerr := os.Lstat(path); lerr == nil {
-			return core.ClaimBase{}, fmt.Errorf("%w: claim-base record %s exists but cannot be read",
+			return core.ClaimBase{}, false, fmt.Errorf("%w: claim-base record %s exists but cannot be read",
 				ErrClaimBaseState, path)
 		} else if !errors.Is(lerr, os.ErrNotExist) {
-			return core.ClaimBase{}, fmt.Errorf("%w: inspecting claim-base record %s: %v",
+			return core.ClaimBase{}, false, fmt.Errorf("%w: inspecting claim-base record %s: %v",
 				ErrClaimBaseState, path, lerr)
 		}
 		if err := p.validateClaimBaseDirForAbsence(); err != nil {
-			return core.ClaimBase{}, err
+			return core.ClaimBase{}, false, err
 		}
-		return core.ClaimBase{State: core.ClaimBaseAbsent}, nil
+		return core.ClaimBase{State: core.ClaimBaseAbsent}, false, nil
 	case err != nil:
-		return core.ClaimBase{}, fmt.Errorf("%w: reading claim-base record %s: %v",
+		return core.ClaimBase{}, false, fmt.Errorf("%w: reading claim-base record %s: %v",
 			ErrClaimBaseState, path, err)
 	}
 
@@ -191,7 +220,7 @@ func (p *Provider) readClaimBaseLocked(ctx context.Context, key string) (core.Cl
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&disk); err != nil {
-		return core.ClaimBase{}, fmt.Errorf("%w: decoding claim-base record %s: %v",
+		return core.ClaimBase{}, false, fmt.Errorf("%w: decoding claim-base record %s: %v",
 			ErrClaimBaseState, path, err)
 	}
 	var extra any
@@ -199,55 +228,67 @@ func (p *Provider) readClaimBaseLocked(ctx context.Context, key string) (core.Cl
 		if err == nil {
 			err = errors.New("multiple JSON values")
 		}
-		return core.ClaimBase{}, fmt.Errorf("%w: decoding claim-base record %s: %v",
+		return core.ClaimBase{}, false, fmt.Errorf("%w: decoding claim-base record %s: %v",
 			ErrClaimBaseState, path, err)
 	}
 
-	state, err := projectClaimBase(disk)
+	state, legacy, err := projectClaimBase(disk)
 	if err != nil {
-		return core.ClaimBase{}, fmt.Errorf("%w: claim-base record %s: %v",
+		return core.ClaimBase{}, false, fmt.Errorf("%w: claim-base record %s: %v",
 			ErrClaimBaseState, path, err)
 	}
 	if err := p.validateClaimBaseRefLocked(ctx, key, state); err != nil {
-		return core.ClaimBase{}, err
+		return core.ClaimBase{}, false, err
 	}
-	return state, nil
+	return state, legacy, nil
 }
 
-func projectClaimBase(disk claimBaseFile) (core.ClaimBase, error) {
-	if disk.Version != claimBaseVersion {
-		return core.ClaimBase{}, fmt.Errorf("unsupported version %d", disk.Version)
+func projectClaimBase(disk claimBaseFile) (core.ClaimBase, bool, error) {
+	legacy := disk.Version == legacyClaimVersion
+	if disk.Version != claimBaseVersion && !legacy {
+		return core.ClaimBase{}, false, fmt.Errorf("unsupported version %d", disk.Version)
 	}
 	if disk.Epoch <= 0 {
-		return core.ClaimBase{}, errors.New("epoch is not positive")
+		return core.ClaimBase{}, false, errors.New("epoch is not positive")
+	}
+	if legacy && (disk.TargetBranch != "" || disk.OutgoingTargetBranch != "") {
+		return core.ClaimBase{}, false, errors.New("legacy record carries target-branch fields")
 	}
 	switch disk.State {
 	case claimBasePending:
 		if disk.BaseSHA != "" {
-			return core.ClaimBase{}, errors.New("pending record carries a pinned base")
+			return core.ClaimBase{}, false, errors.New("pending record carries a pinned base")
 		}
 		if disk.OutgoingBaseSHA == "" && disk.OutgoingEpoch != 0 {
-			return core.ClaimBase{}, errors.New("pending record carries an outgoing epoch without a base")
+			return core.ClaimBase{}, false, errors.New("pending record carries an outgoing epoch without a base")
 		}
 		if disk.OutgoingEpoch < 0 {
-			return core.ClaimBase{}, errors.New("pending record carries a negative outgoing epoch")
+			return core.ClaimBase{}, false, errors.New("pending record carries a negative outgoing epoch")
+		}
+		if disk.OutgoingTargetBranch != "" && disk.OutgoingBaseSHA == "" {
+			return core.ClaimBase{}, false, errors.New("pending record carries an outgoing target without a base")
 		}
 		return core.ClaimBase{
-			State:           core.ClaimBasePending,
-			Epoch:           disk.Epoch,
-			OutgoingEpoch:   disk.OutgoingEpoch,
-			OutgoingBaseSHA: disk.OutgoingBaseSHA,
-		}, nil
+			State:                core.ClaimBasePending,
+			Epoch:                disk.Epoch,
+			TargetBranch:         disk.TargetBranch,
+			OutgoingEpoch:        disk.OutgoingEpoch,
+			OutgoingBaseSHA:      disk.OutgoingBaseSHA,
+			OutgoingTargetBranch: disk.OutgoingTargetBranch,
+		}, legacy, nil
 	case claimBasePinned:
 		if disk.BaseSHA == "" {
-			return core.ClaimBase{}, errors.New("pinned record carries no base")
+			return core.ClaimBase{}, false, errors.New("pinned record carries no base")
 		}
-		if disk.OutgoingEpoch != 0 || disk.OutgoingBaseSHA != "" {
-			return core.ClaimBase{}, errors.New("pinned record carries transitional outgoing state")
+		if !legacy && disk.TargetBranch == "" {
+			return core.ClaimBase{}, false, errors.New("pinned record carries no target branch")
 		}
-		return core.ClaimBase{State: core.ClaimBasePinned, Epoch: disk.Epoch, BaseSHA: disk.BaseSHA}, nil
+		if disk.OutgoingEpoch != 0 || disk.OutgoingBaseSHA != "" || disk.OutgoingTargetBranch != "" {
+			return core.ClaimBase{}, false, errors.New("pinned record carries transitional outgoing state")
+		}
+		return core.ClaimBase{State: core.ClaimBasePinned, Epoch: disk.Epoch, BaseSHA: disk.BaseSHA, TargetBranch: disk.TargetBranch}, legacy, nil
 	default:
-		return core.ClaimBase{}, fmt.Errorf("unknown state %q", disk.State)
+		return core.ClaimBase{}, false, fmt.Errorf("unknown state %q", disk.State)
 	}
 }
 
@@ -318,8 +359,8 @@ func (p *Provider) legacyOutgoingBaseLocked(ctx context.Context, key string) (st
 	return sha, nil
 }
 
-func (p *Provider) pinClaimBaseLocked(ctx context.Context, key string, pending core.ClaimBase, baseSHA string) error {
-	if pending.State != core.ClaimBasePending || pending.Epoch <= 0 || baseSHA == "" {
+func (p *Provider) pinClaimBaseLocked(ctx context.Context, key string, pending core.ClaimBase, baseSHA, targetBranch string) error {
+	if pending.State != core.ClaimBasePending || pending.Epoch <= 0 || baseSHA == "" || targetBranch == "" {
 		return fmt.Errorf("%w: invalid pending-to-pinned transition for workspace %s", ErrClaimBaseState, key)
 	}
 	ref := claimBaseRef(key, pending.Epoch)
@@ -327,16 +368,17 @@ func (p *Provider) pinClaimBaseLocked(ctx context.Context, key string, pending c
 		return fmt.Errorf("%w: retaining claim base at %s: %v", ErrClaimBaseState, ref, err)
 	}
 	return p.writeClaimBaseLocked(key, claimBaseFile{
-		Version: claimBaseVersion,
-		State:   claimBasePinned,
-		Epoch:   pending.Epoch,
-		BaseSHA: baseSHA,
+		Version:      claimBaseVersion,
+		State:        claimBasePinned,
+		Epoch:        pending.Epoch,
+		BaseSHA:      baseSHA,
+		TargetBranch: targetBranch,
 	})
 }
 
 // writeClaimBaseLocked publishes a whole state with one rename. The temp file
 // is synced before its name becomes authoritative and the directory after, so
-// a successful return survives a crash without exposing a torn epoch/base pair.
+// a successful return survives a crash without exposing a torn epoch/base/target tuple.
 func (p *Provider) writeClaimBaseLocked(key string, state claimBaseFile) error {
 	if key == "" {
 		return fmt.Errorf("%w: empty workspace key", ErrPathEscape)

@@ -11,54 +11,14 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/srhg-ai-7cef3f93/ben/internal/gitcmd"
+	"github.com/srhg-ai-7cef3f93/ben/internal/gitremote"
 )
 
 // outputLimit bounds how much captured git/hook output an error carries; the
 // tail is kept because git and shells put the cause last.
 const outputLimit = 4096
-
-// gitCredentialHelper feeds the tracker credential (SPEC §10.2) to git via
-// the credential protocol. The secret travels in the child environment —
-// never in process arguments (`ps`) and never in on-disk git config.
-const gitCredentialHelper = `!f() { if [ "$1" = get ]; then printf 'username=%s\npassword=%s\n' "$BEN_REMOTE_USERNAME" "$BEN_REMOTE_PASSWORD"; fi; }; f`
-
-// gitNoAutoMaintenance turns off git's background maintenance for every git BEN
-// starts (#154).
-//
-// `fetch`, `commit` and `merge` all end by running auto-maintenance, and git
-// *detaches* what that starts, so it outlives the command BEN waited for — a
-// pack can land in objects/pack after the fetch returned. What BEN then has is a
-// process it did not start and cannot account for, running as the daemon's user,
-// taking gc.pid and pack locks in base.git and in the linked worktrees sharing
-// its object store, while an attempt may be running in one. Not corruption: a
-// process outside BEN's account of the workspaces it owns, which is what SPEC
-// §9.10 is careful about everywhere else.
-//
-// Both keys, because they stop different things — maintenance.auto=false stops
-// the fork itself, and gc.auto=0 stops the work, which is the leg that answers
-// for a git old enough to have run `git gc --auto` directly, before `git
-// maintenance` existed to be routed through. As `-c`
-// rather than base.git's config, because `-c` outranks every config file: the
-// guarantee then holds over a base repository BEN did not create, cannot be
-// edited out of one, and reaches the git processes git itself starts, through
-// the GIT_CONFIG_PARAMETERS it exports for them. Maintaining the base repository,
-// if it is ever wanted, is then a decision BEN makes rather than git's default.
-// docs/WORKTREES.md carries what each of those was measured from.
-//
-// Bounded to the git BEN starts, which is what BEN can account for: a hook's
-// shell (SPEC §6.5) and an agent's run (§7.6) are given composed environments of
-// their own, and a git either of them starts is theirs.
-var gitNoAutoMaintenance = []string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}
-
-// gitArgv composes the full argv of a BEN-invoked git: the no-maintenance
-// overrides, which must precede the subcommand, then what the caller asked for.
-// Every exec of git in this package goes through it; error messages keep naming
-// the caller's own args, because the overrides are not part of the request.
-func gitArgv(args []string) []string {
-	argv := make([]string, 0, len(gitNoAutoMaintenance)+len(args))
-	argv = append(argv, gitNoAutoMaintenance...)
-	return append(argv, args...)
-}
 
 // gitCmd runs one git command and returns its trimmed combined output.
 // Errors carry the redacted argv and output — git's stderr is the only
@@ -68,11 +28,12 @@ func gitArgv(args []string) []string {
 // reads that use none. Passed per call rather than held on the provider, which
 // is the whole of the fix: a value captured at construction scrubs a **stale**
 // token after a rotation while the live one flows through git's stderr into
-// error text and logs (SPEC §6.2, amendment 6).
-func (p *Provider) gitCmd(ctx context.Context, dir, secret string, extraEnv []string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", gitArgv(args)...)
+// error text and logs (SPEC §6.2, amendment 6). The caller supplies the complete
+// environment so the local and remote authority sets cannot be conflated here.
+func (p *Provider) gitCmd(ctx context.Context, dir, secret string, env []string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", gitcmd.Argv(args)...)
 	cmd.Dir = dir
-	cmd.Env = append(gitEnv(), extraEnv...)
+	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(redact(string(out), secret))
 	if err != nil {
@@ -83,7 +44,54 @@ func (p *Provider) gitCmd(ctx context.Context, dir, secret string, extraEnv []st
 }
 
 func (p *Provider) git(ctx context.Context, dir string, args ...string) (string, error) {
-	return p.gitCmd(ctx, dir, "", nil, args...)
+	return p.gitCmd(ctx, dir, "", localGitEnv(), args...)
+}
+
+// localGitEnv makes "local" an enforced property rather than an assumption
+// about the subcommand. A run can mark base.git as a partial clone and name a
+// promisor remote; without this guard, an object read such as rev-parse starts
+// an implicit fetch using that repository-local transport policy (#231).
+// GIT_NO_LAZY_FETCH is the direct guard in newer Git. The empty protocol
+// allowlist is the command-boundary backstop for older supported Git releases
+// that do not implement it: a local invocation has no legitimate transport.
+func localGitEnv() []string {
+	return append(gitcmd.Env(),
+		"GIT_NO_LAZY_FETCH=1",
+		"GIT_ALLOW_PROTOCOL=",
+	)
+}
+
+// gitObjectDir runs a local command in a daemon-created scratch repository
+// while making base.git's object store visible. The scratch repository remains
+// the source of configuration and refs; only content-addressed objects are
+// shared with the cache.
+func (p *Provider) gitObjectDir(ctx context.Context, dir, objectDir string, args ...string) (string, error) {
+	env := append(localGitEnv(), "GIT_OBJECT_DIRECTORY="+objectDir)
+	return p.gitCmd(ctx, dir, "", env, args...)
+}
+
+// gitConfigHasMatch asks whether repository-local config contains at least one
+// key matching pattern without retaining its output. Config keys are authored
+// by the run and unbounded in both count and length; CombinedOutput would let a
+// refusal check allocate in proportion to hostile input merely to discard it.
+func (p *Provider) gitConfigHasMatch(ctx context.Context, dir, pattern string) (bool, error) {
+	args := []string{"config", "--local", "--no-includes", "--name-only", "--get-regexp", pattern}
+	cmd := exec.CommandContext(ctx, "git", gitcmd.Argv(args)...)
+	cmd.Dir = dir
+	cmd.Env = localGitEnv()
+	cmd.Stdout = io.Discard
+	stderr := tailWriter{limit: outputLimit}
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git %s: %w: %s",
+		strings.Join(args, " "), err, truncateOutput(strings.TrimSpace(stderr.String())))
 }
 
 // remoteGit runs a git command that contacts the remote, obtaining the
@@ -96,22 +104,37 @@ func (p *Provider) git(ctx context.Context, dir string, args ...string) (string,
 // is no unauthenticated fallback to fall through to, which matters most against
 // a public remote, where an unauthenticated fetch would quietly succeed and hide
 // the misconfiguration until the first private operation.
+//
+// The helper and the scope it answers for come from internal/gitremote, shared
+// with internal/mirror: it is one shell script, and the request-parsing behind
+// its host check (#230) is the kind of thing two copies drift apart on. The
+// scope is derived from *this provider's* configured remote, so a redirect or a
+// rewrite that sends git to another host gets silence rather than the token.
 func (p *Provider) remoteGit(ctx context.Context, dir string, args ...string) (string, error) {
+	return p.remoteGitEnv(ctx, dir, gitcmd.RemoteEnv(), args...)
+}
+
+// remoteGitObjectDir is the remote boundary used by fetchRemoteRef. Git reads
+// configuration and writes refs in dir, a fresh repository the daemon just
+// created, while fetched objects land in base.git's content-addressed object
+// store. Reintroducing GIT_OBJECT_DIRECTORY only here, after RemoteEnv removed
+// every inherited repository-local variable, keeps base.git/config out of the
+// network process without redownloading the whole repository on every fetch.
+func (p *Provider) remoteGitObjectDir(ctx context.Context, dir, objectDir string, args ...string) (string, error) {
+	env := append(gitcmd.RemoteEnv(), "GIT_OBJECT_DIRECTORY="+objectDir)
+	return p.remoteGitEnv(ctx, dir, env, args...)
+}
+
+func (p *Provider) remoteGitEnv(ctx context.Context, dir string, env []string, args ...string) (string, error) {
 	if p.authSource == nil {
-		return p.gitCmd(ctx, dir, "", nil, args...)
+		return p.gitCmd(ctx, dir, "", env, args...)
 	}
 	auth, err := p.authSource.Auth(ctx)
 	if err != nil {
 		return "", fmt.Errorf("git %s: obtaining the remote credential: %w", strings.Join(args, " "), err)
 	}
-	full := append([]string{
-		"-c", "credential.helper=",
-		"-c", "credential.helper=" + gitCredentialHelper,
-	}, args...)
-	env := []string{
-		"BEN_REMOTE_USERNAME=" + auth.Username,
-		"BEN_REMOTE_PASSWORD=" + auth.Password,
-	}
+	full := append(gitremote.CredentialConfig(), args...)
+	env = append(env, gitremote.CredentialEnv(p.remoteURL, auth.Username, auth.Password)...)
 	return p.gitCmd(ctx, dir, auth.Password, env, full...)
 }
 
@@ -155,9 +178,9 @@ func (p *Provider) gitLines(ctx context.Context, maxLines, maxLineBytes int, arg
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, "git", gitArgv(args)...)
+	cmd := exec.CommandContext(runCtx, "git", gitcmd.Argv(args)...)
 	cmd.Dir = p.baseDir
-	cmd.Env = gitEnv()
+	cmd.Env = localGitEnv()
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, false, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
@@ -292,22 +315,6 @@ func complete(s string) bool {
 	// RuneError with size 1 is the decoder's "these bytes are not a rune"; a real
 	// U+FFFD in the input decodes with size 3 and is left alone.
 	return r != utf8.RuneError || size > 1
-}
-
-// gitEnv is the daemon environment minus repo-context variables that would
-// redirect git away from the paths passed explicitly, plus a guard against
-// interactive credential prompts hanging the daemon.
-func gitEnv() []string {
-	var env []string
-	for _, kv := range os.Environ() {
-		switch key, _, _ := strings.Cut(kv, "="); key {
-		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE":
-			continue
-		default:
-			env = append(env, kv)
-		}
-	}
-	return append(env, "GIT_TERMINAL_PROMPT=0")
 }
 
 // revParse resolves ref to the commit SHA it peels to. Absence (ok=false,

@@ -89,6 +89,19 @@ type Orchestrator struct {
 	// assigned issues from the ordinary Fetch, so nothing else ever looks.
 	scanOwed     bool
 	scanInFlight bool
+	// cycleScanInFlight is the local read of independently durable ended-cycle
+	// obligations; cycleScanFailed blocks dispatch until a complete read says
+	// which issues those records own. Treating an unreadable directory as empty
+	// would let a replacement run while its predecessor is being disposed.
+	cycleScanInFlight bool
+	cycleScanFailed   bool
+	// cycleMutationSeq and cycleMutationsInFlight scope a full-directory read to
+	// the BeginClaimBase writes and completed disposals it observed. Only a read
+	// taken after the latest completed mutation may publish its snapshot or clear
+	// a prior refusal; otherwise an older listing could resurrect an obligation
+	// whose confirmation already removed it.
+	cycleMutationSeq       uint64
+	cycleMutationsInFlight int
 	// The §9.10 step 5 sweep's outstanding work, all loop-owned.
 	//
 	// sweepPassOwed is a whole pass that never ran or could not list the directory;
@@ -133,9 +146,19 @@ type Orchestrator struct {
 	// set's turnover skip the other's records. *One* cursor for held claims,
 	// though, however they became candidates: they share a budget, so sharing a
 	// rotation is what makes that budget fair across both (#135).
-	parkedCursor string
-	owedCursor   string
-	heldCursor   string
+	// disposalCursor is a fourth, over the ended workspace cycles that owe a
+	// disposal (cycle.go, #252). Separate from heldCursor because they are
+	// separate *budgets* — a confirming Get is one tracker read and a disposal is
+	// a backend call that waits for three evidence fields — and over a separate
+	// set: an obligation is keyed by cycle address and outlives whichever owner
+	// noticed it, so it is not a held claim and not a record.
+	parkedCursor   string
+	owedCursor     string
+	heldCursor     string
+	disposalCursor string
+	// endedCycles are the workspace cycles the tracker has ended whose disposal
+	// the backend has not yet confirmed. Loop-owned, like records and held.
+	endedCycles map[string]*endedCycle
 	// draining is loop-owned and drainWaiters are the callers of Shutdown
 	// awaiting it. See shutdown.go.
 	draining     bool
@@ -548,9 +571,10 @@ func (o *Orchestrator) onAdopt(a *adoption) {
 	if o.identityMoved(a) && o.identityWorkOutstanding() {
 		if a.state.CompareAndSwap(adoptPending, adoptCancelled) {
 			a.ack <- fmt.Errorf("%w: %d run records, %d held claims, %d pending run-marker clears, "+
-				"recovery scan outstanding: %v, workspace cleanup outstanding: %v",
+				"recovery scan outstanding: %v, ended-cycle state outstanding: %v, workspace cleanup outstanding: %v",
 				config.ErrWorkOutstanding, len(o.records), len(o.held), len(o.markerClears),
-				o.scanOwed || o.scanInFlight, o.sweepOwed())
+				o.scanOwed || o.scanInFlight,
+				o.cycleScanInFlight || o.cycleScanFailed || o.cycleMutationsInFlight > 0, o.sweepOwed())
 		}
 		return
 	}
@@ -591,8 +615,14 @@ func (o *Orchestrator) onAdopt(a *adoption) {
 // lets that comparison stay a string comparison on the authority goroutine; see
 // markerStore for why canonicalizing there is not an option.
 func (o *Orchestrator) identityWorkOutstanding() bool {
-	return len(o.records) > 0 || len(o.held) > 0 ||
-		o.scanOwed || o.scanInFlight || o.sweepOwed() || len(o.markerClears) > 0
+	// endedCycles for the same reason the two record sets are here, and with the
+	// sharper version of it: an obligation names a workspace cycle in *this*
+	// provider's store, and an identity reload replaces the provider. Carrying one
+	// across would ask a different backend, under a different principal, to dispose
+	// a cycle address it never issued (#252, cycle.go).
+	return len(o.records) > 0 || len(o.held) > 0 || len(o.endedCycles) > 0 ||
+		o.scanOwed || o.scanInFlight || o.cycleScanInFlight || o.cycleScanFailed || o.cycleMutationsInFlight > 0 ||
+		o.sweepOwed() || len(o.markerClears) > 0
 }
 
 // sweepOwed reports whether §9.10 step 5 has unfinished work: a whole pass that never
@@ -862,17 +892,97 @@ func (o *Orchestrator) attemptEnded(ctx context.Context, r *Record) {
 	})
 }
 
-// dispose returns the workspace, keeping it for forensics where the spec says
-// to. Once per record — see Record.disposalOwed for why the exit can be reached
-// twice and what a second disposal would cost.
-func (o *Orchestrator) dispose(ctx context.Context, r *Record, keep bool) {
+// oweDisposal serializes one terminal workspace action with the hooks and
+// tracker writes around it. Once per record — see Record.disposalOwed for why
+// an exit can be reached twice and what a second disposal would cost.
+func (o *Orchestrator) oweDisposal(
+	ctx context.Context, r *Record, complete func(context.Context, Workspaces, core.Workspace) error,
+) {
 	if !r.hasWorkspace() || r.disposalOwed {
 		return
 	}
 	r.disposalOwed = true
 	ws := r.Workspace
 	o.owe(ctx, r, "dispose workspace", effectLocal, func(ctx context.Context, o *Orchestrator) error {
-		return o.bundle().Workspaces.Dispose(ctx, ws, keep)
+		return complete(ctx, o.bundle().Workspaces, ws)
+	})
+}
+
+func (o *Orchestrator) disposePublished(ctx context.Context, r *Record) {
+	o.oweDisposal(ctx, r, func(ctx context.Context, workspaces Workspaces, ws core.Workspace) error {
+		return workspaces.Dispose(ctx, ws, false)
+	})
+}
+
+// completeFailure reaches only providers that expose a backend allocation
+// policy. The v1 provider's failed-workspace behavior remains the §6.4 keep it
+// already performs by doing nothing here.
+func (o *Orchestrator) completeFailure(ctx context.Context, r *Record) {
+	if _, ok := o.bundle().Workspaces.(workspaceLifecycleCompleter); !ok {
+		return
+	}
+	o.oweDisposal(ctx, r, func(ctx context.Context, workspaces Workspaces, ws core.Workspace) error {
+		lifecycle, ok := workspaces.(workspaceLifecycleCompleter)
+		if !ok {
+			return nil
+		}
+		return lifecycle.CompleteFailure(ctx, ws)
+	})
+}
+
+// disposeRevoked keeps the local provider's existing keep/remove choice while
+// letting a remote provider select its dedicated on_revoked policy.
+//
+// The two go to different places, and the split is #252's. A local Dispose is a
+// worktree removal on this host: fast, ordered against this record's tracker
+// writes, and correct on the owed queue where it has always been. A remote
+// revocation is the end of a *workspace cycle* — a backend call that does not
+// return until compute release, volume destruction and record tombstoning each
+// confirm — and the owed queue is one serial worker shared by every issue's label
+// writes, so a wedged control plane on it stalls the whole projection. It goes to
+// the bounded obligation instead (cycle.go), which driveOwed then holds this
+// record's release behind.
+func (o *Orchestrator) disposeRevoked(ctx context.Context, r *Record, keep bool) {
+	if o.oweRemoteRevocation(r) {
+		return
+	}
+	o.oweDisposal(ctx, r, func(ctx context.Context, workspaces Workspaces, ws core.Workspace) error {
+		return workspaces.Dispose(ctx, ws, keep)
+	})
+}
+
+// completeRevocationOnly is the recovery verdict whose v1 meaning is "leave the
+// kept workspace untouched". A remote backend still has an on_revoked policy to
+// apply, so only that optional surface is reached.
+func (o *Orchestrator) completeRevocationOnly(ctx context.Context, r *Record) {
+	o.oweRemoteRevocation(r)
+}
+
+// oweRemoteRevocation registers this record's workspace cycle as ended, and
+// reports whether it took responsibility for it.
+//
+// `false` means there is nothing here a remote policy applies to — a local
+// provider, or a claim that never pinned a base and so never acquired a sandbox —
+// and the caller keeps whatever v1 behaviour it had. cycleWorkspace decides,
+// rather than each caller testing the provider for itself: the first version of
+// #252 made that test at one call site and leaked at the two others.
+func (o *Orchestrator) oweRemoteRevocation(r *Record) bool {
+	id := r.Issue.Identifier
+	before := o.endedCycleOwed(id)
+	o.oweEndedCycle(id, o.bundle().Workspaces, r.Workspace, "claim revoked by tracker state")
+	return before || o.endedCycleOwed(id)
+}
+
+func (o *Orchestrator) completeShutdown(ctx context.Context, r *Record) {
+	if _, ok := o.bundle().Workspaces.(workspaceLifecycleCompleter); !ok {
+		return
+	}
+	o.oweDisposal(ctx, r, func(ctx context.Context, workspaces Workspaces, ws core.Workspace) error {
+		lifecycle, ok := workspaces.(workspaceLifecycleCompleter)
+		if !ok {
+			return nil
+		}
+		return lifecycle.CompleteShutdown(ctx, ws)
 	})
 }
 
@@ -908,9 +1018,9 @@ func (o *Orchestrator) runningCount() int {
 		case StateVerifying:
 			// The one state on the way *out*, so the reasoning inverts. The
 			// state moves on the terminal event, which is §9.2's trigger, but
-			// the process may outlive it — a descendant in the group is what
-			// §7.5's Stop is asked about — so it counts until the group is
-			// confirmed gone.
+			// execution may outlive it — another domain member is what §7.5's
+			// Stop accounts for — so it counts until the domain is confirmed
+			// quiet.
 			//
 			// After that it does not. The §9.7 evidence check reads git and
 			// the tracker with no agent running at all, and it can be slow:
@@ -918,7 +1028,7 @@ func (o *Orchestrator) runningCount() int {
 			// concurrency on something that is not the scarce resource, and
 			// with a slow tracker a full set of verifying records starves
 			// dispatch entirely while nothing is executing.
-			if !r.groupGone {
+			if !r.domainQuiet {
 				n++
 			}
 		}
@@ -941,9 +1051,10 @@ func (o *Orchestrator) freeSlots(def *config.WorkflowDefinition) int {
 // snapshot (SPEC §5.4: a reload never changes a live run's ground).
 func (o *Orchestrator) renderPrompt(r *Record) (string, error) {
 	vars := template.Vars{
-		Issue:     r.Issue,
-		Attempt:   r.Attempt,
-		Workspace: r.Workspace.Path,
+		Issue:        r.Issue,
+		Attempt:      r.Attempt,
+		Workspace:    r.Workspace.Path,
+		TargetBranch: r.Workspace.TargetBranch,
 		Run: template.Run{
 			ID:              fmt.Sprintf("%s-%d", r.Issue.Identifier, r.Attempt),
 			PreviousOutcome: previousOutcome(r),

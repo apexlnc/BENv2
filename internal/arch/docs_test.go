@@ -107,8 +107,10 @@ func flatten(s string) string {
 var whitespace = regexp.MustCompile(`\s+`)
 
 // markdownFiles returns every markdown file in this module, module-relative and
-// slash-separated, under the same scoping rules the import walk uses: dotted
-// and underscored directories, testdata, vendor, and nested modules are out.
+// slash-separated, in the go tool's pattern-expansion scope (ignoredPackageDir):
+// dotted and underscored directories, testdata, vendor, and nested modules are
+// out. Not the import walks' scope, which keeps testdata in — see
+// ignoredImportDir.
 func markdownFiles(t *testing.T, root string) []string {
 	t.Helper()
 	var out []string
@@ -595,7 +597,24 @@ func TestEveryDocsFileIsLinkedFromTheRoot(t *testing.T) {
 // behind one belongs in docs/, linked from the section that states the rule.
 // Raising the number is the third legitimate answer — deliberately, in the
 // change that needs it, which is all this test asks.
-const agentsLineBudget = 260
+//
+// 260 → 262 for #11: a whole subsystem arrived (`internal/review` and
+// `cmd/benreview`, the forge-side review controller). Its two added lines are
+// one repo-map row and one canonical command; the required-label constraint
+// replaces the existing queue-label rule without growing the guide. Evidence,
+// identities and deployment stay in docs/REVIEW.md.
+// Raised by one for #194's `internal/airlock` repo-map row. The row is the
+// cheapest possible form of what the budget protects — one line naming a package
+// and linking the long-form document — and the alternative was leaving a
+// top-level package the map does not mention, which is the drift the map exists
+// to prevent.
+// Raised by one again for #205's `internal/remotews` row, on the same grounds
+// and for the package that makes #194's foundation dispatchable. The `cmd/ben`
+// and `internal/airlock` rows absorbed their share of #205 by rewording rather
+// than growing, and the two-clock rule the row states is the one thing a reader
+// of this map cannot infer from the package name; its evidence is in
+// docs/REMOTE.md.
+const agentsLineBudget = 264
 
 func TestAGENTSStaysWithinItsContextBudget(t *testing.T) {
 	lines := strings.Count(read(t, filepath.Join(moduleRoot(t), "AGENTS.md")), "\n")
@@ -674,8 +693,7 @@ func TestAGENTSSectionsNamedElsewhereExist(t *testing.T) {
 }
 
 // referencingFiles returns every file worth scanning for the reference above,
-// module-relative, under the same scoping rules the import and markdown walks
-// use.
+// module-relative, under the same scoping rules the markdown walk uses.
 func referencingFiles(t *testing.T, root string) []string {
 	t.Helper()
 	var out []string

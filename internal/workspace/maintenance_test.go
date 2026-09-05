@@ -29,16 +29,28 @@ import (
 //   - `git config --get` through the provider: git resolves the keys we passed
 //     to the values we meant, over a repository that says the opposite.
 //
-// The first two mutate the test binary's environment (PATH, GIT_TRACE2_EVENT),
-// so they stay out of the #167 cohort; the marker audit sees the t.Setenv
-// through the helpers.
+// The first and third also carry #228's neutralization of the config surfaces a
+// run can write inside base.git, which is the same shape of claim about the same
+// argv: present before the subcommand, and resolved by git to the value BEN
+// meant over a repository configured the other way. What planting the real
+// adversarial state proves is next door, in steering_test.go — this pair cannot
+// see whether the set is *sufficient*, only whether it is intact.
+//
+// The first two mutate the test binary's PATH, so they stay out of the #167
+// cohort; the marker audit sees the t.Setenv through the helpers.
 
-// The overrides, written out rather than read from gitNoAutoMaintenance: a test
-// driven by the declaration it checks agrees with any declaration, including one
-// an edit emptied (AGENTS.md, Conventions).
-var wantMaintenanceArgv = []string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}
+// The overrides, written out rather than read from gitcmd.Argv: a test driven by
+// the declaration it checks agrees with any declaration, including one an edit
+// emptied (AGENTS.md, Conventions).
+var wantInvocationArgv = []string{
+	"-c", "gc.auto=0",
+	"-c", "maintenance.auto=false",
+	"-c", "core.hooksPath=",
+	"-c", "core.fsmonitor=",
+	"-c", "core.useReplaceRefs=false",
+}
 
-// TestEveryProviderGitCarriesTheMaintenanceOverrides records the argv of every
+// TestEveryProviderGitCarriesTheInvocationOverrides records the argv of every
 // git a lifecycle's worth of provider calls starts.
 //
 // Driven through the provider rather than asserted about gitArgv, because the
@@ -46,7 +58,7 @@ var wantMaintenanceArgv = []string{"-c", "gc.auto=0", "-c", "maintenance.auto=fa
 // credential helper and gitLines builds a second exec.Command entirely, and both
 // would keep passing a unit test of the composer they no longer use. The
 // subcommand coverage below is what holds the driving to reaching all three.
-func TestEveryProviderGitCarriesTheMaintenanceOverrides(t *testing.T) {
+func TestEveryProviderGitCarriesTheInvocationOverrides(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 	p := newProvider(t, f, Hooks{})
@@ -69,12 +81,13 @@ func TestEveryProviderGitCarriesTheMaintenanceOverrides(t *testing.T) {
 		t.Fatal("no git invocation was recorded; the shim did not take, so this test asserts nothing")
 	}
 	for _, argv := range invocations {
-		if len(argv) < len(wantMaintenanceArgv) ||
-			!slices.Equal(argv[:len(wantMaintenanceArgv)], wantMaintenanceArgv) {
+		if len(argv) < len(wantInvocationArgv) ||
+			!slices.Equal(argv[:len(wantInvocationArgv)], wantInvocationArgv) {
 			// Before the subcommand, not merely present: git refuses `-c` after
 			// it, so an override in the wrong place is not an override.
-			t.Errorf("git %s\n  does not begin with %s — this invocation may fork maintenance BEN never waits for",
-				strings.Join(argv, " "), strings.Join(wantMaintenanceArgv, " "))
+			t.Errorf("git %s\n  does not begin with %s — this invocation may fork maintenance BEN never waits "+
+				"for, or be steered by config the run wrote into base.git",
+				strings.Join(argv, " "), strings.Join(wantInvocationArgv, " "))
 		}
 	}
 
@@ -115,7 +128,11 @@ func TestNoProviderGitForksBackgroundMaintenance(t *testing.T) {
 	agentCommit(t, ws.Path, "work.txt")
 	agentPush(t, ws.Path)
 
-	control := traceInto(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("no git on PATH: %v", err)
+	}
+	control := traceInto(t, realGit)
 	scratch := filepath.Join(t.TempDir(), "control.git")
 	runGit(t, filepath.Dir(scratch), "clone", "--quiet", "--bare", f.origin, scratch)
 	runGit(t, scratch, "fetch", "--quiet", f.origin, "+refs/heads/main:refs/heads/main")
@@ -130,7 +147,7 @@ func TestNoProviderGitForksBackgroundMaintenance(t *testing.T) {
 			"being read (fix it). Trace: %+v", control())
 	}
 
-	subject := traceInto(t)
+	subject := traceInto(t, realGit)
 	driveProviderLifecycle(t, ctx, p, ws)
 	trace := subject()
 
@@ -146,16 +163,17 @@ func TestNoProviderGitForksBackgroundMaintenance(t *testing.T) {
 	}
 }
 
-// TestMaintenanceOverridesOutrankTheRepositoryConfig asks git what it resolved,
+// TestInvocationOverridesOutrankTheRepositoryConfig asks git what it resolved,
 // which is the half neither of the above can see: an argv carrying a misspelled
 // key, or a value git parses as something other than "off", is recorded and
 // forked-free and configures nothing.
 //
 // Over a base repository configured the other way, because that is both the
 // stronger claim and the realistic one — BEN can be pointed at a base.git an
-// operator or an older BEN created, and `-c` is what makes the guarantee a
-// property of the invocation rather than of the repository's state.
-func TestMaintenanceOverridesOutrankTheRepositoryConfig(t *testing.T) {
+// operator or an older BEN created, and for #228's three keys the repository is
+// written by the run itself, so "the repository says the opposite" is the
+// expected state rather than a contrived one.
+func TestInvocationOverridesOutrankTheRepositoryConfig(t *testing.T) {
 	parallel(t)
 	ctx := context.Background()
 	p := newProvider(t, newFixture(t), Hooks{})
@@ -163,27 +181,38 @@ func TestMaintenanceOverridesOutrankTheRepositoryConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	runGit(t, ws.SharedGitDir, "config", "gc.auto", "1")
-	runGit(t, ws.SharedGitDir, "config", "maintenance.auto", "true")
 
-	// The type is part of the assertion: git reads these keys as an int and a
-	// bool, and `--type` fails rather than reporting a value git would not honor.
+	// The type is part of the assertion where there is one: git reads gc.auto as
+	// an int and the two booleans as bools, and `--type` fails rather than
+	// reporting a value git would not honor. The two hook keys are read
+	// untyped — `--type=path` refuses an empty value, which is the value that
+	// disables them.
 	tests := []struct {
 		key, typ, want, repo string
 	}{
 		{key: "gc.auto", typ: "int", want: "0", repo: "1"},
 		{key: "maintenance.auto", typ: "bool", want: "false", repo: "true"},
+		{key: "core.hooksPath", want: "", repo: "/tmp/ben-test-hooks"},
+		{key: "core.fsmonitor", want: "", repo: "/tmp/ben-test-fsmonitor"},
+		{key: "core.useReplaceRefs", typ: "bool", want: "false", repo: "true"},
+	}
+	for _, tt := range tests {
+		runGit(t, ws.SharedGitDir, "config", tt.key, tt.repo)
 	}
 	for _, tt := range tests {
 		t.Run(tt.key, func(t *testing.T) {
 			if got := runGit(t, ws.SharedGitDir, "config", "--get", tt.key); got != tt.repo {
 				t.Fatalf("the repository reads %s=%q, want the opposing %q: the case asserts nothing", tt.key, got, tt.repo)
 			}
+			args := []string{"config", "--get", tt.key}
+			if tt.typ != "" {
+				args = []string{"config", "--get", "--type=" + tt.typ, tt.key}
+			}
 			for _, where := range []struct{ what, dir string }{
 				{"base repository", ws.SharedGitDir},
 				{"linked worktree", ws.Path},
 			} {
-				got, err := p.git(ctx, where.dir, "config", "--get", "--type="+tt.typ, tt.key)
+				got, err := p.git(ctx, where.dir, args...)
 				if err != nil {
 					t.Fatalf("git config --get %s in the %s: %v", tt.key, where.what, err)
 				}
@@ -269,12 +298,21 @@ type gitTrace struct {
 	maintenanceForks [][]string
 }
 
-// traceInto points GIT_TRACE2_EVENT at a fresh directory — one file per process,
-// so nothing interleaves — and returns a reader of what accumulated there.
-func traceInto(t *testing.T) func() gitTrace {
+// traceInto puts a test-only Git shim on PATH that points GIT_TRACE2_EVENT at a
+// fresh directory — one file per process, so nothing interleaves — and returns
+// a reader of what accumulated there. Trace controls are intentionally absent
+// from gitcmd.Env's production allowlist; injecting at the executable boundary
+// keeps this instrumentation independent without widening that boundary.
+func traceInto(t *testing.T, realGit string) func() gitTrace {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("GIT_TRACE2_EVENT", dir)
+	shimDir := t.TempDir()
+	script := fmt.Sprintf("#!/bin/sh\nGIT_TRACE2_EVENT=%s exec %s \"$@\"\n",
+		shellQuote(dir), shellQuote(realGit))
+	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return func() gitTrace {
 		entries, err := os.ReadDir(dir)
 		if err != nil {

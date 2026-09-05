@@ -2,6 +2,7 @@ package codexexec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -165,6 +166,9 @@ func ParseProvider(cfg core.AgentConfig) (Provider, error) {
 	if p.Env, err = b.StringMap("env"); err != nil {
 		return Provider{}, err
 	}
+	if err := checkTempRoot(p.Env); err != nil {
+		return Provider{}, err
+	}
 
 	// The config half of the BEN_ reservation (SPEC §7.6): a collision authored
 	// here is written once and hits every run, so it refuses at load.
@@ -203,6 +207,22 @@ func ParseProvider(cfg core.AgentConfig) (Provider, error) {
 	p.SandboxMode = mode
 
 	return p, nil
+}
+
+// checkTempRoot makes the provider's alternate temp root an unambiguous path
+// assembly can compare with daemon-only state. An empty or relative TMPDIR has
+// process- and cwd-dependent fallback semantics, so it cannot participate in a
+// fail-closed containment check.
+func checkTempRoot(env map[string]string) error {
+	tmp, ok := env["TMPDIR"]
+	if !ok {
+		return nil
+	}
+	if tmp != "" && filepath.IsAbs(tmp) {
+		return nil
+	}
+	return harness.ValueRefusal("env.TMPDIR", tmp,
+		fmt.Errorf("%w: env.TMPDIR must be a non-empty absolute path so daemon-only state can be kept outside it", ErrProviderValue))
 }
 
 // checkCodexHome refuses a relative CODEX_HOME, because the two things that
@@ -304,13 +324,16 @@ func (p Provider) checkRuntime(ctx context.Context, path string, publish harness
 
 	out, err := harness.Probe(ctx, t, path, env, "--version")
 	if err != nil {
-		return fmt.Errorf("%w: %s --version failed: %v", ErrBinary, path, err)
+		// Wrapped, not formatted: a probe refused for flooding its output
+		// (harness.ErrProbeOutput) is a different fact about the binary from one
+		// that exited non-zero, and the caller should be able to tell them apart.
+		return fmt.Errorf("%w: %s --version failed: %w", ErrBinary, path, err)
 	}
 	// `codex-cli 0.147.0` — the marker, not the number: pinning a minimum
 	// version would refuse harness upgrades we have no evidence to refuse.
 	if !strings.Contains(string(out), versionMarker) {
 		return fmt.Errorf("%w: %s --version does not identify as the Codex CLI: %q",
-			ErrBinary, path, strings.TrimSpace(string(out)))
+			ErrBinary, path, harness.Excerpt(strings.TrimSpace(string(out)), harness.ProbeExcerpt))
 	}
 	return p.checkAuth(ctx, path, env, t)
 }
@@ -351,6 +374,14 @@ func (p Provider) checkAuth(ctx context.Context, path string, env []string, t ha
 		// is its own kind of unusable.
 		return fmt.Errorf("%w: %s login status did not answer: %v", ErrBinary, path, ctx.Err())
 	}
+	if errors.Is(err, harness.ErrProbeOutput) {
+		// Before the excuse below, and not folded into it: that excuse reads the
+		// body, and a body past the probe's bound is not the one-line "Not
+		// logged in" it exists for, whatever the flood happens to contain
+		// (#235). Failing closed here is the same direction as everything else
+		// in this function.
+		return fmt.Errorf("%w: %s login status: %w", ErrBinary, path, err)
+	}
 	if err == nil {
 		return nil
 	}
@@ -365,14 +396,5 @@ func (p Provider) checkAuth(ctx context.Context, path string, env []string, t ha
 	// is account identity, which never reaches an error or a log line.
 	return fmt.Errorf("%w: %s login status failed: %s; set agent.provider.api_key, "+
 		"point agent.provider.codex_home at a usable home, or run `codex login` as the daemon user",
-		ErrBinary, path, truncate(answer, 200))
-}
-
-// truncate bounds harness output copied into a refusal, so a binary that
-// answers with a wall of text cannot turn a startup error into one.
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "…"
+		ErrBinary, path, harness.Excerpt(answer, harness.ProbeExcerpt))
 }

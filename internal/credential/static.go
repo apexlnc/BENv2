@@ -94,8 +94,11 @@ func SiteAuthority(field string) string { return SiteAuthorityPrefix + field }
 //
 // Its BindingKey carries no digest, and that is not an omission: the value is
 // read at every fetch, so a rotation is picked up without rebuilding anything
-// and there is nothing about it for a reload to compare. The literal case below
-// is the one where the value *is* part of the definition.
+// and there is nothing about it for a reload to compare. PrincipalKey remains
+// empty for a different reason: an opaque replacement token may name a
+// different downstream principal, so a principal-scoped replay must bind the
+// concrete token. The literal case below is the one where the value *is* part
+// of the definition.
 func EnvDescriptor(variable string) core.SourceDescriptor {
 	return core.SourceDescriptor{
 		Kind:      StaticKindName,
@@ -119,6 +122,10 @@ func EnvDescriptor(variable string) core.SourceDescriptor {
 // The full digest, not a prefix. A truncated digest makes a collision suppress a
 // required rebuild, and there is no length worth defending for a value that is
 // compared and never displayed.
+//
+// PrincipalKey is still empty. Knowing the exact opaque token does not give the
+// pure descriptor a contract that all future tokens from this source name one
+// downstream principal; a replay consumer binds the concrete token instead.
 //
 // This is not a reintroduction of the token-keyed rate gate. That gate needed
 // **stability across rotation**; this key needs **instability across change**.

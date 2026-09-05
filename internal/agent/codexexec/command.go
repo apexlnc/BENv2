@@ -34,7 +34,14 @@ import (
 //     gets from --max-budget-usd.
 
 // command builds the argv for one attempt. The prompt is never part of it.
-func (p Provider) command(spec core.RunSpec) []string {
+//
+// It returns an error rather than a best-effort argv because one element is not
+// this adapter's to choose: the resume token comes from the child's own stream
+// (see the continuation branch). A caller that could ignore the refusal and use
+// the argv anyway would leave the check advisory, and there are exactly two
+// callers — Start and RemoteInvocation — each of which owes the orchestrator a
+// refusal with no process behind it (SPEC §7.3).
+func (p Provider) command(spec core.RunSpec) ([]string, error) {
 	argv := []string{p.Binary, "exec", "--json", "--sandbox", p.SandboxMode}
 
 	if p.Model != "" {
@@ -45,11 +52,21 @@ func (p Provider) command(spec core.RunSpec) []string {
 	// carried back opaquely by the orchestrator (SPEC §7.1). A resumed run
 	// reports the same thread id it was handed (verified against 0.147.0), so a
 	// continuation chain keeps one stable token.
+	//
+	// Opaque to the orchestrator, checked here: the token is the one argv element
+	// the *agent* chose, so it is validated where it is minted (validThreadID) and
+	// again here, independently, against the one property that matters to an argv
+	// (harness.CheckContinuationArgv). This is the adapter where it matters most —
+	// sandboxOverrides above exists to keep `sandbox_workspace_write.*` out of the
+	// agent's hands, and a flag-shaped token would hand it straight back.
 	if spec.Continuation != "" {
+		if err := harness.CheckContinuationArgv(spec.Continuation, ErrContinuationToken); err != nil {
+			return nil, err
+		}
 		argv = append(argv, "resume", spec.Continuation)
 	}
 	// The prompt arrives on stdin (SPEC §7.6).
-	return append(argv, "-")
+	return append(argv, "-"), nil
 }
 
 // sandboxOverrides pins every sandbox setting the workflow states, so the
@@ -65,8 +82,11 @@ func (p Provider) command(spec core.RunSpec) []string {
 // sandbox rather than inheriting one (see ErrSandboxMode), and a setting is only
 // stated if it is passed.
 //
-// So both keys are always emitted under workspace-write, false and empty
-// included. The roots travel as the `writable_roots` array rather than as
+// So all three keys are always emitted under workspace-write, false, empty and
+// the /tmp exclusion included. Codex otherwise grants /tmp implicitly, outside
+// both the workspace and the operator's add_dirs; excluding it makes the
+// declared write set complete while the separately reported TMPDIR remains
+// available. The roots travel as the `writable_roots` array rather than as
 // `--add-dir` so there is exactly one mechanism and no question about which
 // wins: a flag that merges with the config key would leave the inherited roots
 // standing. Values are pre-validated absolute and escape-free (checkAddDirs), so
@@ -75,7 +95,8 @@ func (p Provider) command(spec core.RunSpec) []string {
 // Nothing is emitted under danger-full-access: that mode sandboxes nothing, so
 // there is no boundary for the config file to widen. Key names and array syntax
 // verified against codex-cli 0.147.0 with `--strict-config`, which rejects an
-// unrecognized `-c` override.
+// unrecognized `-c` override. exclude_slash_tmp was additionally verified
+// against codex-cli 0.153.0 with that same strict parser.
 func (p Provider) sandboxOverrides() []string {
 	if p.SandboxMode != sandboxWorkspaceWrite {
 		return nil
@@ -87,6 +108,7 @@ func (p Provider) sandboxOverrides() []string {
 	return []string{
 		"-c", "sandbox_workspace_write.network_access=" + strconv.FormatBool(p.NetworkAccess),
 		"-c", "sandbox_workspace_write.writable_roots=[" + strings.Join(roots, ",") + "]",
+		"-c", "sandbox_workspace_write.exclude_slash_tmp=true",
 	}
 }
 

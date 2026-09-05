@@ -12,6 +12,32 @@ import (
 
 const advancedHeadSHA = "2222222222222222222222222222222222222222"
 
+// A remote provider has no local branch interval: the earlier publication is
+// already the new epoch's trusted base. Its typed provider fact still renders a
+// revision, while the baseline shift preserves this claim's full retry budget.
+func TestRemotePriorWorkRaisesTheAttemptFloorWithoutLocalFacts(t *testing.T) {
+	h := start(t, harnessOpts{
+		issues: []core.Issue{fake.Issue("1", epoch)},
+		hang:   true,
+		script: startedOnly,
+		configureWorkspaces: func(w *fake.Workspaces) {
+			w.SetPriorWork("1", true)
+		},
+	})
+	h.WaitState("1", StateRunning)
+
+	spec, ok := h.Runner.LastSpec()
+	if !ok {
+		t.Fatal("the provider-owned prior-work fact produced no RunSpec")
+	}
+	if got := spec.Env["BEN_ATTEMPT"]; got != "2" {
+		t.Errorf("BEN_ATTEMPT = %q, want 2", got)
+	}
+	if !containsAll(spec.Prompt, "Attempt 2", "previous outcome unknown") {
+		t.Errorf("remote revision prompt does not report attempt 2 with an unknown prior outcome:\n%s", spec.Prompt)
+	}
+}
+
 // SPEC §9.6, §9.10 gate 4 (#94): removing the required label releases the
 // claim and keeps the workspace. If the label later returns, the new record's
 // first Prepare reattaches that workspace and derives only what git proves:

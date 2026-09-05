@@ -60,6 +60,7 @@ When — and only when — the task is complete:
 1. Commit your changes. Work only on the branch already checked out here; never
    create, switch, or force-update branches.
 2. Push it: `git push origin HEAD`.
-3. Open a pull request against the default branch with `gh pr create`, and put
+3. Open a pull request against `{{ target_branch }}` with
+   `gh pr create --base {{ target_branch | shellescape }}`, and put
    `Fixes #{{ issue.identifier }}` in the body.
 4. Do not merge the pull request. Do not close the issue.

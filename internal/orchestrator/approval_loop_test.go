@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -489,7 +491,10 @@ func TestOnlyReapprovalMovesThePin(t *testing.T) {
 	// dispatching over it.
 	h.Tracker.Edit("1", epoch.Add(time.Hour), func(c *core.IssueContent) { c.Body = "edited body" })
 	h.Clock.Advance(time.Hour)
-	h.WaitState("1", StateNeedsReview)
+	// WaitParked, not WaitState: each re-queue below drops the `ben:*` labels,
+	// and doing that while the park's own projection is still owed is what makes
+	// the unpark decline (#276 — see WaitParked).
+	h.WaitParked("1", 1)
 
 	// A re-queue and nothing else. §9.2's unpark restores the budgets and
 	// resumes; it approves nothing (§6.7), so the re-dispatch meets the same
@@ -498,7 +503,7 @@ func TestOnlyReapprovalMovesThePin(t *testing.T) {
 	h.Tick()
 	h.WaitState("1", StateBackoff)
 	h.Clock.Advance(time.Hour)
-	h.WaitState("1", StateNeedsReview)
+	h.WaitParked("1", 2)
 	if n := h.Runner.StartCount(); n != 1 {
 		t.Fatalf("started %d run(s); a re-queue over unreapproved drift dispatched: %q", n, h.Runner.Prompts())
 	}
@@ -523,6 +528,161 @@ func TestOnlyReapprovalMovesThePin(t *testing.T) {
 	if strings.Contains(got, "approved body") {
 		t.Errorf("prompt after reapproval = %q; the pin did not move to the reapproved content", got)
 	}
+}
+
+// The interleaving #276 could not rule out from the flake alone: the unpark's
+// retry timer coming due *while the unpark's own label projection is still on
+// the serial effects queue*.
+//
+// The failing run's evidence could not separate two readings of it. Either the
+// assertion sampled a state the loop had already left (an observation race, fixed
+// by the barrier in WaitParked), or the loop genuinely mishandles this order —
+// re-parking the reapproved attempt because the projection it owes has not landed
+// — which would be a product bug and its own ticket. Timing alone cannot tell
+// them apart, so the order is staged here instead of waited for.
+//
+// The staging is deterministic, and rests on three properties of the loop rather
+// than on any sleep. The projection is held open in the tracker's label gate, on
+// the effects goroutine — which is not the authority goroutine, and does not hold
+// the tracker's lock (fake.SetStateLabels calls the gate before taking it), so
+// the retry's re-fetch runs to completion underneath it. `enqueue` is
+// non-blocking, so a held effect cannot stall the loop. And the retry's own timer
+// is the only waiter due before the poll interval, so advancing by exactly its
+// remaining delay fires it and nothing else.
+//
+// The result is the answer to the open question: §9.6's re-fetch is a decision
+// about approval, pin and slots, and it consults no owed state at all. The
+// projection being in flight is invisible to it — reading 2 is refuted, and the
+// three tests in this ticket are observation races.
+func TestARetryDueInsideTheUnparkProjectionStillReapproves(t *testing.T) {
+	issue := fake.Issue("1", epoch)
+	issue.Title, issue.Body = "approved title", "approved body"
+	h := start(t, harnessOpts{
+		definition: contentDefinition(t),
+		issues:     []core.Issue{issue},
+		script:     func(core.RunSpec, int) []core.Event { return fake.Fail(core.FailureCrashed) },
+	})
+	h.WaitState("1", StateBackoff)
+
+	// Park on drift, then reapprove — the same gesture TestOnlyReapprovalMovesThePin
+	// makes, so what is being staged is the interleaving and nothing else.
+	h.Tracker.Edit("1", epoch.Add(time.Hour), func(c *core.IssueContent) { c.Body = "edited body" })
+	h.Clock.Advance(time.Hour)
+	h.WaitParked("1", 1)
+	h.Tracker.AppendHistory("1",
+		core.ClaimEvent{Kind: core.ClaimEventUnlabeled, Actor: "a-labeler", Subject: "ben-queue", At: epoch.Add(2 * time.Hour)},
+		core.ClaimEvent{Kind: core.ClaimEventLabeled, Actor: "a-labeler", Subject: "ben-queue", At: epoch.Add(3 * time.Hour)},
+	)
+
+	// Reported by the gate, asserted by the test: the gate runs on the effects
+	// goroutine, and a t.Fatalf from there is a data race on the test's own state
+	// as well as a report the test binary need not survive.
+	var (
+		once   sync.Once
+		armed  atomic.Bool
+		staged atomic.Bool
+	)
+	staging := make(chan struct{})
+	poll := time.Duration(h.def.Config.Polling.IntervalMS) * time.Millisecond
+	h.Tracker.SetLabelGate(func() {
+		once.Do(func() {
+			// Closed last, and waited on below: the gate's own barriers outlast
+			// Tick's settle window, so reading its verdict on Tick's return would
+			// be the very race this test is about.
+			defer close(staging)
+			// One shot: from here the interleaving has been staged, and holding
+			// later projections open only slows the run down.
+			defer h.Tracker.SetLabelGate(nil)
+			decisions := h.applied(sigTimerFetched)
+			// enterBackoff owes this projection and *then* arms the timer, so the
+			// timer is not there yet when the gate is entered.
+			delay, ok := awaitRetryWait(h, poll)
+			if !ok {
+				return
+			}
+			armed.Store(true)
+			// Exactly the retry's remaining delay: the poll ticker's waiter still
+			// has the rest of the interval to run, so only the retry comes due.
+			h.Clock.Advance(delay)
+			staged.Store(awaitApplied(h, sigTimerFetched, decisions+1))
+		})
+	})
+
+	h.Tracker.Mutate("1", func(i *core.Issue) { i.Labels = withoutStateLabels(i.Labels) })
+	h.Tick()
+
+	// Generous, because it bounds two nested barriers rather than one piece of
+	// work: in the passing case the gate is already through by the time Tick's
+	// settle returns.
+	select {
+	case <-staging:
+	case <-time.After(4 * barrierBudget):
+		t.Fatal("the unpark never projected a label, so nothing was ever held open to stage the retry inside")
+	}
+	if !armed.Load() {
+		t.Fatalf("the retry timer never armed inside the unpark's projection; outstanding waits: %v (poll interval %s)",
+			h.Clock.Waits(), poll)
+	}
+	if !staged.Load() {
+		t.Fatal("the retry's re-fetch decision never landed while the unpark's projection was still in flight;" +
+			" the interleaving this test exists to stage did not happen")
+	}
+
+	waitFor(t, "the reapproved attempt", func() bool { return h.Runner.StartCount() == 2 })
+	if got := promptFor(t, h, 2); !strings.Contains(got, "edited body") || strings.Contains(got, "approved body") {
+		t.Errorf("prompt after reapproval = %q, want the content the labeler re-approved", got)
+	}
+	// The reading being refuted, stated as the loop's own record: a retry that
+	// parked instead of dispatching would have written a second `needs-review`.
+	if n := countState(h.o.Transitions.Path("1"), StateNeedsReview); n != 1 {
+		t.Errorf("parked %d time(s); the retry parked over an in-flight projection (path: %v)",
+			n, h.o.Transitions.Path("1"))
+	}
+}
+
+// awaitRetryWait blocks until an armed timer is due before the poll interval —
+// the retry, which is the only thing that waits less than a tick here — and
+// reports how long it still has to run.
+//
+// Callable off the test goroutine, so it reports rather than fails.
+func awaitRetryWait(h *harness, poll time.Duration) (time.Duration, bool) {
+	deadline := time.Now().Add(barrierBudget)
+	for time.Now().Before(deadline) {
+		shortest, found := time.Duration(0), false
+		for _, d := range h.Clock.Waits() {
+			if d < poll && (!found || d < shortest) {
+				shortest, found = d, true
+			}
+		}
+		if found {
+			return shortest, true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return 0, false
+}
+
+// awaitApplied blocks until the loop has finished handling n signals of a kind.
+// The off-goroutine form of harness.applied, for the same reason as above.
+func awaitApplied(h *harness, kind sigKind, n uint64) bool {
+	deadline := time.Now().Add(barrierBudget)
+	for time.Now().Before(deadline) {
+		if h.applied(kind) >= n {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+func countState(path []State, want State) int {
+	n := 0
+	for _, s := range path {
+		if s == want {
+			n++
+		}
+	}
+	return n
 }
 
 // The check is a dispatch-decision cost, not a per-tick one: reconciliation

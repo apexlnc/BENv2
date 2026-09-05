@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "name": "restart-converges",
+  "issue": {
+    "identifier": "7"
+  },
+  "attempts": [
+    {
+      "outcome": "running",
+      "session": "restart-1"
+    },
+    {
+      "outcome": "succeeded",
+      "session": "restart-2"
+    }
+  ],
+  "publication": "complete",
+  "steps": [
+    {
+      "action": "start",
+      "until": "running"
+    },
+    {
+      "action": "restart",
+      "until": "backoff",
+      "prior_run": "gone"
+    },
+    {
+      "action": "advance",
+      "until": "done"
+    }
+  ]
+}

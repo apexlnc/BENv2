@@ -1,0 +1,51 @@
+scenario: retry-to-success
+schema_version: 1
+
+step 1: start until=backoff
+observed:
+  - issue=7 state=backoff attempt=1 turns=0 failure=crashed
+  - labels=[ben-queue ben:claimed]
+  - assignees=[ben-bot]
+  - milestones=[claimed]
+  - prepares=1 runs=1 releases=0 disposals=0
+decisions:
+  - queued -> claimed: selected by dispatch; claim verified by read-back
+  - claimed -> preparing: claim verified
+  - preparing -> running: worktree ready, before_run passed, agent started
+  - running -> backoff: agent run failed
+effects:
+  - tracker: claim 7
+  - tracker: label 7=claimed
+  - tracker: comment 7=claimed
+  - tracker: label 7=running
+  - tracker: label 7=claimed
+  - workspace: prepare issue=7 attempt=1 epoch=2 base=1111111111111111111111111111111111111111
+  - runner: start #1
+  - workspace: run marker write #1
+  - workspace: run marker clear #1
+next: advance the manual clock after the retry delay
+
+step 2: advance until=done
+observed:
+  - issue=7 state=done attempt=2 turns=0 failure=crashed
+  - labels=[ben-queue]
+  - assignees=[ben-bot]
+  - milestones=[claimed published]
+  - prepares=2 runs=2 releases=0 disposals=1
+  - pull_request=https://example.test/pull/220
+decisions:
+  - backoff -> preparing: backoff fired; issue active and routable; slot free
+  - preparing -> running: worktree ready, before_run passed, agent started
+  - running -> verifying: runner reported succeeded
+  - verifying -> done: publish evidence complete
+effects:
+  - tracker: label 7=running
+  - tracker: label 7=claimed
+  - tracker: label 7=
+  - tracker: comment 7=published
+  - workspace: prepare issue=7 attempt=2 epoch=2 base=1111111111111111111111111111111111111111
+  - runner: start #2
+  - workspace: run marker write #2
+  - workspace: run marker clear #2
+  - workspace: dispose key=issue-7 keep=false
+next: issue merge or close

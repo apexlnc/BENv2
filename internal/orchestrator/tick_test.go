@@ -71,7 +71,7 @@ func TestReconciliationRunsWhileTheCandidateFetchHangs(t *testing.T) {
 
 // SPEC §9.5: "`limits.max_concurrent_agents` caps live agent processes — the
 // one scarce resource." Verification is not one. It runs only after the process
-// group is confirmed gone (§7.5), reads git and the tracker, and can be slow —
+// domain is confirmed quiet (§7.5), reads git and the tracker, and can be slow —
 // it probes origin and calls FindPR. Counting it capped concurrency on
 // something that is not executing, so a slow tracker starved dispatch entirely
 // while no agent was running at all.
@@ -95,7 +95,7 @@ func TestVerificationDoesNotHoldAnAgentSlot(t *testing.T) {
 		}),
 	})
 
-	// Reaching the verifier at all means the run ended and its process group
+	// Reaching the verifier at all means the run ended and its execution domain
 	// was confirmed gone, so what follows is about the slot and not a race
 	// with the agent still holding it.
 	waitFor(t, "verification to begin", func() bool { return entered.Load() == 1 })

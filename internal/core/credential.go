@@ -127,7 +127,8 @@ func CredentialAuthority(err error) string {
 // entry; it is not part of what the entry *is*, and a descriptor carrying one
 // would make a rename a rebuild.
 type SourceDescriptor struct {
-	// Kind is the registered source kind, e.g. "octo_sts" or "static".
+	// Kind is the registered source kind, e.g. "octo_sts", "projected_oidc"
+	// or "static".
 	Kind string
 	// Authority is CREDENTIAL IDENTITY — deliberately narrow. Two sources with
 	// equal Authority are one credential, so this is what the split refusal
@@ -149,6 +150,18 @@ type SourceDescriptor struct {
 	// that value instead, which is comparable, non-secret, and sensitive to the
 	// one field that matters (SPEC §5.4).
 	BindingKey string
+	// PrincipalKey is populated only when the source definition itself fixes
+	// the downstream service principal for every token it can return. For
+	// octo_sts, the canonical issuer, scope and workload identity do. A
+	// projected_oidc source verifies its configured tenant and subject in every
+	// token. An opaque static token does not, because changing one $VAR can
+	// change tenant and subject without changing Authority or BindingKey.
+	//
+	// The value is non-secret and stable across ordinary token rotation. A
+	// consumer whose replay domain is principal-scoped may persist a digest of
+	// it; when it is empty, that consumer must instead bind the concrete token
+	// or refuse ambiguous replay.
+	PrincipalKey string
 	// MinFreshTTL is the shortest remaining lifetime this kind promises a
 	// freshly minted token. Zero means the kind is explicitly UNBOUNDED —
 	// `static` and every legacy spelling — and every TTL gate is skipped.
@@ -189,6 +202,28 @@ const (
 	PurposeTracker   Purpose = "tracker"
 	PurposeWorkspace Purpose = "workspace"
 	PurposePublish   Purpose = "publish"
+	// PurposeSubstrate authenticates BEN to a v2 execution backend (#194, #46).
+	//
+	// A fourth partition rather than reuse of one of §10.2's three, because it
+	// is a fourth consumer with a fourth blast radius: the token that provisions
+	// sandboxes cannot rewrite the queue and cannot push a branch, and the whole
+	// argument for keeping the first three apart is that a cache shared between
+	// consumers of different authority is one credential wearing three names.
+	//
+	// It selects a partition and an audit label, never an identity — the rule
+	// above binds it exactly as it binds the others. A workflow that pointed the
+	// substrate at the tracker's credential source is refused at load, not
+	// silently served from a different cache slot.
+	PurposeSubstrate Purpose = "substrate"
+	// PurposeReview authenticates the #204 review controller.
+	//
+	// A fifth partition, for PurposeSubstrate's reason applied to a fifth blast
+	// radius: this token may publish an advisory review, remove exactly one
+	// assignment and revoke one required label, and it must be able to do
+	// nothing else. #11's whole safety argument is that the controller, the claim
+	// principal and the tracker author are three identities; a cache shared with
+	// either of the others is that argument dissolved.
+	PurposeReview Purpose = "review"
 )
 
 // Token is one credential and the deadline its source stands behind.

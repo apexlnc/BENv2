@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -252,5 +253,45 @@ func TestProvenanceRecordsEveryInterpolatedVariable(t *testing.T) {
 	}
 	if got := origin.EnvVarLabel(); got != "$FIRST, $SECOND" {
 		t.Errorf("EnvVarLabel = %q, want both variables named", got)
+	}
+}
+
+// The remote adapter is a consumer of provenance, not of the resolved secret:
+// every provider leaf's source must survive AgentBinding even when the same
+// variable is renamed into env or bound to argv. The literal table is
+// independent of providerEnvSources so dropping either path is visible.
+func TestAgentBindingCarriesEveryProviderSource(t *testing.T) {
+	t.Setenv("GH_TOKEN", "ghp-reusable-MUST-NOT-CROSS")
+	def, err := Load(writeWorkflow(t, workflowWith("", "    env:\n      AGENT_FLAG: $GH_TOKEN\n    model: $GH_TOKEN\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []core.ProviderEnvSource{
+		{Variable: "GH_TOKEN", Field: "agent.provider.env.AGENT_FLAG"},
+		{Variable: "GH_TOKEN", Field: "agent.provider.model"},
+	}
+	if got := def.Config.AgentBinding().ProviderEnvSources; !slices.Equal(got, want) {
+		t.Fatalf("ProviderEnvSources = %+v, want %+v", got, want)
+	}
+}
+
+// A source-only edit can leave the resolved provider block byte-for-byte equal.
+// It still rebuilds the runner because the remote safety decision changed.
+func TestAgentBindingChangesWhenOnlyProviderSourceChanges(t *testing.T) {
+	t.Setenv("GH_TOKEN", "same-value")
+	t.Setenv("SAFE_MODEL", "same-value")
+	github, err := Load(writeWorkflow(t, workflowWith("", "    model: $GH_TOKEN\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	safe, err := Load(writeWorkflow(t, workflowWith("", "    model: $SAFE_MODEL\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(github.Config.Agent.Provider, safe.Config.Agent.Provider) {
+		t.Fatal("control failed: resolved provider blocks differ")
+	}
+	if reflect.DeepEqual(github.Config.AgentBinding(), safe.Config.AgentBinding()) {
+		t.Fatal("a provider source-only edit did not change the agent binding")
 	}
 }

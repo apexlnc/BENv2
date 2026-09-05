@@ -5,7 +5,7 @@
 // event (SPEC §3.6).
 //
 // It is the second adapter, and it exists to keep the first one honest: the
-// process lifecycle, liveness windows, signal ladder, environment composition,
+// process lifecycle, liveness windows, execution-domain teardown, environment composition,
 // and transcript retention are shared with claude-code in internal/agent/harness,
 // and both adapters run the same conformance suite (internal/agent/agenttest)
 // unmodified. What is left here is genuinely codex-shaped — an argv, an
@@ -24,10 +24,10 @@
 //
 // It also happens to justify one of the shared runtime's choices out loud: the
 // `codex` on PATH is a launcher that spawns the platform binary as a child, so
-// the process this adapter starts is never the process doing the work. Stopping
-// the leader alone would leave the real harness running in the workspace; the
-// SIGTERM→grace→SIGKILL ladder is driven by the process *group* (SPEC §7.5),
-// which is what makes that invisible here.
+// the process this adapter starts is never the only process doing the work.
+// Stopping that direct child alone would leave the real harness running in the
+// workspace; §7.5's execution domain accounts for the complete PID namespace,
+// including children that create another process group or session.
 //
 // # The agent.provider block
 //
@@ -86,6 +86,7 @@ package codexexec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -105,7 +106,9 @@ const KindName = "codex-exec"
 
 // Kind is the package-level agent.kind registration (SPEC §5.7, §7.1; BUILD
 // assembly decision 13): the entry points that exist before any runner does.
-type Kind struct{}
+// domain is an unexported contract-test seam; registry construction leaves it
+// nil and therefore selects the process-lifetime production domain.
+type Kind struct{ domain harness.ExecutionDomain }
 
 var _ core.RunnerKind = Kind{}
 
@@ -116,6 +119,26 @@ var _ core.RunnerKind = Kind{}
 func (Kind) Structural(cfg core.AgentConfig) error {
 	_, err := ParseProvider(cfg)
 	return err
+}
+
+// LocalWrites reports the complete write scope beyond the workspace and
+// inherited TMPDIR. An unsandboxed run is explicitly unbounded: add_dirs and
+// TMPDIR are then strict subsets, not the write boundary. Parsing through
+// ParseProvider is load-bearing: the grant and its declaration cannot disagree
+// about a key.
+func (Kind) LocalWrites(cfg core.AgentConfig, _ core.LocalRuntimePaths) (core.LocalWriteScope, error) {
+	p, err := ParseProvider(cfg)
+	if err != nil {
+		return core.LocalWriteScope{}, err
+	}
+	if p.SandboxMode == sandboxFullAccess {
+		return core.LocalWriteScope{Unbounded: true}, nil
+	}
+	roots := slices.Clone(p.AddDirs)
+	if tmp, ok := p.Env["TMPDIR"]; ok {
+		roots = append(roots, tmp)
+	}
+	return core.LocalWriteScope{Roots: roots}, nil
 }
 
 // ForwardedEnvVars names the variables this adapter copies into a child by
@@ -147,7 +170,7 @@ func (Kind) Model(provider map[string]any) (string, []string) {
 // The nil is returned explicitly rather than as a typed *Runner: a refusal must
 // leave the caller with a nil interface, or `runner, err := kind.New(...)`
 // hands back something non-nil to call methods on after it has already failed.
-func (Kind) New(opts core.RunnerOptions) (core.AgentRunner, error) {
+func (k Kind) New(opts core.RunnerOptions) (core.AgentRunner, error) {
 	r, err := New(Options{
 		Provider:       opts.Provider,
 		Publish:        opts.Publish,
@@ -155,6 +178,7 @@ func (Kind) New(opts core.RunnerOptions) (core.AgentRunner, error) {
 		TranscriptDir:  opts.TranscriptDir,
 		OnRun:          opts.OnRun,
 		Timings:        harness.Timings{StopGrace: opts.StopGrace},
+		Domain:         k.domain,
 	})
 	if err != nil {
 		return nil, err
@@ -190,14 +214,12 @@ type Runner struct {
 
 	transcripts harness.TranscriptStore
 	onRun       core.RunEvidenceSink
+	domain      harness.ExecutionDomain
 	// redact are the bound block's credential values, kept out of retained
 	// transcripts (SPEC §10.3). Read off credentialKeys through
 	// harness.CredentialValues, so this adapter states each credential once.
 	redact  []string
 	timings harness.Timings
-	// signal sends sig to a process group; injectable so a test can simulate a
-	// process the kernel will not kill for us.
-	signal harness.SignalFunc
 }
 
 // Options configures a Runner.
@@ -223,9 +245,9 @@ type Options struct {
 	// every issue, so a sink that could not name the workspace would upgrade the
 	// wrong marker.
 	OnRun core.RunEvidenceSink
-
-	// signal is test-only (see Runner.signal).
-	signal harness.SignalFunc
+	// Domain overrides the process-lifetime Linux execution domain in contract
+	// tests. Production leaves it nil.
+	Domain harness.ExecutionDomain
 }
 
 // New binds the provider configuration to a runner. Binding at construction is
@@ -239,6 +261,10 @@ func New(opts Options) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	domain := opts.Domain
+	if domain == nil {
+		domain = harness.LocalDomain()
+	}
 	r := &Runner{
 		provider:       p,
 		publish:        opts.Publish,
@@ -246,8 +272,8 @@ func New(opts Options) (*Runner, error) {
 		redact:         harness.CredentialValues(opts.Provider, credentialKeys),
 		transcripts:    opts.Transcripts,
 		onRun:          opts.OnRun,
+		domain:         domain,
 		timings:        opts.Timings,
-		signal:         opts.signal,
 	}
 	if r.transcripts == nil {
 		if opts.TranscriptDir != "" {
@@ -262,15 +288,20 @@ func New(opts Options) (*Runner, error) {
 // Capabilities reports what this harness supports (SPEC §7.1). Resume is the
 // thread id carried in RunSpec.Continuation; usage is the token counts on the
 // turn.completed line — without a cost, which core.Usage allows for.
-func (r *Runner) Capabilities() core.Capabilities {
-	return core.Capabilities{Resume: true, Usage: true}
-}
+func (r *Runner) Capabilities() core.Capabilities { return capabilities() }
+
+// capabilities is the one declaration behind both substrates — see
+// claudecode.capabilities for why it is a function and why there is only one.
+func capabilities() core.Capabilities { return core.Capabilities{Resume: true, Usage: true} }
 
 // Ready checks the bound configuration against the world: the binary exists,
 // identifies itself as the Codex CLI, and has a plausible credential
 // (SPEC §7.1). Catching any of it here is the difference between one loud
 // refusal at startup and every dispatch burning a workspace to rediscover it.
 func (r *Runner) Ready(ctx context.Context) error {
+	if err := r.domain.Ready(ctx); err != nil {
+		return fmt.Errorf("%w: %w", ErrExecutionDomain, err)
+	}
 	path, err := r.resolveBinary()
 	if err != nil {
 		return err
@@ -329,7 +360,10 @@ func (r *Runner) Start(ctx context.Context, spec core.RunSpec) (core.RunHandle, 
 	if err != nil {
 		return nil, err
 	}
-	argv := p.command(spec)
+	argv, err := p.command(spec)
+	if err != nil {
+		return nil, err
+	}
 	argv[0] = binary
 
 	// Per attempt, before the environment is composed. Refusing here costs one
@@ -353,7 +387,7 @@ func (r *Runner) Start(ctx context.Context, spec core.RunSpec) (core.RunHandle, 
 	if err != nil {
 		return nil, fmt.Errorf("codex-exec: %w", err)
 	}
-	return harness.Start(ctx, harness.Launch{
+	handle, err := harness.Start(ctx, harness.Launch{
 		Name:       KindName,
 		Argv:       argv,
 		Env:        env,
@@ -366,8 +400,12 @@ func (r *Runner) Start(ctx context.Context, spec core.RunSpec) (core.RunHandle, 
 		Redact:     redact,
 		OnRun:      harness.BindEvidence(r.onRun, spec),
 		Timings:    r.timings,
-		Signal:     r.signal,
+		Domain:     r.domain,
 	})
+	if errors.Is(err, harness.ErrExecutionDomain) {
+		return nil, fmt.Errorf("%w: %w", ErrExecutionDomain, err)
+	}
+	return handle, err
 }
 
 // specErrors names this adapter's refusals for the shared RunSpec checks

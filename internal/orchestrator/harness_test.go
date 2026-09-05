@@ -225,6 +225,10 @@ type harnessOpts struct {
 	prepRetry   func(error) bool
 	issues      []core.Issue
 	workspaces  Workspaces
+	// wrapWorkspaces decorates the concrete fake after the harness constructs
+	// it, for optional provider seams whose absence is itself part of the
+	// default fixture's contract.
+	wrapWorkspaces func(*fake.Workspaces) Workspaces
 	// configureWorkspaces applies concrete fake-provider state before the first
 	// tick. It is for cross-boundary cases whose bug is in the provider shape,
 	// not an orchestrator-only scripted return.
@@ -243,21 +247,21 @@ type harnessOpts struct {
 	// (see core.Termination) and the wrong one for the many tests that are not
 	// about retention and just need a stop that works.
 	//
-	// Pair it with `descendants` whenever the run *ends* during the test. Stop's
-	// answer is this knob; Probe's is derived from the group (fake Handle.Probe),
-	// so a run that reaches Done with nothing outliving it has a group Probe
-	// rightly calls gone and a Stop that says otherwise — a world the harness
+	// Pair it with `domainMembers` whenever the run *ends* during the test. Stop's
+	// answer is this knob; Probe's is derived from the domain (fake Handle.Probe),
+	// so a run that reaches Done with nothing outliving it has a domain Probe
+	// rightly calls quiet and a Stop that says otherwise — a world the harness
 	// cannot produce, and one where the pre-Done probe routes the very outcome
 	// the test is asserting was held (#100, #103's family). A run held open for
 	// the whole test (`hang`) has no such gap: the process is alive, so both
 	// answers agree without the pairing.
 	stopUnconfirmed bool
-	// holdDone keeps `done` open after the group has gone quiet — the state a real
+	// holdDone keeps `done` open after the domain has gone quiet — the state a real
 	// harness is in while its transcript finishes writing (#79).
 	holdDone bool
-	// descendants makes each run's process group outlive its process, so Probe
+	// domainMembers makes each run's execution domain outlive its process, so Probe
 	// answers unconfirmed even after Done and only a Stop clears it (#79).
-	descendants bool
+	domainMembers bool
 	// probeGate blocks inside Probe, for testing a decision that overtakes an
 	// observation already out (#79).
 	probeGate func()
@@ -265,7 +269,7 @@ type harnessOpts struct {
 	// land *between* two events of one run — a drain arriving mid-stream, say.
 	eventGate func(int)
 	// stopGate blocks inside Stop, for testing a decision that overtakes a
-	// signal ladder already walking.
+	// domain teardown already running.
 	stopGate func()
 	// startGate blocks inside Start, for testing a decision that lands while a
 	// launch is still out — including one that will answer with an error.
@@ -301,10 +305,13 @@ type harnessOpts struct {
 	// recoverErr tolerates a failed recovery pass, for the fixtures that make the
 	// candidate read fail on purpose (§6.4 warn and continue).
 	recoverErr bool
-	// runGone answers §9.10's "is that run's group gone" for an identified marker.
+	// runGone answers §9.10's "is that run's domain quiet" for an identified marker.
 	// Nil is a daemon with no prober, which is what makes every identified marker
 	// possibly-live.
 	runGone func(core.RunEvidence) (bool, error)
+	// resolveRun is the authority-gated prober that may replay an unanswered
+	// remote start. Most tests need only the read-only runGone seam.
+	resolveRun func(core.Issue, core.RunEvidence, int64) (bool, error)
 	// failures is the §9.10 step 6 transition-log reader. Nil is the missing
 	// capability the startup warning names.
 	failures FailureReasonReader
@@ -488,7 +495,7 @@ func start(t *testing.T, opts harnessOpts) *harness {
 	if opts.stopUnconfirmed {
 		h.Runner.SetStopTermination(core.TerminationUnconfirmed)
 	}
-	h.Runner.SetDescendants(opts.descendants)
+	h.Runner.SetDomainMembers(opts.domainMembers)
 	h.Runner.SetHoldDone(opts.holdDone)
 	h.Runner.SetStopGate(opts.stopGate)
 	h.Runner.SetStartGate(opts.startGate)
@@ -528,6 +535,8 @@ func start(t *testing.T, opts harnessOpts) *harness {
 	var workspaces Workspaces = h.Workspaces
 	if opts.workspaces != nil {
 		workspaces = opts.workspaces
+	} else if opts.wrapWorkspaces != nil {
+		workspaces = opts.wrapWorkspaces(h.Workspaces)
 	} else if opts.withHook {
 		h.Hooked = fake.NewHookedWorkspaces(h.Workspaces)
 		workspaces = h.Hooked
@@ -549,6 +558,7 @@ func start(t *testing.T, opts harnessOpts) *harness {
 		Workspaces:     workspaces,
 		Runner:         h.Runner,
 		Verifier:       opts.verifier,
+		ResolveRun:     opts.resolveRun,
 		ClaimPrincipal: fake.DefaultPrincipal,
 		// Stated for every harness, not only the telemetry tests: an outcome
 		// record naming nothing would let a wiring change that dropped the
@@ -803,6 +813,38 @@ func (h *harness) WaitState(identifier string, want State) {
 		time.Sleep(time.Millisecond)
 	}
 	h.t.Fatalf("issue %s is %q, want %q (path: %v)", identifier, got, want, h.o.Transitions.Path(identifier))
+}
+
+// WaitParked is the barrier for a park: the record has reached `needs-review`
+// *and* the loop has acknowledged the projection that park owed.
+//
+// WaitState alone is not that barrier, and the difference is a real race rather
+// than a slow write. `needs-review` is not terminal — §9.8's sweep unparks it —
+// and the label the park owes is still on the owed queue when the record's state
+// changes. A test that drops the `ben:*` labels on the strength of WaitState
+// alone races the pending write two ways: the write re-adds the label, so
+// applyParked declines against `hasStateLabel(fresh)`; or the sweep's read
+// carries `labelsSettled=false` and applyParked declines on that. Either way the
+// unpark is silently skipped and whatever the test waits for next never comes
+// (#276; #86 and #103 are the same wait-on-X-assert-on-Y shape elsewhere).
+//
+// The acknowledgement is the milestone comment, which is strictly later than the
+// label write it stands for: enterNeedsReview queues the projection and *then*
+// the comment onto one head-of-line queue (owed.go), so a posted comment can only
+// mean onEffectDone dequeued the projection ahead of it — which is exactly the
+// fact the unpark rule reads. Observing the label itself would not do: that
+// proves the write landed, not that the loop has stopped owing it.
+//
+// Parks are counted rather than tested for presence because a record can park
+// more than once, and each park owes its own projection.
+func (h *harness) WaitParked(identifier string, occurrence int) {
+	h.t.Helper()
+	h.WaitState(identifier, StateNeedsReview)
+	what := fmt.Sprintf("park %d of issue %s to be acknowledged: the needs-review comment queued behind its projection",
+		occurrence, identifier)
+	waitFor(h.t, what, func() bool {
+		return milestoneCount(h.Tracker.CommentsFor(identifier), core.MilestoneNeedsReview) >= occurrence
+	})
 }
 
 // notLaunched is every state SPEC §9.2 lets `preparing` leave for other than
@@ -1087,15 +1129,15 @@ func TestAppliedCountsHandledNotDequeued(t *testing.T) {
 
 // waitStopApplied blocks until the loop has handled n stop results.
 //
-// The rule, which holds for *every* tick a test fires expecting a ladder to
-// follow it, not just the first: acknowledge the previous ladder's answer before
+// The rule, which holds for *every* tick a test fires expecting teardown to
+// follow it, not just the first: acknowledge the previous Stop answer before
 // firing it. `StopCount()` cannot serve, because the fake counts the call at
 // entry, and between those two facts `beginStop`'s single-slot guard turns the
 // tick into a no-op — after which the unconfirmed answer clears the flag and
 // schedules nothing, so with a manual clock there is no later tick to recover it
 // and the test hangs to its deadline on a fact nothing will produce.
 //
-// Both ticks in the ordinary shape need it, one ladder apart: the tick that must
+// Both ticks in the ordinary shape need it, one Stop apart: the tick that must
 // *retry* the stop (n=1) and the tick that must ask again after the test flips
 // the answer to confirmed (n=2). #106's review found the second one after the
 // first was fixed, which is the argument for stating the rule here rather than
@@ -1107,7 +1149,7 @@ func (h *harness) waitStopApplied(n uint64) {
 	})
 }
 
-// waitForGroupQuestion blocks until §7.5's question — is this run's process group
+// waitForDomainQuestion blocks until §7.5's question — is this run's execution domain
 // gone — has been put to a run and **the post-`Done` Stop's answer has been
 // handled**. It is the barrier the "nothing followed the run" negatives need.
 //
@@ -1130,17 +1172,17 @@ func (h *harness) waitStopApplied(n uint64) {
 // on every run, and post-`Done` §7.5 makes the question a Stop.
 //
 // What keeps the negatives sound *after* the barrier is the fixture, not the
-// barrier: under descendants+stopUnconfirmed every answer is `unconfirmed`, so
+// barrier: under domainMembers+stopUnconfirmed every answer is `unconfirmed`, so
 // once one has been handled and refused, nothing can route until the test changes
 // what Stop reports. They hold for as long as that stands rather than for an
 // interval — and the same acknowledgement is what the tick after the flip needs,
 // so it is not repeated there.
-func (h *harness) waitForGroupQuestion(run *fake.Handle) {
+func (h *harness) waitForDomainQuestion(run *fake.Handle) {
 	h.t.Helper()
 	if run == nil {
-		h.t.Fatal("no run was started, so nothing could have asked about its process group")
+		h.t.Fatal("no run was started, so nothing could have asked about its execution domain")
 	}
-	waitFor(h.t, "§7.5's group question to be put to the run (a Probe before Done, a Stop after it)", func() bool {
+	waitFor(h.t, "§7.5's domain-quiet question to be put to the run (a Probe before Done, a Stop after it)", func() bool {
 		return run.ProbeCount()+run.StopCount() > 0
 	})
 	h.waitStopApplied(1)

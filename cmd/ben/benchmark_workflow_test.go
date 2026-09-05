@@ -31,7 +31,7 @@ func TestBenchmarkProfilesHoldEveryNonAgentInputConstant(t *testing.T) {
 
 	var baseline config.Config
 	var prompt string
-	agentBaselines := map[string]config.AgentConfig{}
+	agentBaselines := map[string]map[string]any{}
 	for i, p := range profiles {
 		path := filepath.Join(moduleRoot(t), "scripts", "benchmark", p.file)
 		def, err := config.Load(path)
@@ -42,9 +42,8 @@ func TestBenchmarkProfilesHoldEveryNonAgentInputConstant(t *testing.T) {
 			t.Errorf("%s selects %s model %#v, want %s model %q", p.file,
 				def.Config.Agent.Kind, def.Config.Agent.Provider["model"], p.agent, p.model)
 		}
-		agent := def.Config.Agent
-		agent.Provider = maps.Clone(agent.Provider)
-		agent.Provider["model"] = ""
+		agent := maps.Clone(def.Config.Agent.Provider)
+		agent["model"] = ""
 		if want, ok := agentBaselines[p.agent]; ok {
 			if !reflect.DeepEqual(agent, want) {
 				t.Errorf("%s changes %s provider input other than model:\n got  %#v\n want %#v",

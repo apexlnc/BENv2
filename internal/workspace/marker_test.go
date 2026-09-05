@@ -13,7 +13,7 @@ import (
 
 func markerProvider(t *testing.T) *Provider {
 	t.Helper()
-	p, err := New(Options{
+	p, err := providerFromOptions(t, Options{
 		Root:        t.TempDir(),
 		WorkflowKey: "wf",
 		Repository:  repo("https://github.com/o/r.git"),

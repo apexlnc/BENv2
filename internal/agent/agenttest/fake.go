@@ -3,6 +3,7 @@ package agenttest
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/srhg-ai-7cef3f93/ben/internal/agent/harness"
 	"io"
 	"os"
 	"os/exec"
@@ -39,8 +40,9 @@ const (
 	// rather than hoped for. Unset means no delay.
 	SlowStartEnv = "FAKE_HARNESS_SLOW_START"
 	// AuthEnv and ProbeEnv drive the adapter-supplied Probe: what its
-	// credential check should answer, and whether its version check should leak
-	// a child holding stdout.
+	// credential check should answer, and what its version check should do
+	// besides answer — "leak" a child holding stdout (LeakPipeHolder), or
+	// "flood" stdout past the bound the probe retains (FloodProbe).
 	AuthEnv  = "FAKE_HARNESS_AUTH"
 	ProbeEnv = "FAKE_HARNESS_PROBE"
 )
@@ -58,6 +60,7 @@ const (
 	scriptSurvivor       = "survivor"
 	scriptStopThenWrite  = "stop-then-write"
 	scriptBigLine        = "big-line"
+	scriptOversizedLine  = "oversized-line"
 	scriptLinger         = "linger"
 	scriptChatty         = "chatty"
 	scriptManyLines      = "many-lines"
@@ -68,7 +71,21 @@ const (
 	scriptPipeHolder     = "pipe-holder"
 	scriptGarbage        = "garbage"
 	scriptEchoEnv        = "echo-env"
+	scriptUntrustedID    = "untrusted-session-id"
+	scriptUniversalOK    = "universal-success"
+	scriptUniversalFail  = "universal-failure"
+	scriptUniversalLive  = "universal-live"
 )
+
+// HostileSessionID is the identity scriptUntrustedID announces: a token shaped
+// like a flag rather than like a session id (#233).
+//
+// One constant serves both harnesses because the hazard is not harness-shaped.
+// The session or thread id an adapter reads off the child's stream is the one
+// argv element the *agent* chose, and every argv reads a leading `-` the same
+// way — so a token like this is what the harness would be handed as an option
+// on the next attempt if the adapter minted a continuation from it.
+const HostileSessionID = "--config=ben.hostile=1"
 
 // NoStreamStderr is what scriptNoStream writes to stderr: the shape of
 // explanation a real harness gives when it refuses before streaming anything.
@@ -172,9 +189,34 @@ func runFake(f Fake, args []string) {
 
 	out := os.Stdout
 	switch script {
+	case scriptUniversalOK:
+		f.Init(out)
+		f.Text(out, successText)
+		f.Success(out)
+		os.Exit(0)
+
+	case scriptUniversalFail:
+		f.Init(out)
+		os.Exit(3)
+
+	case scriptUniversalLive:
+		f.Init(out)
+		time.Sleep(60 * time.Second)
+		os.Exit(0)
+
 	case scriptSuccess:
 		f.Init(out)
 		f.Private(out)
+		f.Text(out, successText)
+		f.Success(out)
+		os.Exit(0)
+
+	case scriptUntrustedID:
+		// A healthy run that announces an identity no adapter may resume from
+		// (#233). Healthy on purpose: the announcement is a line like any other,
+		// so refusing it costs the resume and must not cost the attempt
+		// (SPEC §7.2).
+		f.InitUntrusted(out)
 		f.Text(out, successText)
 		f.Success(out)
 		os.Exit(0)
@@ -260,6 +302,16 @@ func runFake(f Fake, args []string) {
 		f.Init(out)
 		f.Text(out, strings.Repeat("x", bigLine))
 		f.Success(out)
+		os.Exit(0)
+
+	case scriptOversizedLine:
+		// One assistant line past the scanner ceiling, then silence (#235). The
+		// scanner cannot continue past it, so nothing but the adapter's own
+		// verdict can end this run: the script never terminates on its own, and
+		// the case that drives it sets no liveness window.
+		f.Init(out)
+		f.Text(out, strings.Repeat("x", harness.MaxScanLine+1))
+		time.Sleep(60 * time.Second)
 		os.Exit(0)
 
 	case scriptLinger:
@@ -403,7 +455,7 @@ func DumpInvocation(prompt string) {
 // when ProbeEnv is set; it is what makes an unbounded post-exit wait — and an
 // orphaned probe child — observable.
 func LeakPipeHolder() {
-	if os.Getenv(ProbeEnv) == "" {
+	if os.Getenv(ProbeEnv) != "leak" {
 		return
 	}
 	self, err := os.Executable()
@@ -424,6 +476,30 @@ func LeakPipeHolder() {
 	// reason that is not a defect.
 	if path := os.Getenv(PIDEnv); path != "" {
 		os.WriteFile(path, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600)
+	}
+}
+
+// FloodProbe writes past the bound a readiness probe retains
+// (harness.MaxProbeOutput) when the suite asks for it (ProbeEnv "flood"). A
+// Fake calls it from its version probe *after* printing the answer the adapter
+// reads, so a refusal is the bound speaking and not a missing marker — the head
+// of the output is exactly what would have passed.
+func FloodProbe() {
+	if os.Getenv(ProbeEnv) != "flood" {
+		return
+	}
+	Flood(os.Stdout)
+}
+
+// Flood writes more than harness.MaxProbeOutput bytes to w, in whole lines of
+// low-entropy text. Exported for a Fake that has to flood a stream of its own
+// choosing — codex's login probe answers on stderr.
+func Flood(w io.Writer) {
+	chunk := []byte(strings.Repeat("x", 4095) + "\n")
+	for written := 0; written <= harness.MaxProbeOutput; written += len(chunk) {
+		if _, err := w.Write(chunk); err != nil {
+			return
+		}
 	}
 }
 

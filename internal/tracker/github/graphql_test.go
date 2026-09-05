@@ -97,6 +97,17 @@ func (f *fakeGitHub) handleGraphQL(answer func() graphQLIssue) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// The absent-issue contract suite drives every GraphQL issue read through
+		// this independently anchored handler. RemotePR asks different fields but
+		// must classify the same null repository.issue as issue absence.
+		if strings.Contains(payload.Query, "closingIssuesReferences") {
+			if got := payload.Variables["issue"]; got != float64(7) {
+				f.t.Errorf("query variable issue = %v, want the issue number", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":{"repository":{"issue":null,"pullRequests":{"totalCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}}`)) //nolint:errcheck // test server
+			return
+		}
 		// The query has to ask for both facts, or the fixtures below prove
 		// nothing about what a real server would return.
 		for _, want := range []string{"lastEditedAt", "RENAMED_TITLE_EVENT"} {

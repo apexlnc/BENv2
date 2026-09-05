@@ -209,8 +209,9 @@ var rootBinding = object(map[string]field[Vars]{
 		}
 		return v.Attempt
 	}},
-	"workspace": text(func(v Vars) string { return v.Workspace }),
-	"run":       nested(runBinding, func(v Vars) Run { return v.Run }),
+	"workspace":     text(func(v Vars) string { return v.Workspace }),
+	"target_branch": text(func(v Vars) string { return v.TargetBranch }),
+	"run":           nested(runBinding, func(v Vars) Run { return v.Run }),
 })
 
 // rootScope is the walk's base scope. It is a copy: a top-level

@@ -14,23 +14,40 @@ import (
 	"testing"
 
 	"github.com/srhg-ai-7cef3f93/ben/internal/agent/agenttest"
+	"github.com/srhg-ai-7cef3f93/ben/internal/agent/runnertest"
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 )
 
-// TestMain lets the test binary re-exec itself as the fake harness: process
-// discipline (SPEC §7.5) and liveness (§7.4) are only real if they are tested
-// against a real process.
-func TestMain(m *testing.M) { agenttest.Main(m, fake{}, cohort) }
+// TestMain lets the test binary re-exec itself as the fake harness: stream
+// lifecycle and liveness (§7.4) are only real if tested against a real process.
+// localdomain's own tests prove the production §7.5 containment mechanism.
+func TestMain(m *testing.M) {
+	agenttest.Main(m, fake{}, cohort)
+}
 
 // The B06 conformance suite, run unmodified — the ticket's acceptance criterion
 // and the whole claim behind "agent-agnostic" (BUILD B07). What is
 // codex-specific lives below it.
 func TestConformance(t *testing.T) { agenttest.Run(t, contract()) }
 
+func TestUniversalContract(t *testing.T) {
+	parallel(t)
+	runnertest.Run(t, agenttest.Universal(contract()))
+}
+
+// newTestRunner keeps process-backed adapter tests portable while production
+// New remains fail-closed outside the approved Linux domain.
+func newTestRunner(opts Options) (*Runner, error) {
+	if opts.Domain == nil {
+		opts.Domain = agenttest.Domain()
+	}
+	return New(opts)
+}
+
 func contract() agenttest.Contract {
 	return agenttest.Contract{
 		Name: KindName,
-		Kind: Kind{},
+		Kind: Kind{domain: agenttest.Domain()},
 		Block: func(binary string, env map[string]string) map[string]any {
 			block := map[string]any{
 				"binary": binary,
@@ -49,14 +66,14 @@ func contract() agenttest.Contract {
 		},
 		New: func(t *testing.T, block map[string]any, o agenttest.Options) core.AgentRunner {
 			t.Helper()
-			r, err := New(Options{
+			r, err := newTestRunner(Options{
 				Provider:       block,
 				Publish:        o.Publish,
 				AttemptTimeout: o.AttemptTimeout,
 				Transcripts:    o.Transcripts,
 				Timings:        o.Timings,
 				OnRun:          o.OnRun,
-				signal:         o.Signal,
+				Domain:         o.Domain,
 			})
 			if err != nil {
 				t.Fatalf("New: %v", err)
@@ -78,6 +95,8 @@ func contract() agenttest.Contract {
 
 			EnvReserved:       ErrEnvReserved,
 			PublishCredential: ErrPublishCredential,
+			Continuation:      ErrContinuationToken,
+			ExecutionDomain:   ErrExecutionDomain,
 		},
 	}
 }
@@ -123,6 +142,13 @@ func (fake) Probe(args []string) bool {
 			// deliberate direction (see checkAuth).
 			fmt.Fprintln(os.Stderr, "Session: some future phrasing nobody has parsed")
 			os.Exit(1)
+		case "flood":
+			// The excusable answer, buried in more output than the probe
+			// retains (#235): the excuse must not be read off a body past the
+			// bound, whatever the body happens to contain.
+			fmt.Fprintln(os.Stderr, "Not logged in")
+			agenttest.Flood(os.Stderr)
+			os.Exit(1)
 		default:
 			fmt.Fprintln(os.Stderr, "Logged in using an API key - sk-proj-***AAAA")
 			os.Exit(0)
@@ -133,6 +159,9 @@ func (fake) Probe(args []string) bool {
 		// Leaves a child holding stdout when the suite asks for it: the probe's
 		// pipes then stay open long after its process is gone.
 		agenttest.LeakPipeHolder()
+		// Or floods stdout past what the probe retains, *after* the answer
+		// above — so a refusal is the bound's, not a missing marker (#235).
+		agenttest.FloodProbe()
 		os.Exit(0)
 	}
 	return false
@@ -148,6 +177,14 @@ func (fake) Usage() core.Usage {
 
 func (fake) Init(w io.Writer) {
 	fmt.Fprintf(w, `{"type":"thread.started","thread_id":%q}`+"\n", threadID)
+}
+
+// InitUntrusted is Init with the one field that matters replaced: the line this
+// harness really emits, announcing an identity the adapter must not mint a
+// resume token from (#233). Everything else about it is well-formed, so the
+// refusal under test is the thread id's shape and not a parse failure.
+func (fake) InitUntrusted(w io.Writer) {
+	fmt.Fprintf(w, `{"type":"thread.started","thread_id":%q}`+"\n", agenttest.HostileSessionID)
 }
 
 // Private is the turn boundary: activity with no normalized meaning, which the
@@ -177,7 +214,7 @@ func (fake) Success(w io.Writer) {
 // missing capability.
 func TestCapabilities(t *testing.T) {
 	parallel(t)
-	r, err := New(Options{Provider: map[string]any{"sandbox_mode": "workspace-write"}})
+	r, err := newTestRunner(Options{Provider: map[string]any{"sandbox_mode": "workspace-write"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,13 +268,21 @@ func TestReadyClassifiesTheLoginProbe(t *testing.T) {
 			auth:    "unrecognized",
 			wantErr: true,
 		},
+		{
+			// A flooding probe is refused before its body is read (#235): the
+			// excusable "Not logged in" is in there, and must excuse nothing.
+			name:    "api_key configured, flooding login probe",
+			apiKey:  "sk-provider-key",
+			auth:    "flood",
+			wantErr: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			block := contract().Block(selfPath(t), map[string]string{agenttest.AuthEnv: tc.auth})
 			if tc.apiKey != "" {
 				block["api_key"] = tc.apiKey
 			}
-			r, err := New(Options{Provider: block})
+			r, err := newTestRunner(Options{Provider: block})
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -270,7 +315,7 @@ func TestReadyProbeInvocations(t *testing.T) {
 			if tc.apiKey != "" {
 				block["api_key"] = tc.apiKey
 			}
-			r, err := New(Options{Provider: block})
+			r, err := newTestRunner(Options{Provider: block})
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -291,7 +336,7 @@ func TestReadyProbeInvocations(t *testing.T) {
 func TestReadyRefusalQuotesTheDiagnosticNotTheIdentity(t *testing.T) {
 	parallel(t)
 	block := contract().Block(selfPath(t), map[string]string{agenttest.AuthEnv: "bad-home"})
-	r, err := New(Options{Provider: block})
+	r, err := newTestRunner(Options{Provider: block})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

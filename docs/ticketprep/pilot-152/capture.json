@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "kernel_version": "ticketprep.v0",
+  "subject": {
+    "repository_identity": "github.com/srhg-ai-7cef3f93/ben",
+    "issue_number": 152,
+    "issue_url": "https://github.com/srhg-ai-7cef3f93/ben/issues/152",
+    "title": "Configurable per-workflow base/target branch (workspace cut from and PR opened against something other than the repo default branch)",
+    "body": "**Spec:** §5.2.4/§6.2 (workspace base derivation), §5.6 (canonical publish snippet) · **Depends on:** —\n\n## Problem\n\nBEN's workspace provider has no concept of a base branch other than the repository's actual\nGitHub default branch. `internal/workspace/workspace.go`'s `remoteDefaultBranch` reads the\nremote HEAD symref, and a fresh issue's workspace branch is always cut from that fetched head\n(`workspace.go:761,843,868`). The canonical publish snippet (SPEC §5.6) also hardcodes \"open a\npull request against the default branch.\"\n\nThis surfaced on a real deployment: `NFTYDoor/nftydoor-admin` mirrors a Bitbucket repository —\nGitHub `main` must stay a clean, GitHub-authored-commit-free mirror, and a whole stabilization\nepic requires every BEN-authored branch to be cut from, and every PR opened against, a\ndedicated `switchboard-stabilization` branch instead. Changing the repo's actual GitHub default\nbranch is explicitly a non-goal of that epic (it would violate the mirror invariant a different\nway). There is no other way today to make BEN base and publish against a non-default branch —\nnot a config key, not a documented workaround, and it isn't named in §13's deferred extensions\neither.\n\n## Proposal (for discussion, not a locked design)\n\nAdd an optional `workspace.base_branch` (or similar) config key: when set, `Prepare` fetches and\nbases fresh workspaces on that ref instead of the repository's default branch, and the canonical\npublish snippet's PR-target instruction uses it instead of \"the default branch.\" Needs a decision\non:\n\n- whether the base ref is validated to exist at `Ready`-time (readiness failure) or load time;\n- interaction with the remote-first reattach logic (§6.2) — reattaching to an existing\n  `ben/\u003cworkspace_key\u003e` branch should presumably still take precedence over the configured base\n  for a fresh prepare;\n- whether this belongs in `workspace` or is closer to a `publish`-block concern, since it affects\n  both the git base and the PR target.\n\n## Acceptance\n\n- [ ] A workflow can configure a non-default base/target branch and have BEN's workspace\n      provider and canonical publish snippet both honor it.\n- [ ] `ben config effective` surfaces the configured value (or its default-branch fallback)\n      with provenance, per §5.8.\n- [ ] Structural validation rejects an obviously malformed ref name at load; existence is a\n      readiness concern, not a load concern (mirrors how `publish.value` is handled, §5.5).\n- [ ] `make check` green (evidence in the PR)",
+    "content_digest": "sha256:573840a53d765816267c611bb78f50595f4498fe22387d58699748c8718e55ca"
+  },
+  "repository": {
+    "remote": "origin",
+    "identity": "github.com/srhg-ai-7cef3f93/ben",
+    "remote_fingerprint": "sha256:c211de43f2655f3cc0f117659fc4b6b67f4b2404cd057948f45752e8c731621a",
+    "commit": "87d01e949fcab4053df1ed34c74562bc22d340e7",
+    "tree": "3a1ecd8ba562a41a386ee1eede284010fc9072fd"
+  },
+  "facts": {
+    "paths": [
+      {
+        "reference": "internal/workspace/workspace.go",
+        "status": "exists",
+        "resolved_path": "internal/workspace/workspace.go",
+        "blob": "745fca9e1580e08a0ff5d6204a52bc2c101e9e5a",
+        "evidence": "git_tree:3a1ecd8ba562a41a386ee1eede284010fc9072fd"
+      },
+      {
+        "reference": "workspace.go:761,843,868",
+        "status": "unknown",
+        "evidence": "git_tree:3a1ecd8ba562a41a386ee1eede284010fc9072fd",
+        "reason": "basename is ambiguous across 4 committed paths"
+      }
+    ],
+    "symbols": [
+      {
+        "reference": "Prepare",
+        "status": "unknown",
+        "name": "Prepare",
+        "evidence": "go_syntax_at_commit:87d01e949fcab4053df1ed34c74562bc22d340e7",
+        "reason": "identifier is ambiguous across 3 committed declarations"
+      },
+      {
+        "reference": "Ready",
+        "status": "unknown",
+        "name": "Ready",
+        "evidence": "go_syntax_at_commit:87d01e949fcab4053df1ed34c74562bc22d340e7",
+        "reason": "identifier is ambiguous across 8 committed declarations"
+      },
+      {
+        "reference": "remoteDefaultBranch",
+        "status": "exists",
+        "name": "remoteDefaultBranch",
+        "path": "internal/workspace/workspace.go",
+        "line": 791,
+        "blob": "745fca9e1580e08a0ff5d6204a52bc2c101e9e5a",
+        "evidence": "go_syntax_at_commit:87d01e949fcab4053df1ed34c74562bc22d340e7"
+      }
+    ],
+    "instruction_files": [
+      {
+        "path": "AGENTS.md",
+        "blob": "2f64b8cdca8653fce3a6abb5bb87936d92746d4a"
+      }
+    ],
+    "validation_commands": [
+      {
+        "command": "make check",
+        "source": "AGENTS.md",
+        "line": 55,
+        "blob": "2f64b8cdca8653fce3a6abb5bb87936d92746d4a"
+      },
+      {
+        "command": "make test",
+        "source": "AGENTS.md",
+        "line": 57,
+        "blob": "2f64b8cdca8653fce3a6abb5bb87936d92746d4a"
+      },
+      {
+        "command": "make lint",
+        "source": "AGENTS.md",
+        "line": 58,
+        "blob": "2f64b8cdca8653fce3a6abb5bb87936d92746d4a"
+      },
+      {
+        "command": "go run ./cmd/ben config effective WORKFLOW.md",
+        "source": "AGENTS.md",
+        "line": 63,
+        "blob": "2f64b8cdca8653fce3a6abb5bb87936d92746d4a"
+      },
+      {
+        "command": "make race",
+        "source": "Makefile",
+        "line": 53,
+        "blob": "519cb037b749c9eaac7a70be6c00405c22b014ef"
+      },
+      {
+        "command": "make fmt-check",
+        "source": "Makefile",
+        "line": 70,
+        "blob": "519cb037b749c9eaac7a70be6c00405c22b014ef"
+      },
+      {
+        "command": "make vet",
+        "source": "Makefile",
+        "line": 76,
+        "blob": "519cb037b749c9eaac7a70be6c00405c22b014ef"
+      },
+      {
+        "command": "make workflow-check",
+        "source": "Makefile",
+        "line": 87,
+        "blob": "519cb037b749c9eaac7a70be6c00405c22b014ef"
+      },
+      {
+        "command": "make worktree-check",
+        "source": "Makefile",
+        "line": 111,
+        "blob": "519cb037b749c9eaac7a70be6c00405c22b014ef"
+      }
+    ],
+    "unknown": [
+      {
+        "reference": "NFTYDoor/nftydoor-admin",
+        "reason": "literal is not an unambiguous v0 path or Go symbol reference"
+      },
+      {
+        "reference": "ben/\u003cworkspace_key\u003e",
+        "reason": "literal is not an unambiguous v0 path or Go symbol reference"
+      },
+      {
+        "reference": "publish.value",
+        "reason": "literal is not an unambiguous v0 path or Go symbol reference"
+      },
+      {
+        "reference": "workspace.base_branch",
+        "reason": "literal is not an unambiguous v0 path or Go symbol reference"
+      }
+    ]
+  },
+  "sources": {
+    "issue": "declared_issue_snapshot",
+    "repository": "git_object_database",
+    "remote": "git_config:remote.origin.url"
+  }
+}

@@ -19,6 +19,7 @@ import (
 
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 	"github.com/srhg-ai-7cef3f93/ben/internal/credential"
+	"github.com/srhg-ai-7cef3f93/ben/internal/gitremote"
 )
 
 const (
@@ -335,6 +336,16 @@ func (fi *fakeIssue) removeLabel(name string) bool {
 // choose the two independently, so a test whose clone host merely echoed the
 // API host could not tell a cached server answer from a derived one.
 const testCloneURL = "https://git.example.com/" + testOwner + "/" + testRepo + ".git"
+
+var testRepositoryIdentity = mustRepositoryIdentity(testCloneURL)
+
+func mustRepositoryIdentity(remote string) string {
+	identity, err := gitremote.RepositoryIdentity(remote)
+	if err != nil {
+		panic(err)
+	}
+	return identity
+}
 
 // serveRepo registers the repository read Ready uses as its reachability
 // probe. Registered per test rather than globally so a test can model a repo

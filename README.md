@@ -31,18 +31,20 @@ run markers before the first tick dispatches, so an interruption leaves claims a
 standing *for recovery to reconstruct* rather than stranded (B10). The §12.3 invariant suite runs in
 CI with no network and no subprocesses (B12).
 
-The daemon is **not yet ready for unattended use**, and the reason is no longer an unfinished
-ticket. BEN's own unattended-dogfood gate is tracked in
-[issue #76](https://github.com/srhg-ai-7cef3f93/ben/issues/76), whose one open lane is the **forge
-control** — §10.1 requirement 3, which is load-bearing in risk-accepted mode because it is the only
-remaining gate there. Branch protection is applied through Terraform and independently read back
-([#83](https://github.com/srhg-ai-7cef3f93/ben/issues/83)), but BEN publishes as whoever runs the
-daemon, who is also the human reviewing the pull request — so an approval does not yet bind to an
-identity distinct from the one that pushed.
+The daemon is **not yet approved for unattended use**, and the reason is no longer an unfinished
+ticket. BEN's own unattended-dogfood gate,
+[issue #76](https://github.com/srhg-ai-7cef3f93/ben/issues/76), closed on 2026-08-20: branch
+protection is applied through Terraform and independently read back
+([#83](https://github.com/srhg-ai-7cef3f93/ben/issues/83)), and
 [#155](https://github.com/srhg-ai-7cef3f93/ben/issues/155) and
-[#156](https://github.com/srhg-ai-7cef3f93/ben/issues/156) are what close that. Until they do, use
-`ben run` only for supervised development and the scripted smoke profile — and
-`deploy/ben.service` stays blocked by its `ExecStartPre` gate.
+[#156](https://github.com/srhg-ai-7cef3f93/ben/issues/156) made the publishing identity a bot
+distinct from the human who reviews — its pull requests cannot merge without that human's approval.
+What remains is a decision, not a ticket: the committed `WORKFLOW.md` declares `attended`, and
+moving a deployment to `risk-accepted` or `protected` is the explicit act
+[docs/DEPLOY.md](docs/DEPLOY.md) describes; unattended dispatch on public input also waits on the
+containment qualification tracked in [#195](https://github.com/srhg-ai-7cef3f93/ben/issues/195).
+Until a deployment records that decision, use `ben run` only for supervised development and the
+scripted smoke profile — and `deploy/ben.service` stays blocked by its `ExecStartPre` gate.
 
 Per-ticket state deliberately lives where it stays current rather than here: [BUILD.md](BUILD.md)
 for the twelve tickets and their acceptance criteria, and the
@@ -71,6 +73,12 @@ network access, and an installed harness, and remains subject to the **Status** 
 **[docs/DEPLOY.md](docs/DEPLOY.md)** is the runbook: the dedicated account, the two credentials,
 the branch protection BEN's review gate rests on, the isolation you can configure today, and
 risk-accepted mode. Read it before standing BEN up with no human present.
+
+**[docs/REVIEW.md](docs/REVIEW.md)** is the optional review controller (#11): a forge-side GitHub
+Action that reviews the pull request BEN published and either hands the branch back for one more
+revision or stops automation and waits for a human. It is bounded at three revision rounds, it is
+off until an operator turns it on, and it changes nothing about the gate above — it never approves,
+never merges, and never applies a required label.
 
 Two of its rules do not survive being skimmed, because breaking either fails silently rather than
 loudly:

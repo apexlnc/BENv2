@@ -16,7 +16,7 @@ import (
 //
 // That split is the answer to a specific problem. The outcome depends on five
 // facts that arrive from five independent goroutines (the stream ended, the
-// process exited, a liveness window claimed a verdict, the signal ladder
+// process exited, a liveness window claimed a verdict, the bounded teardown
 // finished, the consumer left), and the rules relating them — first writer wins,
 // a settled outcome never changes, publication waits for cleanup — used to live
 // in comments around a mutex. `-race` does not check ordering, so the only way
@@ -33,15 +33,18 @@ const (
 	// inEvent is one translated harness event (SPEC §7.2). A terminal one is
 	// the harness declaring its own outcome.
 	inEvent inputKind = iota
-	// inStreamEnded is the stdout stream reaching its end — EOF, a line past
-	// the scanner ceiling, or the post-exit bound closing the read end.
+	// inStreamEnded is the stdout stream reaching its end — EOF, the post-exit
+	// bound closing the read end, or the reader giving up on a line past the
+	// scanner ceiling, which it has already claimed a verdict for by then
+	// (handle.overflow).
 	inStreamEnded
 	// inProcessExited is Wait returning. It carries no exit code: they are
 	// advisory only (SPEC §7.4), so the stream decides the outcome.
 	inProcessExited
-	// inVerdict is a liveness window or a Stop claiming the run's outcome.
+	// inVerdict is a runner-owned claim on the run's outcome: a liveness
+	// window, a Stop, or the reader refusing a line past the scanner ceiling.
 	inVerdict
-	// inCleanupFinished is the signal ladder that a verdict promised reaching a
+	// inCleanupFinished is the bounded teardown that a verdict promised reaching a
 	// conclusion, whatever its outcome (SPEC §7.5).
 	inCleanupFinished
 	// inAbandoned is the consumer never coming back for another event.
@@ -70,7 +73,7 @@ const (
 	stepEmit
 	// stepTerminal: deliver step.event as the run's last, then end the stream.
 	stepTerminal
-	// stepAwaitCleanup: a claimed verdict's signal ladder is still outstanding.
+	// stepAwaitCleanup: a claimed verdict's bounded teardown is still outstanding.
 	// Wait for it — or for the consumer to be abandoned — then ask again with
 	// inResolve.
 	stepAwaitCleanup
@@ -99,7 +102,7 @@ type lifecycleState struct {
 	// verdict is the liveness or Stop decision, first writer wins. Empty means
 	// the harness ended on its own terms.
 	verdict core.FailureReason
-	// cleanupDone records that a promised signal ladder ran to a conclusion, so
+	// cleanupDone records that promised teardown ran to a conclusion, so
 	// a verdict can be told from "a verdict whose cleanup is still in flight".
 	cleanupDone bool
 	// abandoned records that no consumer will read another event.
@@ -186,11 +189,11 @@ func (s lifecycleState) endOfRun() (lifecycleState, step) {
 }
 
 // resolve publishes the run's outcome, or reports that a claimed verdict's
-// signal ladder has to finish first.
+// bounded teardown has to finish first.
 //
 // Choosing the event and closing the window on later verdicts happen in one
 // transition, and that is the whole point of resolving here. Choosing earlier —
-// before the cleanup wait — leaves a gap as wide as the signal ladder in which
+// before the cleanup wait — leaves a gap as wide as the teardown in which
 // the watchdog can claim a timeout that an already-chosen `succeeded` then
 // overwrites; liveness is runner-owned (SPEC §7.4), so a late result must never
 // overturn a declared timeout.
@@ -209,7 +212,7 @@ func (s lifecycleState) resolve() (lifecycleState, step) {
 		// — and from here a late verdict can no longer change it.
 	case s.cleanupDone:
 		// A liveness or Stop verdict outranks whatever the stream said. Waiting
-		// for the ladder is what publication owes the orchestrator: announcing
+		// for teardown is what publication owes the orchestrator: announcing
 		// a failure while a descendant is still running would hand back a
 		// workspace it believes is idle and is not (SPEC §9.8).
 		s.outcome = core.Event{Type: core.EventFailed, Reason: s.verdict}
@@ -218,7 +221,7 @@ func (s lifecycleState) resolve() (lifecycleState, step) {
 		// what the orchestrator acts on for an abandoned run is Stop's
 		// confirmed/unconfirmed answer, not an event nothing will drain
 		// (SPEC §9.8, and see handle.Done). Waiting anyway would be the worse
-		// trade — it leaves the run permanently undecided if the ladder that was
+		// trade — it leaves the run permanently undecided if the teardown that was
 		// promised never reports, and an undecided run never closes Done.
 		s.outcome = core.Event{Type: core.EventFailed, Reason: s.verdict}
 	default:
@@ -245,7 +248,7 @@ func (l *lifecycle) on(in input) step {
 }
 
 // claimed reports whether a verdict has been claimed — which is also the
-// promise that a signal ladder will run, so it is what decides whether there is
+// promise that bounded teardown will run, so it is what decides whether there is
 // any cleanup to wait for (see handle.awaitCleanup).
 func (l *lifecycle) claimed() bool {
 	l.mu.Lock()

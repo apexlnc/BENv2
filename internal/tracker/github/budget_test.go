@@ -103,8 +103,8 @@ func TestSpentBudgetRefusesEveryCallWithoutSpendingRequests(t *testing.T) {
 	newFakeIssue(1, "ben-queue").serve(f)
 	adapter := f.adapter(t)
 
-	if _, err := adapter.claimPrincipal(context.Background()); err != nil {
-		t.Fatalf("resolving the principal: %v", err)
+	if err := adapter.Ready(context.Background()); err != nil {
+		t.Fatalf("establishing repository identity: %v", err)
 	}
 	leaveOrdinaryBudget(t, adapter, 0)
 	f.reset()
@@ -113,6 +113,14 @@ func TestSpentBudgetRefusesEveryCallWithoutSpendingRequests(t *testing.T) {
 		name string
 		run  func() error
 	}{
+		// RemotePR must run before the deliberately refused Ready below clears
+		// the previously established repository identity.
+		{"RemotePR", func() error {
+			_, err := adapter.RemotePR(context.Background(), core.RemotePRQuery{
+				Issue: core.Issue{Identifier: "1"}, Repository: testRepositoryIdentity, Branch: "ben/x",
+			})
+			return err
+		}},
 		{"Ready", func() error { return adapter.Ready(context.Background()) }},
 		{"Fetch", func() error { _, err := adapter.Fetch(context.Background()); return err }},
 		{"Get", func() error { _, err := adapter.Get(context.Background(), "1"); return err }},
@@ -124,6 +132,10 @@ func TestSpentBudgetRefusesEveryCallWithoutSpendingRequests(t *testing.T) {
 		}},
 		{"FindPR", func() error {
 			_, err := adapter.FindPR(context.Background(), core.Issue{Identifier: "1"}, "ben/x")
+			return err
+		}},
+		{"ContentApproval", func() error {
+			_, err := adapter.ContentApproval(context.Background(), core.Issue{Identifier: "1"})
 			return err
 		}},
 		{"Claim", func() error { _, err := adapter.Claim(context.Background(), core.Issue{Identifier: "1"}); return err }},

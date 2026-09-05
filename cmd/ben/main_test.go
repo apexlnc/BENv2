@@ -224,6 +224,57 @@ func TestRunConfigEffectiveValidatesEveryRegisteredAgentKind(t *testing.T) {
 	}
 }
 
+// A provider input can be valid for a local child and forbidden when BEN would
+// serialize it to another machine. `config effective` owns that substrate-aware
+// structural decision: a daemon must not get as far as claiming work and only
+// then discover that its already-resolved model came from reusable GitHub
+// authority.
+func TestRunConfigEffectiveAppliesRemoteCredentialRulesOnlyToRemoteSubstrates(t *testing.T) {
+	const secret = "ghp-reusable-MUST-NOT-CROSS"
+	t.Setenv("GH_TOKEN", secret)
+
+	for kind, fixture := range agentFixtures {
+		t.Run(kind, func(t *testing.T) {
+			provider := fixture.valid + "    model: $GH_TOKEN\n"
+			local := workflowWithAgent(kind, provider)
+			remote := strings.Replace(local, "deployment:\n", `credential_sources:
+  airlock:
+    kind: static
+    value: $AIRLOCK_TOKEN
+substrate:
+  kind: airlock
+  airlock:
+    base_url: https://airlock.invalid
+    profile: ben-agent
+    auth_source: airlock
+deployment:
+`, 1)
+
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{"config", "effective", writeWorkflowContent(t, remote)}, &stdout, &stderr); code != 1 {
+				t.Fatalf("remote exit code = %d, want 1 (stdout: %s, stderr: %s)", code, stdout.String(), stderr.String())
+			}
+			for _, want := range []string{"agent.provider.model", "$GH_TOKEN", "reusable GitHub credential"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("remote refusal %q does not name %q", stderr.String(), want)
+				}
+			}
+			if strings.Contains(stderr.String(), secret) || stdout.Len() != 0 {
+				t.Fatalf("remote refusal leaked or printed the rejected config; stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+
+			stdout.Reset()
+			stderr.Reset()
+			if code := run([]string{"config", "effective", writeWorkflowContent(t, local)}, &stdout, &stderr); code != 0 {
+				t.Fatalf("local exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+			}
+			if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) {
+				t.Fatal("local effective output printed the resolved credential value")
+			}
+		})
+	}
+}
+
 // AGENTS.md presents `make workflow-check` as the guarantee the dogfood
 // WORKFLOW.md cannot rot, and workflow-check is exactly `config effective` over
 // that file. So assert the real file, both directions: as committed it validates
@@ -277,9 +328,10 @@ func TestDogfoodWorkflowRendersAnUnknownOutcomeAttemptFloor(t *testing.T) {
 			Title:      "attempt floor",
 			Body:       "derive it from git evidence",
 		},
-		Attempt:   2,
-		Workspace: "/tmp/ben-94",
-		Run:       template.Run{ID: "94-2"},
+		Attempt:      2,
+		Workspace:    "/tmp/ben-94",
+		TargetBranch: "main",
+		Run:          template.Run{ID: "94-2"},
 	})
 	if err != nil {
 		t.Fatalf("rendering the evidence-floored dogfood prompt: %v", err)

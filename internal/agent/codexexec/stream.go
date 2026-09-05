@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/srhg-ai-7cef3f93/ben/internal/agent/harness"
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 )
 
@@ -91,7 +92,7 @@ func translate(line []byte) []core.Event {
 
 	switch l.Type {
 	case "thread.started":
-		if l.ThreadID == "" {
+		if !validThreadID(l.ThreadID) {
 			return nil
 		}
 		// The thread id is both identity and the opaque resume token: it is
@@ -109,7 +110,10 @@ func translate(line []byte) []core.Event {
 		if l.Item == nil || l.Item.Type != "agent_message" || strings.TrimSpace(l.Item.Text) == "" {
 			return nil
 		}
-		return []core.Event{{Type: core.EventProgress, Text: l.Item.Text}}
+		// Bounded here, where the raw payload becomes the one event field a
+		// consumer retains (#235); see claudecode.translate for the reasoning,
+		// which is identical.
+		return []core.Event{{Type: core.EventProgress, Text: harness.BoundText(l.Item.Text)}}
 
 	case "turn.completed":
 		var events []core.Event
@@ -130,6 +134,56 @@ func translate(line []byte) []core.Event {
 	default:
 		return nil
 	}
+}
+
+// maxThreadID bounds an accepted thread id. 0.147.0 mints UUIDv7 spellings — 36
+// characters (see testdata/) — so this is far past any observed id and still a
+// bound, which is the point: the token is persisted (internal/state) and handed
+// back as an argv element, and neither of those has a length of its own.
+const maxThreadID = 128
+
+// validThreadID reports whether an announced thread id is a shape this harness
+// could have minted. It is the first of two independent anchors on a token the
+// child's own JSON stream chooses and the *next* attempt's argv carries (SPEC
+// §7.1, §9.6); the second is in command.go, where the same string becomes the
+// `resume <THREAD_ID>` operand.
+//
+// This is the anchor that belongs here, for the reason SPEC §3.6 gives: this
+// line is the raw provider payload, and translating it is this adapter's job
+// alone. Past this point the token is opaque by contract (SPEC §7.1) — the
+// orchestrator must not interpret it, which is not the same as nobody
+// validating it.
+//
+// Unlike claude-code's session ids, thread ids are documented as opaque, so
+// there is no exact spelling to check and the anchor is a character class:
+// `[A-Za-z0-9_-]+`, bounded, and never leading `-`. That is deliberately wider
+// than the UUIDv7 ids 0.147.0 emits, because a harness release is free to change
+// the spelling and a run refusing to resume is a real cost; what it excludes is
+// every character that gives an argv element a *meaning* — a leading `-` making
+// it a flag, an `=` making it `--config=key=value`, whitespace and quotes making
+// it something a downstream shell would split.
+//
+// It matters most here. `sandboxOverrides` exists to keep `sandbox_workspace_write.*`
+// out of the agent's hands, and a token spelled
+// `--config=sandbox_workspace_write.network_access=true` would hand back exactly
+// what that function withholds.
+//
+// A failing id mints no started event, which is the answer an absent one already
+// got: the line stays activity so the run continues (SPEC §7.2), and the attempt
+// ends with no resume token — one fresh session, the conservative direction.
+func validThreadID(id string) bool {
+	if id == "" || len(id) > maxThreadID || id[0] == '-' {
+		return false
+	}
+	for i := range len(id) {
+		c := id[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // failureReason maps a failed turn to the closed failure taxonomy (SPEC §7.3).
@@ -168,3 +222,9 @@ func mentionsAny(haystack string, needles ...string) bool {
 	}
 	return false
 }
+
+// Translate is this adapter's raw-line boundary, exported for the substrate
+// that cannot reach it through harness.Launch (#194, #46). See
+// claudecode.Translate: the contract, and the reason it must be this exact
+// function rather than a second implementation, are identical.
+func Translate(line []byte) []core.Event { return translate(line) }

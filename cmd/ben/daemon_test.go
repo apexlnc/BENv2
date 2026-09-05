@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	agentharness "github.com/srhg-ai-7cef3f93/ben/internal/agent/harness"
 	"github.com/srhg-ai-7cef3f93/ben/internal/config"
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 	"github.com/srhg-ai-7cef3f93/ben/internal/fake"
@@ -51,7 +52,7 @@ func TestRunRefusesToStartAndNamesTheStage(t *testing.T) {
 			tc.arrange(h)
 			def := h.def() // writes the fixture WORKFLOW.md at h.path
 
-			err := daemon(context.Background(), def.Path, discardLog(), h.b.build, testStateFiles(t))
+			err := daemon(context.Background(), def.Path, discardLog(), h.b.build, testStateFiles(t), h.b.Review)
 			if err == nil {
 				t.Fatal("daemon started on a runtime that could not be built")
 			}
@@ -69,7 +70,7 @@ func TestRunRefusesToStartAndNamesTheStage(t *testing.T) {
 // rather than reporting a build stage that was never reached.
 func TestRunRefusesAMissingWorkflow(t *testing.T) {
 	h := newHarness(t)
-	err := daemon(context.Background(), h.path, discardLog(), h.b.build, testStateFiles(t))
+	err := daemon(context.Background(), h.path, discardLog(), h.b.build, testStateFiles(t), h.b.Review)
 	if err == nil {
 		t.Fatal("daemon started with no WORKFLOW.md")
 	}
@@ -241,7 +242,7 @@ func startDaemonFor(t *testing.T, files *stateFiles, defOpts []func(*workflowSpe
 		}, nil
 	}
 
-	go func() { d.exit <- daemon(context.Background(), def.Path, d.log(), build, files) }()
+	go func() { d.exit <- daemon(context.Background(), def.Path, d.log(), build, files, nil) }()
 	t.Cleanup(func() {
 		if d.exited {
 			return
@@ -441,6 +442,22 @@ func TestDaemonConfigWiresTheRecoveryCapabilities(t *testing.T) {
 			t.Error("no detail; §9.10's reconstructed comment is only as useful as what it can say")
 		}
 	})
+}
+
+func TestRunGoneRoutesCurrentLocalDomainEvidenceToTheHarness(t *testing.T) {
+	evidence := core.RunEvidence{
+		Scheme: agentharness.LocalEvidenceScheme,
+		Boot:   "not-a-canonical-boot-id",
+		ID:     "not-a-canonical-domain-id",
+	}
+	wantGone, wantErr := agentharness.EvidenceGone(evidence)
+	gotGone, gotErr := runGone(nil)(evidence)
+	if gotGone != wantGone {
+		t.Errorf("runGone = %v, harness = %v", gotGone, wantGone)
+	}
+	if (gotErr == nil) != (wantErr == nil) || gotErr != nil && gotErr.Error() != wantErr.Error() {
+		t.Errorf("runGone error = %v, harness = %v", gotErr, wantErr)
+	}
 }
 
 // SPEC §10.1: BEN verifies none of the deployment properties, so the record is

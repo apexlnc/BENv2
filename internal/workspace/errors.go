@@ -1,12 +1,37 @@
 package workspace
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/srhg-ai-7cef3f93/ben/internal/core"
+)
 
 // Named refusals (see AGENTS.md conventions); tests assert on these.
 var (
 	// ErrBaseRepoState refuses an unexpected base.git: fail closed, no
 	// auto-repair (SPEC §6.2).
 	ErrBaseRepoState = errors.New("workspace: base repository in unexpected state")
+
+	// ErrBaseConfigSteering refuses repository-local Git configuration that can
+	// redirect or re-authenticate a remote operation. base.git is writable by a
+	// run, so its config is evidence to validate, never daemon policy (#231).
+	ErrBaseConfigSteering = errors.New("workspace: base repository config can steer remote Git operations")
+
+	// ErrScratchRoot refuses a missing or overlapping root for the temporary Git
+	// repositories that carry credentialed remote commands. The root is supplied
+	// from daemon-owned state and must never be one an agent receives (#231).
+	ErrScratchRoot = errors.New("workspace: daemon scratch root is not isolated from agent-writable workspace state")
+
+	// ErrBaseBranchNotFound is a structurally valid configured branch, or the
+	// branch named by the remote HEAD symref, that the canonical remote does not
+	// advertise. Existence is a credentialed readiness concern.
+	ErrBaseBranchNotFound = errors.New("workspace: base branch does not exist on the remote")
+
+	// ErrBaseBranchReserved refuses a configured or repository-default target
+	// inside the namespace BEN uses for issue publication branches. Allowing the
+	// repository default to be ben/<workspace_key> would make the target and
+	// candidate the same ref.
+	ErrBaseBranchReserved = errors.New("workspace: base branch uses BEN's reserved branch namespace")
 
 	// ErrWorkspaceState refuses a workspace whose directory and git
 	// registration disagree in a way prune-and-retry-once could not fix, or
@@ -21,6 +46,11 @@ var (
 	// ErrClaimBaseState refuses malformed, contradictory, unreadable, or
 	// mismatched provider-owned claim-base safety evidence (SPEC §6.2).
 	ErrClaimBaseState = errors.New("workspace: claim base in unexpected state")
+
+	// ErrClaimTargetUnrecorded marks a pre-#152 claim-base record. Its base is
+	// readable only as outgoing state for a later assignment epoch; it cannot
+	// authorize same-epoch prepare, prompt rendering, or verification.
+	ErrClaimTargetUnrecorded = core.ErrClaimTargetUnrecorded
 
 	// ErrBranchDiverged refuses an issue branch whose local and origin
 	// histories have each moved since they last agreed: fast-forwarding
@@ -63,4 +93,17 @@ var (
 	// echoed, not even the scheme. Which workflow refused is in the caller's
 	// wrapping context.
 	ErrRemoteCredentials = errors.New("workspace: remote URL must not embed credentials — pass them via Repository.AuthSource so they stay out of argv and git config (SPEC §10.2)")
+
+	// ErrCleartextCredentialRemote refuses the pairing of a credential source
+	// with a remote git would authenticate to over an unencrypted transport
+	// (#230). The credential helper's host scoping cannot help here: the
+	// configured host is the one reading the token off the wire.
+	//
+	// The pairing and not the scheme alone — a public `http://` remote with no
+	// AuthSource exposes nothing, and BEN's own suites drive real git against
+	// credential-free local remotes. At construction rather than at the first
+	// remote invocation, in this repo's usual style: the remote arrives from the
+	// tracker, so assembly is the earliest point that can see it, and a bundle
+	// that refuses to build says so once instead of once per dispatched claim.
+	ErrCleartextCredentialRemote = errors.New("workspace: a credential source cannot be used with a cleartext remote — http:// and ftp:// put the credential on the wire (SPEC §10.2)")
 )

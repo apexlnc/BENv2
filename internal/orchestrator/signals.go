@@ -36,6 +36,7 @@ const (
 	sigDoneOwnership
 	sigHeldConfirmed
 	sigHeldHistory
+	sigCycleDisposed
 	sigHeldReleased
 	sigParkedConfirmed
 	sigAdopt
@@ -46,6 +47,7 @@ const (
 	sigSweepReserve
 	sigSweepRelease
 	sigMarkerCleared
+	sigCycleScan
 
 	// numSigKinds bounds the kinds above; it is not one of them. Its only use is
 	// sizing Orchestrator.applied, so a kind added without a line here is a
@@ -134,6 +136,21 @@ type signal struct {
 	effect string
 	// sigClaimAnchor, and the re-derived cycle on sigHeldHistory
 	anchor int64
+	// cycleSuperseded says the provider's retained workspace cycle is not the one
+	// the standing approval selects — a required label withdrawn and re-applied
+	// since the claim was retained (cycleApprovalSource, SPEC §6.7).
+	//
+	// cycleApprovalErr is that read failing, carried apart from `err` because they
+	// are different questions with different consequences: the history read failing
+	// retries on the next revision bump, while this one must not let the caller
+	// re-baseline the revision it rode in on — that would spend the trigger that
+	// buys the next read.
+	cycleSuperseded  bool
+	cycleApprovalErr error
+	// issueRevision is the §8.3 change token the two answers above were computed
+	// against, so a held record is baselined to what was actually asked about
+	// rather than to whatever the record holds when the answer lands.
+	issueRevision string
 	// sigRecovered carries a retried §9.10 classification and the facts it was
 	// reached from. Both are pointers because a zero recoveryVerdict is `unknown`,
 	// which is not a verdict — nil says the reads failed and there is nothing to
@@ -157,6 +174,14 @@ type signal struct {
 	// time because that write can land while the read is in flight, leaving the
 	// record owing nothing and the answer still predating it.
 	labelsSettled bool
+	// sigCycleScan, and sigClaimBaseBegun's immediate read after the provider may
+	// have created an obligation.
+	cycleRead       bool
+	cycleRefs       []core.WorkspaceRef
+	cycleWorkspaces Workspaces
+	cycleScanErr    error
+	cycleScanSeq    uint64
+	cycleScanOK     bool
 }
 
 // sweepClaim is one workspace's reservation request, answered on the authority
@@ -221,6 +246,42 @@ func (o *Orchestrator) handle(ctx context.Context, s signal) {
 	// completes when the last worker reports back, and the report *is* a signal.
 	// A no-op until shutdown has begun.
 	defer o.driveShutdown(ctx)
+	if s.kind == sigClaimBaseBegun && s.cycleRead {
+		// Counted when the remote provider's mutation was started. Do this before
+		// record lookup: the owning record may have been forgotten while the I/O
+		// was out, but the global scan barrier still has to be released and its
+		// durable obligations still have to be adopted.
+		if o.cycleMutationsInFlight <= 0 {
+			o.cycleScanFailed = true
+			o.log.Error("ended-cycle mutation accounting underflow; blocking dispatch")
+		} else {
+			o.cycleMutationsInFlight--
+		}
+		fresh := s.cycleScanSeq == o.cycleMutationSeq
+		if s.cycleScanErr != nil {
+			// A refusal is sticky even when its generation is old.
+			s.cycleScanOK = o.applyCycleScan(
+				s.cycleWorkspaces, s.cycleRefs, s.cycleScanErr, false,
+			)
+		} else {
+			// A complete local read is enough for this claim-base transition to
+			// continue: PrepareClaim re-reads the same directory under the provider's
+			// cycle lock before it can prune pins. Only a current snapshot may update
+			// the loop's ownership set, though.
+			s.cycleScanOK = true
+			if fresh {
+				// Mutation-local reads may add obligations but never clear a refusal;
+				// only the periodic scan starts behind the no-mutation barrier.
+				o.applyCycleScan(
+					s.cycleWorkspaces, s.cycleRefs, s.cycleScanErr, false,
+				)
+			} else {
+				// A successful old snapshot is ignored wholesale: disposal
+				// confirmation or a later begin may have removed an obligation while
+				// this directory read was out.
+			}
+		}
+	}
 
 	switch s.kind {
 	case sigTick:
@@ -243,6 +304,10 @@ func (o *Orchestrator) handle(ctx context.Context, s signal) {
 		o.onHeldConfirmed(ctx, s)
 	case sigHeldHistory:
 		o.onHeldHistory(ctx, s)
+	case sigCycleDisposed:
+		// Keyed to an issue but to neither owner: an ended workspace cycle outlives
+		// the record or held claim that noticed it (cycle.go).
+		o.onCycleDisposed(ctx, s)
 	case sigHeldReleased:
 		o.onHeldReleased(ctx, s)
 	case sigSwept:
@@ -263,6 +328,9 @@ func (o *Orchestrator) handle(ctx context.Context, s signal) {
 		// Not keyed to an issue: it is the §9.10 step 1 candidate read for the whole
 		// principal, redone after a startup scan that failed.
 		o.onRecoveryScan(ctx, s)
+	case sigCycleScan:
+		// A provider-local durable-state read, keyed to no run record.
+		o.onCycleScan(ctx, s)
 		// sigParkedConfirmed is keyed to a run record and falls through to the
 		// default, unlike the three above: a parked record is still in the machine.
 	default:
@@ -388,6 +456,7 @@ func (o *Orchestrator) handleRecord(ctx context.Context, r *Record, s signal) {
 // here.
 func (o *Orchestrator) onTick(ctx context.Context) {
 	o.openRequestWindow()
+	o.beginCycleScan(ctx)
 	// Before the reads, so a verification waiting on a credential is retried on
 	// the same tick it would otherwise have idled through. It rides the poll
 	// tick rather than §9.8's attempt backoff because nothing about the attempt
@@ -506,12 +575,12 @@ func (o *Orchestrator) beginReconcile(ctx context.Context) {
 // beginDispatchReads runs §9.4 steps 2 and 3: defensive config revalidation,
 // then the candidate fetch it gates.
 func (o *Orchestrator) beginDispatchReads(ctx context.Context) {
-	if o.dispatchInFlight || o.draining {
-		// A **cost** gate, not the correctness one. The §9.4 step-2 revalidation
-		// and the candidate fetch are requests, and a daemon on its way out
-		// should stop spending them (SPEC §8.5) — but stopping the read is not
-		// stopping dispatch, because a Fetch already in flight returns
-		// afterwards. The gate that matters is in dispatch, on the claim.
+	if o.dispatchInFlight || o.reconcileInFlight || o.draining || o.cycleScanInFlight || o.cycleScanFailed {
+		// Draining is a cost gate: a daemon on its way out should stop spending
+		// tracker requests, while dispatch itself remains the claim-write gate for
+		// a Fetch already in flight. Reconciliation and the durable cycle scan are
+		// ordering gates. A candidate read may start only after both have answered;
+		// whichever finishes second re-enters this method.
 		return
 	}
 	o.dispatchInFlight = true
@@ -569,9 +638,9 @@ func (o *Orchestrator) retryPendingExits(ctx context.Context) {
 		if r.State == StateBackoff && r.claimBaseDispatch && r.claimEpoch > 0 {
 			o.beginClaimBase(ctx, r)
 		}
-		// A finished run whose process group was not confirmed gone: ask
+		// A finished run whose execution domain was not confirmed quiet: ask
 		// again. Until it is, its outcome stays held (SPEC §7.5, §9.8). Both
-		// this and the stop above are no-ops while a ladder is already walking
+		// this and the stop above are no-ops while teardown is already running
 		// — beginStop owns that guard, since they share the one slot.
 		o.confirmQuiet(ctx, r)
 	}
@@ -609,7 +678,13 @@ func (o *Orchestrator) onReconciled(ctx context.Context, s signal) {
 	// settled release is an owed write, not a conclusion of this tick's list
 	// response. After the confirmation offer so a selected read owns the record's
 	// one operation slot; an inconclusive result re-drives its release directly.
-	o.retryHeldReleases(ctx)
+	o.retryHeldExits(ctx)
+	// After both, and before the record retries below, because it is what those
+	// exits are waiting on: an ended workspace cycle's disposal is ordered ahead of
+	// the tracker release that would give up the claim making it findable (#252,
+	// cycle.go). Later in the tick than the sweep that settles the verdict, so the
+	// ordinary case starts on the same tick it is decided.
+	o.driveEndedCycles(ctx)
 	o.retryPendingExits(ctx)
 	// The one question those retries cannot answer for themselves: is the issue
 	// still there? A write's own refusal never classifies (#134), and no read set
@@ -697,6 +772,12 @@ func (o *Orchestrator) onTickResult(ctx context.Context, s signal) {
 		}
 		return
 	}
+	if o.cycleScanInFlight || o.cycleScanFailed {
+		// This Fetch may have started before the obligation directory became
+		// unreadable. It cannot authorize dispatch while BEN cannot say which
+		// issues an independently durable disposal owns.
+		return
+	}
 	o.dispatch(ctx, s.candidates, cur)
 }
 
@@ -777,6 +858,13 @@ func gone(res refreshResult) bool {
 func (o *Orchestrator) stopAndFinish(ctx context.Context, r *Record, keepWorkspace bool, why string) {
 	r.keepOnStop = keepWorkspace
 	r.stopReason = why
+	// An exit outranks §9.9's park, and this is where that is said for a ladder
+	// already walking: a budget stop this exit overtook shares the one slot
+	// (beginStop), so its answer comes back here — and onStopped must route it
+	// out of the machine rather than into a park that keeps the claim, the
+	// workspace and a `ben:needs-review` projection (SPEC §9.8, #236). The
+	// `budgetStop` cause remains intact for the attempt record.
+	r.finishAfterStop = true
 
 	if r.handle != nil {
 		r.stopping = true
@@ -819,11 +907,20 @@ func (o *Orchestrator) finishNow(ctx context.Context, r *Record, keepWorkspace b
 	o.attemptEnded(ctx, r)
 	// An attempt still in flight when the exit was ordered — one abandoned in
 	// `preparing`, most often — ends here, deliberately stopped (#60, SPEC §7.3).
+	// The exception has already ended for a more specific reason: a confirmed
+	// budget stop can be reading its prior-attempt account when this exit arrives.
+	// That read defers the park, not the cause, so preserve `budget_exceeded` just
+	// as endAttemptSuspended does when a drain lands in the same window.
+	reason := core.FailureKilled
+	if r.parkOnBudgetPending {
+		r.parkOnBudgetPending = false
+		reason = core.FailureBudgetExceeded
+	}
 	// A no-op for every other route in, since an attempt that reached its own
 	// outcome recorded it there and this guard is idempotent.
-	o.recordAttempt(r, core.FailureKilled, VerdictUnknown)
+	o.recordAttempt(r, reason, VerdictUnknown)
 	o.abandonPendingClaimBase(ctx, r)
-	o.dispose(ctx, r, keepWorkspace)
+	o.disposeRevoked(ctx, r, keepWorkspace)
 	if r.gone || r.claimLost {
 		// Nothing to release: the claim died with the issue, or the assignment
 		// that *was* the claim is already gone (SPEC §8.3). Asking the tracker
@@ -881,6 +978,14 @@ func (o *Orchestrator) dispatch(ctx context.Context, candidates []core.Issue, cu
 			// the second lock on the same door — but the door is a second run
 			// on an issue that already has an owner, and the sweep drops the
 			// held record only once the release is confirmed.
+			continue
+		}
+		if o.endedCycleOwed(c.Identifier) {
+			// At least one previous workspace cycle still owns cleanup for this
+			// issue. Its provider address is independent of a replacement, but the
+			// obligation is still an ownership claim: do not start a new tenure while
+			// cleanup is unresolved. The next poll dispatches after all addresses
+			// confirm.
 			continue
 		}
 		if o.sweepDisposing[c.Identifier] {

@@ -793,6 +793,9 @@ func TestOnlyTheIssueReadsClassifyAnAbsentIssue(t *testing.T) {
 		// the request whose 404 is under test. Empty means the default: only the
 		// identity endpoint, so the row's first request is the one that fails.
 		serve func(*fakeGitHub)
+		// ready establishes the repository identity needed by RemotePR before
+		// the absent-issue GraphQL observation under test.
+		ready bool
 		// classifies is whether this call answers with core.ErrIssueNotFound.
 		classifies bool
 	}{
@@ -806,6 +809,12 @@ func TestOnlyTheIssueReadsClassifyAnAbsentIssue(t *testing.T) {
 		}},
 		{name: "ContentApproval", classifies: true, call: func(a *Adapter) error {
 			_, err := a.ContentApproval(context.Background(), issue)
+			return err
+		}},
+		{name: "RemotePR", classifies: true, ready: true, call: func(a *Adapter) error {
+			_, err := a.RemotePR(context.Background(), core.RemotePRQuery{
+				Issue: issue, Repository: remotePRRepositoryIdentity, Branch: "ben/7",
+			})
 			return err
 		}},
 		// The reads that do not name one issue. Their 404 is the repository's or
@@ -871,11 +880,21 @@ func TestOnlyTheIssueReadsClassifyAnAbsentIssue(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeGitHub(t)
 			f.handleGraphQL(func() graphQLIssue { return graphQLIssue{absent: true} })
+			if tc.ready {
+				f.serveRepoWithCloneURL(remotePRCloneURL)
+			}
 			if tc.serve != nil {
 				tc.serve(f)
 			}
 
-			err := tc.call(f.adapter(t))
+			a := f.adapter(t)
+			if tc.ready {
+				if err := a.Ready(t.Context()); err != nil {
+					t.Fatalf("Ready: %v", err)
+				}
+				f.reset()
+			}
+			err := tc.call(a)
 			if err == nil {
 				t.Fatalf("%s succeeded for an issue the tracker does not have", tc.name)
 			}
@@ -1709,6 +1728,7 @@ func TestFindPR(t *testing.T) {
 		State:   gh.Ptr("open"),
 		HTMLURL: gh.Ptr("https://github.com/acme/widgets/pull/9"),
 		Head:    &gh.PullRequestBranch{Ref: gh.Ptr(branch)},
+		Base:    &gh.PullRequestBranch{Ref: gh.Ptr("release/v2")},
 	}
 	mergedPR := &gh.PullRequest{
 		Number:   gh.Ptr(8),
@@ -1766,8 +1786,48 @@ func TestFindPR(t *testing.T) {
 			if pr == nil {
 				t.Fatal("FindPR() = nil, want the published pull request")
 			}
-			if pr.Number != tt.wantNumber || pr.State != tt.wantState || pr.Branch != branch {
-				t.Errorf("FindPR() = %+v, want #%d %s on %s", pr, tt.wantNumber, tt.wantState, branch)
+			if pr.Number != tt.wantNumber || pr.State != tt.wantState || pr.Branch != branch || pr.BaseBranch != "release/v2" {
+				t.Errorf("FindPR() = %+v, want #%d %s from %s to release/v2", pr, tt.wantNumber, tt.wantState, branch)
+			}
+		})
+	}
+}
+
+func TestFindPRRefusesMultipleExactHeadCandidatesRegardlessOfTargetOrOrder(t *testing.T) {
+	const branch = "ben/issue-1-9f2a"
+	pr := func(number int, target string) *gh.PullRequest {
+		return &gh.PullRequest{
+			Number: gh.Ptr(number), State: gh.Ptr("open"),
+			HTMLURL: gh.Ptr(fmt.Sprintf("https://github.com/acme/widgets/pull/%d", number)),
+			Head:    &gh.PullRequestBranch{Ref: gh.Ptr(branch)},
+			Base:    &gh.PullRequestBranch{Ref: gh.Ptr(target)},
+		}
+	}
+	correct, wrong := pr(10, "main"), pr(11, "unprotected")
+	for _, tc := range []struct {
+		name  string
+		pages [][]*gh.PullRequest
+	}{
+		{name: "correct then wrong", pages: [][]*gh.PullRequest{{correct, wrong}}},
+		{name: "wrong then correct", pages: [][]*gh.PullRequest{{wrong, correct}}},
+		{name: "second candidate on another page", pages: [][]*gh.PullRequest{{correct}, {wrong}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeGitHub(t)
+			f.handle("GET /api/v3/repos/{owner}/{repo}/pulls", func(w http.ResponseWriter, r *http.Request) {
+				page := 1
+				if r.URL.Query().Get("page") == "2" {
+					page = 2
+				}
+				if page < len(tc.pages) {
+					w.Header().Set("Link", fmt.Sprintf(`<%s%s&page=%d>; rel="next"`, f.srv.URL, r.URL.RequestURI(), page+1))
+				}
+				writeJSON(w, r, tc.pages[page-1])
+			})
+
+			got, err := f.adapter(t).FindPR(context.Background(), core.Issue{Identifier: "1"}, branch)
+			if !errors.Is(err, core.ErrPRAmbiguous) || got != nil {
+				t.Fatalf("FindPR = %+v, %v; want nil, ErrPRAmbiguous", got, err)
 			}
 		})
 	}

@@ -1553,9 +1553,9 @@ func TestATimerCannotFireOnTheNextRecordForTheIssue(t *testing.T) {
 // that invariant for the stop path; it holds identically for a run that ended on
 // its own, and the continuation track re-dispatches after about a second.
 //
-// What holds the line here is the group question, asked as a Probe while the
+// What holds the line here is the domain-quiet question, asked as a Probe while the
 // process is alive and as a Stop once Done has closed (#79) — never Done itself,
-// which reports neither the group nor permission to touch the workspace.
+// which reports neither domain quiet nor permission to touch the workspace.
 func TestNothingFollowsARunUntilItsProcessHasExited(t *testing.T) {
 	var verifies atomic.Int32
 	h := start(t, harnessOpts{
@@ -1607,13 +1607,91 @@ func TestNothingFollowsARunUntilItsProcessHasExited(t *testing.T) {
 	waitFor(t, "the continuation", func() bool { return h.Runner.StartCount() == 2 })
 }
 
-// SPEC §7.5 puts process-group termination behind `Stop` and makes its
-// confirmed/unconfirmed verdict the evidence. `Done` deliberately reports the
-// harness process only — a harness that spawned tools of its own leaves them
-// in its group, and on a natural exit the adapter runs no signal ladder, so
-// nothing has asked whether they are gone. A reaped harness is therefore not a
-// quiet workspace, and the outcome waits for one that is.
-func TestNothingFollowsARunUntilItsGroupIsConfirmedGone(t *testing.T) {
+// Once Events closes, the read-only Probe races the already-near Done edge. A
+// natural completion must confirm quiet whether Probe answers first or Done
+// overtakes it and requires Stop to make a fresh observation. This is the
+// regression from #271: accepting only a previously signalled domain stranded
+// an ordinary successful run forever when Done won that race.
+func TestNaturalDomainQuietIsSchedulerIndependent(t *testing.T) {
+	tests := []struct {
+		name       string
+		configure  func(*harnessOpts, <-chan struct{})
+		beforeOpen func(*testing.T, *harness, *fake.Handle)
+		wantProbe  bool
+		wantStop   bool
+	}{
+		{
+			name: "Probe wins before Done",
+			configure: func(opts *harnessOpts, _ <-chan struct{}) {
+				opts.holdDone = true
+			},
+			beforeOpen: func(t *testing.T, h *harness, run *fake.Handle) {
+				t.Helper()
+				waitFor(t, "the read-only quiet observation", func() bool {
+					return h.applied(sigProbed) > 0
+				})
+				run.ReleaseDone()
+			},
+			wantProbe: true,
+		},
+		{
+			name: "Done wins the Probe race",
+			configure: func(opts *harnessOpts, open <-chan struct{}) {
+				opts.probeGate = func() { <-open }
+			},
+			beforeOpen: func(t *testing.T, h *harness, _ *fake.Handle) {
+				t.Helper()
+				waitFor(t, "Done to overtake the blocked Probe", func() bool {
+					return h.applied(sigHandleDone) > 0
+				})
+			},
+			wantProbe: true,
+			wantStop:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			open := make(chan struct{})
+			var openOnce sync.Once
+			release := func() { openOnce.Do(func() { close(open) }) }
+			t.Cleanup(release)
+
+			var verifies atomic.Int32
+			opts := harnessOpts{
+				issues: []core.Issue{fake.Issue("1", epoch)},
+				verifier: verifierFunc(func(context.Context, core.Issue, core.Workspace) (VerifyResult, error) {
+					verifies.Add(1)
+					return VerifyResult{Verdict: VerdictIncomplete}, nil
+				}),
+			}
+			tt.configure(&opts, open)
+			h := start(t, opts)
+			waitFor(t, "the run to start", func() bool { return h.Runner.StartCount() == 1 })
+			run := h.Runner.LastHandle()
+
+			tt.beforeOpen(t, h, run)
+			release()
+			waitFor(t, "the natural success to reach verification", func() bool {
+				return verifies.Load() == 1
+			})
+
+			if got := run.ProbeCount() > 0; got != tt.wantProbe {
+				t.Errorf("Probe called = %v, want %v", got, tt.wantProbe)
+			}
+			if got := run.StopCount() > 0; got != tt.wantStop {
+				t.Errorf("Stop called = %v, want %v", got, tt.wantStop)
+			}
+
+			// A naturally quiet run must not leave the daemon unable to drain.
+			h.shutdown()
+		})
+	}
+}
+
+// A live execution-domain member after direct execution ends is not a quiet
+// workspace. The outcome remains held until bounded teardown confirms it.
+func TestNothingFollowsARunUntilItsDomainIsConfirmedQuiet(t *testing.T) {
 	t.Run("a run that reported success", func(t *testing.T) {
 		var verifies atomic.Int32
 		h := start(t, harnessOpts{
@@ -1626,10 +1704,10 @@ func TestNothingFollowsARunUntilItsGroupIsConfirmedGone(t *testing.T) {
 				return VerifyResult{Verdict: VerdictIncomplete}, nil
 			}),
 			withHook: true,
-			// A descendant outlived the harness, so the group is not confirmed
-			// gone — what the adapter reports for a survivor. Both halves are
+			// A member outlived direct execution, so the domain is not confirmed
+			// quiet — what the adapter reports for a survivor. Both halves are
 			// needed to say that; see harnessOpts.stopUnconfirmed.
-			descendants:     true,
+			domainMembers:   true,
 			stopUnconfirmed: true,
 		})
 		// The state moves on the terminal event, so this happens either way and
@@ -1637,7 +1715,7 @@ func TestNothingFollowsARunUntilItsGroupIsConfirmedGone(t *testing.T) {
 		h.WaitState("1", StateVerifying)
 		run := h.Runner.LastHandle()
 		h.PollNow()
-		h.waitForGroupQuestion(run)
+		h.waitForDomainQuestion(run)
 
 		// The harness is reaped and the agent has claimed success. Nothing that
 		// touches the workspace may begin while a descendant may still be in it.
@@ -1645,7 +1723,7 @@ func TestNothingFollowsARunUntilItsGroupIsConfirmedGone(t *testing.T) {
 			t.Errorf("the §9.7 evidence check ran %d times against a workspace a surviving descendant may hold", got)
 		}
 		if got := h.Hooked.AfterRunCount("1"); got != 0 {
-			t.Errorf("the after_run hook fired %d times before the group was confirmed gone", got)
+			t.Errorf("the after_run hook fired %d times before the domain was confirmed quiet", got)
 		}
 		if n := h.Tracker.ReleaseCount("1"); n != 0 {
 			t.Errorf("released %d times; an unconfirmed termination retains the claim (SPEC §9.8)", n)
@@ -1681,21 +1759,21 @@ func TestNothingFollowsARunUntilItsGroupIsConfirmedGone(t *testing.T) {
 				return fake.Fail(core.FailureCrashed)
 			},
 			withHook: true,
-			// As above: the group outlives the process, and the ladder reports
+			// As above: a domain member outlives direct execution, and Stop reports
 			// what that means (see harnessOpts.stopUnconfirmed).
-			descendants:     true,
+			domainMembers:   true,
 			stopUnconfirmed: true,
 		})
 		waitFor(t, "the run to start", func() bool { return h.Runner.StartCount() == 1 })
 		run := h.Runner.LastHandle()
 		h.PollNow()
-		h.waitForGroupQuestion(run)
+		h.waitForDomainQuestion(run)
 
 		if got := h.stateOf("1"); got != StateRunning {
 			t.Errorf("state = %q; the crash was routed while a descendant may still hold the workspace", got)
 		}
 		if got := h.Hooked.AfterRunCount("1"); got != 0 {
-			t.Errorf("the after_run hook fired %d times before the group was confirmed gone", got)
+			t.Errorf("the after_run hook fired %d times before the domain was confirmed quiet", got)
 		}
 
 		// As in the sibling above: the barrier already acknowledged the stop's
@@ -1718,27 +1796,27 @@ func TestNothingFollowsARunUntilItsGroupIsConfirmedGone(t *testing.T) {
 	// enqueues a verifier and its counter lags the decision by a scheduling
 	// quantum, which is what made the same mutant escape 1 run in 20 when measured
 	// through it (#106's review).
-	t.Run("a run whose group is observed before Done", func(t *testing.T) {
+	t.Run("a run whose domain is observed before Done", func(t *testing.T) {
 		h := start(t, harnessOpts{
 			issues:          []core.Issue{fake.Issue("1", epoch)},
 			script:          func(core.RunSpec, int) []core.Event { return fake.Fail(core.FailureCrashed) },
 			withHook:        true,
-			descendants:     true,
+			domainMembers:   true,
 			stopUnconfirmed: true,
 			holdDone:        true,
 		})
 		waitFor(t, "the run to start", func() bool { return h.Runner.StartCount() == 1 })
 		run := h.Runner.LastHandle()
 
-		// The observation, and its answer handled. Not waitForGroupQuestion: that
+		// The observation, and its answer handled. Not waitForDomainQuestion: that
 		// helper waits for the Stop, which cannot happen yet — here the point is
 		// precisely what the loop does with a *probe* that came back unconfirmed.
 		waitFor(t, "the pre-Done observation's answer to be handled", func() bool {
 			return h.applied(sigProbed) > 0
 		})
 		// §7.5, the rule this staging exists to pin: before `Done` the question is
-		// only ever asked with Probe. A Stop here would SIGTERM a group that may
-		// still be flushing §7.2's transcript.
+		// only ever asked with Probe. A Stop here could disturb execution that is
+		// still flushing §7.2's transcript.
 		if got := run.StopCount(); got != 0 {
 			t.Errorf("stopped %d times before Done; the pre-Done question is Probe's alone (#79)", got)
 		}
@@ -1792,12 +1870,12 @@ func TestAnExitDecidedDuringTheQuiescenceStopWins(t *testing.T) {
 			verifies.Add(1)
 			return VerifyResult{Verdict: VerdictPublished, PRURL: "https://example.test/pull/1"}, nil
 		}),
-		// The ladder stands in the gate for as long as the test needs, which is
-		// the window a SIGTERM grace opens in production.
+		// Teardown stands in the gate for as long as the test needs, which is
+		// the bounded window Stop opens in production.
 		stopGate: func() { <-release },
-		// And the group outlives the process, which is what makes the ladder the
+		// And a domain member outlives direct execution, making teardown the
 		// operation in flight rather than an observation.
-		descendants: true,
+		domainMembers: true,
 	})
 
 	// The agent claims success and its process is reaped, so the outcome is
@@ -1813,7 +1891,7 @@ func TestAnExitDecidedDuringTheQuiescenceStopWins(t *testing.T) {
 	h.Tracker.Mutate("1", func(i *core.Issue) { i.State = "closed" })
 	h.PollNow()
 	if got := h.Runner.LastHandle().StopCount(); got != 1 {
-		t.Errorf("Stop called %d times; a second signal ladder was walked over the first", got)
+		t.Errorf("Stop called %d times; a second teardown was started over the first", got)
 	}
 
 	openGate()
@@ -1859,16 +1937,16 @@ func TestAStreamEndingWithoutATerminalEventIsHeldAsACrash(t *testing.T) {
 		t.Fatalf("outcome = %+v, want a held failed(crashed)", r.outcome)
 	}
 	if r.State != StateRunning {
-		t.Errorf("state = %q; the crash was routed before the process group was confirmed gone", r.State)
+		t.Errorf("state = %q; the crash was routed before the execution domain was confirmed quiet", r.State)
 	}
 	// Asked, and asked with the operation the phase permits: before Done the
 	// process may still be flushing its transcript, so the question is a
-	// non-signalling Probe rather than a signal ladder (#79).
+	// read-only Probe rather than bounded teardown (#79).
 	if !r.probeInFlight {
-		t.Error("nothing asked whether the process group was gone")
+		t.Error("nothing asked whether the execution domain was gone")
 	}
 	if r.stopInFlight {
-		t.Error("the group was signalled before Done; a probe is the only permissible question there")
+		t.Error("the domain was torn down before Done; a probe is the only permissible question there")
 	}
 }
 
@@ -1936,27 +2014,26 @@ func TestDeliverableSeparatesTenureFromAttempt(t *testing.T) {
 	}
 }
 
-// The cleanup Done permits walks a ladder, and the answer worth having is a
-// confirmed one. The two modes differ in patience: discard cuts the ladder's
-// grace to a tenth, which trades a confirmed verdict for speed in the one place
-// BEN is not in a hurry. (The question *before* Done walks no ladder at all —
-// that is a Probe, and it signals nothing: #79.) An unconfirmed answer costs a retained claim
-// and another tick (§9.8); waiting costs nothing in the ordinary case, where
-// the ladder short-circuits on a group that is already gone.
+// The cleanup Done permits is bounded teardown, and the answer worth having is
+// a confirmed one. Discard is less patient than interrupt, which trades a
+// confirmed verdict for speed in the one place BEN is not in a hurry. (The
+// question *before* Done is a read-only Probe: #79.) An unconfirmed answer costs
+// a retained claim and another tick (§9.8); waiting costs nothing in the
+// ordinary case, where Stop observes an already-quiet domain.
 //
 // The transcript argument that first chose this mode still holds, and #79 gave it
 // teeth one layer down: a stop is only reached *after* Done, where the record is
-// already written and closed, and everything before that edge is a probe which
-// signals nothing at all. The *choice* still has to be pinned somewhere, though:
+// already written and closed, and everything before that edge is a read-only
+// probe. The *choice* still has to be pinned somewhere, though:
 // nothing else in this package fails when it flips back, and the reason it is
 // right has changed twice now.
-// Driven through a group that outlives its process, because that is now the case
-// where a stop is the operation at all: after #79 an ordinary run is settled by
-// the non-signalling probe, and whether a stop follows depends on which side of
+// Driven through a domain member that outlives direct execution, because that
+// is now the case where Stop is the operation at all: after #79 an ordinary run
+// is settled by the read-only probe, and whether a stop follows depends on which side of
 // Done the probe landed — so asserting a stop there would be asserting on a race
 // (it flaked about one run in ninety before this was pinned to the right path).
 func TestThePostDoneCleanupInterruptsRatherThanDiscards(t *testing.T) {
-	h := start(t, harnessOpts{issues: []core.Issue{fake.Issue("1", epoch)}, descendants: true})
+	h := start(t, harnessOpts{issues: []core.Issue{fake.Issue("1", epoch)}, domainMembers: true})
 	h.WaitState("1", StateDone)
 
 	handle := h.Runner.LastHandle()
@@ -1964,7 +2041,7 @@ func TestThePostDoneCleanupInterruptsRatherThanDiscards(t *testing.T) {
 		t.Fatal("no run was started")
 	}
 	if handle.ProbeCount() == 0 {
-		t.Error("the group was signalled without being observed first; before Done a probe is the only permissible question")
+		t.Error("the domain was torn down without being observed first; before Done a probe is the only permissible question")
 	}
 	got := handle.Stops()
 	if len(got) != 1 {
@@ -2101,10 +2178,10 @@ func containsMilestone(got []core.Milestone, want core.Milestone) bool {
 // While the process is still alive after its stream closed, the orchestrator may
 // only *observe*: a signal there would land on a harness still flushing its
 // transcript, so the outcome is held on repeated probes and nothing is signalled
-// at all. Once Done closes, the process is reaped — anything left in the group
-// has outlived its owner and will not leave on its own — so the question becomes
-// a stop, and that is what releases the outcome.
-func TestTheGroupIsObservedBeforeDoneAndCleanedAfterIt(t *testing.T) {
+// at all. Once Done closes, direct execution is over — anything left in the
+// domain has outlived it — so the question becomes a stop, and that is what
+// releases the outcome.
+func TestTheDomainIsObservedBeforeDoneAndTornDownAfterIt(t *testing.T) {
 	var verifies atomic.Int32
 	h := start(t, harnessOpts{
 		issues: []core.Issue{fake.Issue("1", epoch)},
@@ -2133,7 +2210,7 @@ func TestTheGroupIsObservedBeforeDoneAndCleanedAfterIt(t *testing.T) {
 		t.Errorf("the §9.7 evidence check ran %d times against a workspace a live process still holds", got)
 	}
 	if got := h.Hooked.AfterRunCount("1"); got != 0 {
-		t.Errorf("the after_run hook fired %d times before the group was confirmed gone", got)
+		t.Errorf("the after_run hook fired %d times before the domain was confirmed quiet", got)
 	}
 
 	// And it keeps asking, which is the diagnosable half: the case this replaced
@@ -2150,14 +2227,14 @@ func TestTheGroupIsObservedBeforeDoneAndCleanedAfterIt(t *testing.T) {
 	handle.ReleaseProcess()
 	waitFor(t, "the evidence check", func() bool { return verifies.Load() == 1 })
 	if got := handle.StopCount(); got == 0 {
-		t.Error("nothing cleaned the group after Done; a descendant that outlived the process would be left running")
+		t.Error("nothing cleaned the domain after Done; an outliving member would be left running")
 	}
 	waitFor(t, "the after_run hook", func() bool { return h.Hooked.AfterRunCount("1") == 1 })
 }
 
-// A group that outlives its process is exactly what the post-Done stop exists
-// for: the probe cannot clear it, and only the ladder does (#79).
-func TestAGroupThatOutlivesTheProcessIsCleanedByTheStop(t *testing.T) {
+// A domain member that outlives direct execution is exactly what the post-Done
+// stop exists for: Probe cannot clear it, and only Stop does (#79).
+func TestADomainMemberThatOutlivesDirectExecutionIsTornDownByStop(t *testing.T) {
 	var verifies atomic.Int32
 	h := start(t, harnessOpts{
 		issues: []core.Issue{fake.Issue("1", epoch)},
@@ -2168,17 +2245,17 @@ func TestAGroupThatOutlivesTheProcessIsCleanedByTheStop(t *testing.T) {
 			verifies.Add(1)
 			return VerifyResult{Verdict: VerdictIncomplete}, nil
 		}),
-		descendants: true,
+		domainMembers: true,
 	})
 	h.WaitState("1", StateVerifying)
 	handle := h.Runner.Handles[0]
 
-	// Done closes — the process is gone — but the group is not, so the probe
+	// Done closes — direct execution is over — but the domain is not quiet, so the probe
 	// keeps answering unconfirmed and the stop is what settles it.
-	waitFor(t, "the group to be cleaned", func() bool { return handle.StopCount() > 0 })
+	waitFor(t, "the domain to be cleaned", func() bool { return handle.StopCount() > 0 })
 	waitFor(t, "the evidence check", func() bool { return verifies.Load() == 1 })
 	if got := handle.ProbeCount(); got == 0 {
-		t.Error("the group was signalled without ever being observed first")
+		t.Error("the domain was torn down without ever being observed first")
 	}
 }
 
@@ -2232,7 +2309,7 @@ func TestAnExitDecidedDuringAnObservationWins(t *testing.T) {
 // observation's answer, even a *confirmed* one (#79 review).
 //
 // The confirmed case is the dangerous one and the reason for the guard: a probe
-// that comes back "the group is gone" is telling the truth, and routing on it
+// that comes back "the domain is quiet" is telling the truth, and routing on it
 // would be correct for a record that was staying. This one is leaving —
 // reconciliation stopped it and owns the exit — so routing would run the §9.7
 // evidence check and the after-run hook against a workspace the exit is about to
@@ -2268,14 +2345,14 @@ func TestAConfirmedObservationDoesNotOverrideAPendingExit(t *testing.T) {
 	handle := h.Runner.LastHandle()
 	waitFor(t, "the observation", func() bool { return handle.ProbeCount() == 1 })
 
-	// The issue goes terminal while the observation is out; the exit's ladder is
+	// The issue goes terminal while the observation is out; the exit's teardown is
 	// now standing in its own gate.
 	h.Tracker.Mutate("1", func(i *core.Issue) { i.State = "closed" })
 	h.PollNow()
 	waitFor(t, "the exit's stop", func() bool { return handle.StopCount() == 1 })
 
-	// The observation answers confirmed — the process ended, so the group really
-	// is gone — and it must change nothing. Deliberately *not* asserted against a
+	// The observation answers confirmed — the domain became quiet — and it must
+	// change nothing. Deliberately *not* asserted against a
 	// sleep here: "the loop has consumed sigProbed" is not observable from this
 	// side, and under load the stop can finish first and take the record away,
 	// which would let the buggy implementation pass. The assertions that follow
@@ -2284,7 +2361,7 @@ func TestAConfirmedObservationDoesNotOverrideAPendingExit(t *testing.T) {
 	// for the handler itself.
 	openProbe()
 
-	// The exit completes on its own terms once its ladder is let out.
+	// The exit completes on its own terms once its teardown is let out.
 	openStop()
 	h.WaitGone("1")
 	if got := verifies.Load(); got != 0 {
@@ -2342,8 +2419,8 @@ func TestOnProbedRefusesToRouteWhileAnExitIsPending(t *testing.T) {
 
 		o.onProbed(context.Background(), r, confirmed)
 
-		if r.groupGone {
-			t.Error("a confirmed observation set groupGone while the exit's stop was still out")
+		if r.domainQuiet {
+			t.Error("a confirmed observation set domainQuiet while the exit's stop was still out")
 		}
 		if r.outcome == nil {
 			t.Error("the held outcome was routed on an observation the exit outranks")
@@ -2364,9 +2441,9 @@ func TestOnProbedRefusesToRouteWhileAnExitIsPending(t *testing.T) {
 
 		o.onProbed(context.Background(), r, confirmed)
 
-		if r.groupGone || r.outcome == nil || r.handle == nil || r.pending != 0 {
-			t.Errorf("a confirmed observation acted while the exit's ladder was out: groupGone=%v outcome=%v handle=%v pending=%d",
-				r.groupGone, r.outcome != nil, r.handle != nil, r.pending)
+		if r.domainQuiet || r.outcome == nil || r.handle == nil || r.pending != 0 {
+			t.Errorf("a confirmed observation acted while the exit's ladder was out: domainQuiet=%v outcome=%v handle=%v pending=%d",
+				r.domainQuiet, r.outcome != nil, r.handle != nil, r.pending)
 		}
 	})
 
@@ -2382,8 +2459,8 @@ func TestOnProbedRefusesToRouteWhileAnExitIsPending(t *testing.T) {
 
 		o.onProbed(context.Background(), r, confirmed)
 
-		if !r.groupGone {
-			t.Error("a confirmed observation did not record the group as gone")
+		if !r.domainQuiet {
+			t.Error("a confirmed observation did not record the domain as quiet")
 		}
 		if !r.summarizing || r.pending != 1 {
 			t.Errorf("summarizing=%v pending=%d, want the prior-attempt account read started",

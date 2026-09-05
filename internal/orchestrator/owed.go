@@ -117,6 +117,22 @@ func (o *Orchestrator) driveOwed(ctx context.Context, r *Record) {
 		return
 	}
 	eff := r.owed[0]
+	if isExit(eff.what) && o.endedCycleOwed(r.Issue.Identifier) {
+		// The one effect this record may not land yet, in *either* of its forms.
+		// The release gives up the tracker claim, which is what makes the
+		// obligation findable after a restart — §9.10 step 1 enumerates the claim
+		// and recovery re-derives the same verdict from the same labels. The forget
+		// gives up the record itself, which for a gone or lost claim is worse:
+		// there is no claim to re-derive from, so the record is the last thing that
+		// knows a sandbox needs releasing, and `drained` would have nothing left to
+		// wait on (#252, cycle.go).
+		//
+		// Held here rather than refused inside the effect: `do` runs on the effect
+		// queue's goroutine and the obligation set is loop-owned, so the question
+		// can only be asked from here. Re-driven every tick by retryPendingExits and
+		// immediately by clearEndedCycle, so nothing waits longer than the disposal.
+		return
+	}
 	// Keyed to the record rather than the attempt: an owed write belongs to
 	// the record, and the record can be forgotten while its completion is
 	// still in flight.
@@ -200,6 +216,28 @@ func (o *Orchestrator) afterEffect(ctx context.Context, r *Record, what string) 
 // owesAnything reports whether the record still has writes the tracker has
 // not accepted. A record with unlanded writes may not be forgotten.
 func (r *Record) owesAnything() bool { return len(r.owed) > 0 }
+
+// isExit reports whether an effect is the one that drops the record — the
+// release, or the forget that stands in for it when there is no claim left to
+// give up. Two spellings of one thing, so anything ordering against "the record
+// leaves" asks here rather than naming one of them and missing the other.
+func isExit(what string) bool { return what == effectRelease || what == effectForget }
+
+// owesBeforeExit reports whether this record still owes something *ahead* of the
+// exit that drops it.
+//
+// It is what an ended workspace cycle's disposal waits on (cycle.go). The queue
+// ahead of an exit is where the §6.5 after_run hook and the claim-base abandon
+// sit, and both touch the workspace the disposal is about to delete — head-of-line
+// ordering used to sequence them because the disposal was on this queue too, and
+// once it moved off, a delete could retire the cycle out from under a hook that
+// had not run yet (remotews.AfterRun then skips it silently on ErrNoCycle).
+//
+// Deliberately not "owes anything": the exit itself is held *behind* the
+// disposal, so waiting for an empty queue would be each waiting on the other.
+func (r *Record) owesBeforeExit() bool {
+	return len(r.owed) > 0 && !isExit(r.owed[0].what)
+}
 
 // owesForget reports whether the exit that drops this record is already queued,
 // so a second finish does not append another (see finishNow).

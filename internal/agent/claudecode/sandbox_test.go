@@ -30,12 +30,23 @@ const (
 
 func goldenPaths() sandboxPaths {
 	return sandboxPaths{
-		Workspace:    goldenWorkspace,
-		SharedGitDir: goldenSharedGit,
-		PrivateDir:   goldenPrivate,
-		Binary:       goldenBinary,
-		Canonical:    goldenCanonical,
-		Control:      sandboxControlFor(goldenPrivate),
+		Workspace:     goldenWorkspace,
+		SharedGitDir:  goldenSharedGit,
+		PrivateDir:    goldenPrivate,
+		WorktreeAdmin: filepath.Join(goldenSharedGit, "worktrees", "issue-7"),
+		SharedGitWriteDirs: []string{
+			filepath.Join(goldenSharedGit, "objects"),
+			filepath.Join(goldenSharedGit, "refs"),
+			filepath.Join(goldenSharedGit, "logs"),
+		},
+		SharedGitReadFiles: []string{
+			filepath.Join(goldenSharedGit, "config"),
+			filepath.Join(goldenSharedGit, "HEAD"),
+			filepath.Join(goldenSharedGit, "info", "exclude"),
+		},
+		Binary:    goldenBinary,
+		Canonical: goldenCanonical,
+		Control:   sandboxControlFor(goldenPrivate),
 	}
 }
 
@@ -120,6 +131,12 @@ func TestSandboxDeniesTheAgentsOwnControlSurface(t *testing.T) {
 			"hooks are code the next run executes, in a directory every workspace of this workflow shares"},
 		{filepath.Join(goldenSharedGit, "config"),
 			"the shared repository's own configuration"},
+		{filepath.Join(goldenSharedGit, "worktrees", "issue-7", "commondir"),
+			"rewriting commondir relocates the config and hooks a daemon-side git resolves"},
+		{filepath.Join(goldenSharedGit, "worktrees", "issue-7", "config.worktree"),
+			"per-worktree config can steer Git when extensions.worktreeConfig is enabled"},
+		{filepath.Join(goldenSharedGit, "worktrees", "issue-7", "gitdir"),
+			"the reverse worktree pointer is stable administration, not commit state"},
 		{filepath.Join(goldenWorkspace, ".git"),
 			"the gitdir pointer srt leaves writable by design; §6.2 reattaches, so a rewrite survives"},
 		{control.Dir,
@@ -130,17 +147,35 @@ func TestSandboxDeniesTheAgentsOwnControlSurface(t *testing.T) {
 		}
 	}
 
-	// The shared git dir needs *both* lists. Measured: with it in allowWrite
-	// only, under denyRead: [$HOME], git reports "not a git repository:
-	// …/worktrees/<key>" — allowWrite does not imply read, and SPEC §5.2.4's
-	// default root being under $HOME is what makes that reachable.
+	// The whole shared repository is deliberately in neither list. A writable
+	// parent lets Linux move the read-only mounts on denied files; a read-only
+	// parent is emitted after nested write binds and masks those writes. Exact
+	// mutable directories and common-root files are the only coherent shape.
 	for _, list := range []struct {
 		name string
 		in   []string
 	}{{"allowRead", fs.AllowRead}, {"allowWrite", fs.AllowWrite}} {
-		if !slices.Contains(list.in, goldenSharedGit) {
-			t.Errorf("%s is missing the shared git dir %s; a linked worktree's .git points into "+
-				"it, so `git commit` fails without it in both lists", list.name, goldenSharedGit)
+		if slices.Contains(list.in, goldenSharedGit) {
+			t.Errorf("%s grants the whole shared git dir %s", list.name, goldenSharedGit)
+		}
+	}
+	for _, want := range []string{
+		filepath.Join(goldenSharedGit, "objects"),
+		filepath.Join(goldenSharedGit, "refs"),
+		filepath.Join(goldenSharedGit, "logs"),
+		filepath.Join(goldenSharedGit, "worktrees", "issue-7"),
+	} {
+		if !slices.Contains(fs.AllowWrite, want) {
+			t.Errorf("allowWrite = %v, want the measured Git mutation root %s", fs.AllowWrite, want)
+		}
+	}
+	for _, want := range []string{
+		filepath.Join(goldenSharedGit, "config"),
+		filepath.Join(goldenSharedGit, "HEAD"),
+		filepath.Join(goldenSharedGit, "info", "exclude"),
+	} {
+		if !slices.Contains(fs.AllowRead, want) {
+			t.Errorf("allowRead = %v, want required common Git file %s", fs.AllowRead, want)
 		}
 	}
 	// Read policy bounded at all: with denyRead empty the posture is
@@ -158,6 +193,233 @@ func TestSandboxDeniesTheAgentsOwnControlSurface(t *testing.T) {
 	}
 }
 
+// The independent boundary for the worktree redirect denial is Git's own
+// linked-worktree layout, not a hand-written list in the golden. The writable
+// pointer may select only the one real directory whose reciprocal pointers
+// lead back to the provider-reported paths.
+func TestSandboxSelectsTheCurrentGitWorktreeAdmin(t *testing.T) {
+	parallel(t)
+	git := requireGit(t)
+	root := t.TempDir()
+	shared := filepath.Join(root, "base.git")
+	workspace := filepath.Join(root, "issues", "issue-7")
+	private := mkdir(t, root, "private", "issue-7")
+	seedLinkedWorktree(t, git, shared, workspace)
+	gitOut(t, git, "--git-dir="+shared, "pack-refs", "--all")
+
+	admin := filepath.Clean(gitOut(t, git, "-C", workspace, "rev-parse", "--absolute-git-dir"))
+	p := goldenProvider(t)
+	p.AddDirs = nil
+	paths, err := p.sandboxPathsFor(core.RunSpec{Workspace: core.WorkspacePaths{
+		Path: workspace, SharedGitDir: shared, PrivateDir: private,
+	}}, git, "")
+	if err != nil {
+		t.Fatalf("sandboxPathsFor: %v", err)
+	}
+	if !sameTestPath(t, paths.WorktreeAdmin, admin) {
+		t.Fatalf("WorktreeAdmin = %s, want Git's %s", paths.WorktreeAdmin, admin)
+	}
+	for _, want := range []string{
+		filepath.Join(shared, "info", "exclude"),
+		filepath.Join(shared, "packed-refs"),
+	} {
+		if !slices.Contains(paths.SharedGitReadFiles, want) {
+			t.Errorf("SharedGitReadFiles = %v, want existing %s", paths.SharedGitReadFiles, want)
+		}
+	}
+	settings := p.sandboxSettings(paths, "linux", root)
+	if !slices.ContainsFunc(settings.Filesystem.AllowWrite, func(got string) bool {
+		return sameTestPath(t, got, admin)
+	}) {
+		t.Errorf("allowWrite = %v, want only this worktree's admin dir %s",
+			settings.Filesystem.AllowWrite, admin)
+	}
+	for _, name := range []string{"commondir", "config.worktree", "gitdir"} {
+		want := filepath.Join(admin, name)
+		if !slices.Contains(settings.Filesystem.DenyWrite, want) {
+			t.Errorf("denyWrite = %v, want Git's reported worktree admin file %s",
+				settings.Filesystem.DenyWrite, want)
+		}
+	}
+}
+
+// Retained state predating this posture is untrusted. A pointer may make an
+// attempt fail, but it may not choose an allowWrite path: every accepted admin
+// is a real direct child of the reported store with a reciprocal pointer pair.
+func TestSandboxRefusesUntrustedWorktreeAdminState(t *testing.T) {
+	parallel(t)
+	for _, name := range []string{
+		"workspace pointer leaves the reported store",
+		"workspace pointer traverses a writable alias",
+		"workspace pointer is hard-linked",
+		"worktrees registry is replaceable",
+		"admin directory is a symlink",
+		"commondir leaves the reported store",
+		"commondir traverses a writable alias",
+		"commondir is hard-linked",
+		"gitdir does not point back to the workspace",
+		"gitdir traverses a writable alias",
+		"gitdir is hard-linked",
+		"shared refs directory is a symlink",
+		"shared config is a symlink",
+		"shared config is hard-linked",
+		"per-worktree config contains retained state",
+		"per-worktree config is hard-linked",
+	} {
+		t.Run(name, func(t *testing.T) {
+			git := requireGit(t)
+			root := t.TempDir()
+			shared := filepath.Join(root, "base.git")
+			workspace := filepath.Join(root, "issues", "issue-7")
+			private := mkdir(t, root, "private", "issue-7")
+			seedLinkedWorktree(t, git, shared, workspace)
+			admin := filepath.Clean(gitOut(t, git, "-C", workspace, "rev-parse", "--absolute-git-dir"))
+			outside := mkdir(t, root, "outside")
+			hardLink := func(source, name string) {
+				t.Helper()
+				if err := os.Link(source, filepath.Join(workspace, name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			switch name {
+			case "workspace pointer leaves the reported store":
+				if err := os.WriteFile(filepath.Join(workspace, ".git"),
+					[]byte("gitdir: "+outside+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "workspace pointer traverses a writable alias":
+				alias := filepath.Join(workspace, "worktrees-alias")
+				if err := os.Symlink(filepath.Join(shared, "worktrees"), alias); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(workspace, ".git"),
+					[]byte("gitdir: "+filepath.Join(alias, filepath.Base(admin))+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "workspace pointer is hard-linked":
+				hardLink(filepath.Join(workspace, ".git"), "dot-git-alias")
+			case "worktrees registry is replaceable":
+				registry := filepath.Join(shared, "worktrees")
+				if err := os.Rename(registry, registry+".real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, registry); err != nil {
+					t.Fatal(err)
+				}
+			case "admin directory is a symlink":
+				if err := os.Rename(admin, admin+".real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(admin+".real", admin); err != nil {
+					t.Fatal(err)
+				}
+			case "commondir leaves the reported store":
+				if err := os.WriteFile(filepath.Join(admin, "commondir"),
+					[]byte(outside+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "commondir traverses a writable alias":
+				alias := filepath.Join(workspace, "common-alias")
+				if err := os.Symlink(shared, alias); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(admin, "commondir"),
+					[]byte(alias+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "commondir is hard-linked":
+				hardLink(filepath.Join(admin, "commondir"), "commondir-alias")
+			case "gitdir does not point back to the workspace":
+				if err := os.WriteFile(filepath.Join(admin, "gitdir"),
+					[]byte(filepath.Join(outside, ".git")+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "gitdir traverses a writable alias":
+				alias := filepath.Join(workspace, "self-alias")
+				if err := os.Symlink(workspace, alias); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(admin, "gitdir"),
+					[]byte(filepath.Join(alias, ".git")+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "gitdir is hard-linked":
+				hardLink(filepath.Join(admin, "gitdir"), "gitdir-alias")
+			case "shared refs directory is a symlink":
+				refs := filepath.Join(shared, "refs")
+				if err := os.Rename(refs, refs+".real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, refs); err != nil {
+					t.Fatal(err)
+				}
+			case "shared config is a symlink":
+				config := filepath.Join(shared, "config")
+				if err := os.Rename(config, config+".real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(config+".real", config); err != nil {
+					t.Fatal(err)
+				}
+			case "shared config is hard-linked":
+				hardLink(filepath.Join(shared, "config"), "config-alias")
+			case "per-worktree config contains retained state":
+				if err := os.WriteFile(filepath.Join(admin, "config.worktree"),
+					[]byte("[core]\n\thooksPath = /agent/chosen\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "per-worktree config is hard-linked":
+				config := filepath.Join(admin, "config.worktree")
+				if err := os.WriteFile(config, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				hardLink(config, "worktree-config-alias")
+			}
+
+			_, err := goldenProvider(t).sandboxPathsFor(core.RunSpec{Workspace: core.WorkspacePaths{
+				Path: workspace, SharedGitDir: shared, PrivateDir: private,
+			}}, git, "")
+			if !errors.Is(err, ErrSandbox) {
+				t.Errorf("sandboxPathsFor = %v, want ErrSandbox", err)
+			}
+		})
+	}
+}
+
+// Composition does not snapshot the worktree registry. It grants only the
+// current admin directory, while the registry itself stays read-only; a later
+// `git worktree add` is therefore not writable to the older run.
+func TestSandboxDoesNotGrantAWorktreeAddedAfterComposition(t *testing.T) {
+	parallel(t)
+	git := requireGit(t)
+	root := t.TempDir()
+	shared := filepath.Join(root, "base.git")
+	workspace := filepath.Join(root, "issues", "issue-7")
+	private := mkdir(t, root, "private", "issue-7")
+	seedLinkedWorktree(t, git, shared, workspace)
+	p := goldenProvider(t)
+	p.AddDirs = nil
+	paths, err := p.sandboxPathsFor(core.RunSpec{Workspace: core.WorkspacePaths{
+		Path: workspace, SharedGitDir: shared, PrivateDir: private,
+	}}, git, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := p.sandboxSettings(paths, "linux", root).Filesystem
+
+	later := filepath.Join(root, "issues", "issue-9")
+	gitOut(t, git, "--git-dir="+shared, "worktree", "add", "-b", "ben/issue-9", later, "main")
+	laterAdmin := filepath.Clean(gitOut(t, git, "-C", later, "rev-parse", "--absolute-git-dir"))
+	for _, path := range []string{filepath.Join(shared, "worktrees"), laterAdmin} {
+		for _, grant := range fs.AllowWrite {
+			if path == grant || strings.HasPrefix(path, filepath.Clean(grant)+string(filepath.Separator)) {
+				t.Errorf("allowWrite entry %s grants %s, which was created after composition", grant, path)
+			}
+		}
+	}
+}
+
 // The shared git dir is bound from what the provider reported, never derived
 // from the workspace path. SPEC §7.1 forbids the derivation because
 // `git rev-parse --git-common-dir` reads it out of `<workspace>/.git`, which
@@ -171,10 +433,32 @@ func TestSandboxBindsTheReportedSharedGitDirNotOneDerivedFromTheWorkspace(t *tes
 	const elsewhere = "/var/lib/ben/somewhere-else.git"
 	paths := goldenPaths()
 	paths.SharedGitDir = elsewhere
+	paths.WorktreeAdmin = filepath.Join(elsewhere, "worktrees", "issue-7")
+	paths.SharedGitWriteDirs = []string{
+		filepath.Join(elsewhere, "objects"),
+		filepath.Join(elsewhere, "refs"),
+		filepath.Join(elsewhere, "logs"),
+	}
+	paths.SharedGitReadFiles = []string{
+		filepath.Join(elsewhere, "config"),
+		filepath.Join(elsewhere, "HEAD"),
+		filepath.Join(elsewhere, "info", "exclude"),
+	}
 
 	fs := goldenProvider(t).sandboxSettings(paths, "linux", goldenHome).Filesystem
-	if !slices.Contains(fs.AllowWrite, elsewhere) {
-		t.Errorf("allowWrite = %v, want the reported shared git dir %s", fs.AllowWrite, elsewhere)
+	for _, list := range [][]string{fs.AllowRead, fs.AllowWrite} {
+		if slices.Contains(list, elsewhere) {
+			t.Errorf("allow list = %v, must not grant the reported shared git root", list)
+		}
+	}
+	for _, want := range []string{
+		filepath.Join(elsewhere, "config"),
+		filepath.Join(elsewhere, "HEAD"),
+		filepath.Join(elsewhere, "info", "exclude"),
+	} {
+		if !slices.Contains(fs.AllowRead, want) {
+			t.Errorf("allowRead = %v, want common file under reported shared git dir %s", fs.AllowRead, want)
+		}
 	}
 	for _, entry := range slices.Concat(fs.AllowRead, fs.AllowWrite) {
 		if strings.HasPrefix(entry, filepath.Dir(filepath.Dir(goldenWorkspace))) &&
@@ -428,21 +712,62 @@ func sandboxRunner(t *testing.T, extra map[string]any) (*Runner, core.RunSpec) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", stubs+string(os.PathListSeparator)+os.Getenv("PATH"))
-	r, err := New(Options{Provider: block, Publish: testPublishBinding()})
+	r, err := newTestRunner(Options{Provider: block, Publish: testPublishBinding()})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
 	root := t.TempDir()
+	shared := filepath.Join(root, "base.git")
+	workspace := filepath.Join(root, "issues", "issue-7")
+	private := mkdir(t, root, "private", "issue-7")
+	seedSandboxWorktreeShape(t, shared, workspace)
 	spec := core.RunSpec{
 		Workspace: core.WorkspacePaths{
-			Path:         mkdir(t, root, "issues", "issue-7"),
-			SharedGitDir: mkdir(t, root, "base.git"),
-			PrivateDir:   mkdir(t, root, "private", "issue-7"),
+			Path:         workspace,
+			SharedGitDir: shared,
+			PrivateDir:   private,
 		},
 		Prompt: "do the thing",
 	}
 	return r, spec
+}
+
+// seedSandboxWorktreeShape gives fake-runner tests the filesystem contract
+// Start validates without paying for a real repository per test. The
+// independent TestSandboxSelectsTheCurrentGitWorktreeAdmin builds the same
+// shape with real Git, so this helper cannot define the contract by itself.
+func seedSandboxWorktreeShape(t *testing.T, shared, workspace string) {
+	t.Helper()
+	admin := mkdir(t, shared, "worktrees", filepath.Base(workspace))
+	for _, dir := range []string{
+		filepath.Join(shared, "objects"),
+		filepath.Join(shared, "refs"),
+		filepath.Join(shared, "info"),
+		workspace,
+	} {
+		mkdir(t, dir)
+	}
+	canonicalAdmin, err := filepath.EvalSymlinks(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalWorkspace, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []struct{ path, body string }{
+		{filepath.Join(shared, "config"), "[core]\n\tbare = true\n"},
+		{filepath.Join(shared, "HEAD"), "ref: refs/heads/main\n"},
+		{filepath.Join(shared, "info", "exclude"), "# repository-local excludes\n"},
+		{filepath.Join(workspace, ".git"), "gitdir: " + canonicalAdmin + "\n"},
+		{filepath.Join(admin, "commondir"), "../..\n"},
+		{filepath.Join(admin, "gitdir"), filepath.Join(canonicalWorkspace, ".git") + "\n"},
+	} {
+		if err := os.WriteFile(file.path, []byte(file.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func mkdir(t *testing.T, parts ...string) string {
@@ -452,6 +777,23 @@ func mkdir(t *testing.T, parts ...string) string {
 		t.Fatal(err)
 	}
 	return dir
+}
+
+// sameTestPath compares existing paths after resolving aliases. macOS reports
+// the same temporary directory as both /var and /private/var depending on
+// whether the spelling came from Go or Git; the security property is about
+// the object those spellings reach.
+func sameTestPath(t *testing.T, a, b string) bool {
+	t.Helper()
+	a, err := filepath.EvalSymlinks(a)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%s): %v", a, err)
+	}
+	b, err = filepath.EvalSymlinks(b)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%s): %v", b, err)
+	}
+	return a == b
 }
 
 // record is one invocation the fake wrote down: its arguments (argv[0]
@@ -630,6 +972,24 @@ func TestSandboxOwnsTheToolConfigurationItDenies(t *testing.T) {
 			t.Errorf("composed git config does not carry %q:\n%s", want, b)
 		}
 	}
+	// Agent Git invocations do not pass through gitcmd.Argv, while the exact
+	// shared write set intentionally excludes packed-refs.lock and other
+	// common-root maintenance locks. Both modern maintenance and legacy auto-gc
+	// therefore have to be disabled in the global config Git actually parses.
+	git := requireGit(t)
+	for _, tc := range []struct{ key, want string }{
+		{"gc.auto", "0"},
+		{"maintenance.auto", "false"},
+	} {
+		cmd := exec.Command(git, "config", "--file", control.GitConfig, "--get", tc.key)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("reading %s from composed git config: %v: %s", tc.key, err, out)
+		}
+		if got := strings.TrimSpace(string(out)); got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.key, got, tc.want)
+		}
+	}
 	// And the agent may not rewrite it: one that can restore an `insteadOf`
 	// rewrite can redirect its next push.
 	var settings sandboxSettings
@@ -716,7 +1076,7 @@ func TestUnsandboxedPostureAddsNothing(t *testing.T) {
 	parallel(t)
 	dump := filepath.Join(t.TempDir(), "dump.json")
 	block := contract().Block(selfPath(t), map[string]string{agenttest.DumpEnv: dump})
-	r, err := New(Options{Provider: block})
+	r, err := newTestRunner(Options{Provider: block})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -154,8 +154,9 @@ func totalVars() Vars {
 			CreatedAt: time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC),
 			UpdatedAt: time.Date(2026, 8, 6, 13, 0, 0, 0, time.UTC),
 		},
-		Attempt:   2,
-		Workspace: "/w/123",
+		Attempt:      2,
+		Workspace:    "/w/123",
+		TargetBranch: "main",
 		Run: Run{
 			ID:              "r-2",
 			PreviousOutcome: "succeeded",

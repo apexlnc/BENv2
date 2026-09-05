@@ -1,6 +1,7 @@
 package codexexec
 
 import (
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
@@ -41,6 +42,7 @@ func TestCommandArgv(t *testing.T) {
 	pins := []string{
 		"-c", "sandbox_workspace_write.network_access=false",
 		"-c", "sandbox_workspace_write.writable_roots=[]",
+		"-c", "sandbox_workspace_write.exclude_slash_tmp=true",
 	}
 	tail := []string{"-"}
 
@@ -74,6 +76,7 @@ func TestCommandArgv(t *testing.T) {
 			want: slices.Concat(head, []string{
 				"-c", "sandbox_workspace_write.network_access=true",
 				"-c", "sandbox_workspace_write.writable_roots=[]",
+				"-c", "sandbox_workspace_write.exclude_slash_tmp=true",
 			}, tail),
 		},
 		{
@@ -89,6 +92,7 @@ func TestCommandArgv(t *testing.T) {
 			want: slices.Concat(head, []string{
 				"-c", "sandbox_workspace_write.network_access=false",
 				"-c", `sandbox_workspace_write.writable_roots=["/srv/a","/srv/b"]`,
+				"-c", "sandbox_workspace_write.exclude_slash_tmp=true",
 			}, tail),
 		},
 		{
@@ -115,9 +119,64 @@ func TestCommandArgv(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := testProvider(t, tc.extra).command(tc.spec)
+			got, err := testProvider(t, tc.extra).command(tc.spec)
+			if err != nil {
+				t.Fatalf("command(): %v", err)
+			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("command() = %v\nwant %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The second of the two anchors on the resume token (#233, SPEC §7.1, §9.6).
+// It holds whatever reached the RunSpec, not only what this adapter's stream
+// layer minted — a state file written by a build without validThreadID is the
+// case it exists for — and it is deliberately narrower than that check, because
+// what an argv element means is decided by its first character alone
+// (harness.CheckContinuationArgv).
+//
+// This adapter is where it matters most: the `-c sandbox_workspace_write.*`
+// pins are argv, so an element the agent chose is an element that can restate
+// them (sandboxOverrides).
+func TestCommandRefusesAContinuationTokenArgvCannotCarry(t *testing.T) {
+	parallel(t)
+	for _, tc := range []struct {
+		name    string
+		token   string
+		refused bool
+	}{
+		{name: "a thread id", token: fixtureThread},
+		{
+			// Independent anchors: this one is not validThreadID, and a token
+			// argv can carry safely is not this layer's to second-guess.
+			name:  "an opaque token in some other spelling",
+			token: "thread_ABC.123",
+		},
+		{name: "a bare flag", token: "-c", refused: true},
+		{
+			// The pin the agent is not allowed to restate: `-c` takes the next
+			// element, but so does this, and it needs no second element at all.
+			name:    "the sandbox override the pins exist to withhold",
+			token:   "--config=sandbox_workspace_write.network_access=true",
+			refused: true,
+		},
+		{name: "a sandbox mode of the agent's choosing", token: "--sandbox=danger-full-access", refused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			argv, err := testProvider(t, nil).command(core.RunSpec{Continuation: tc.token})
+			if got := errors.Is(err, ErrContinuationToken); got != tc.refused {
+				t.Fatalf("command(%q) error = %v, want refusal=%v", tc.token, err, tc.refused)
+			}
+			if tc.refused {
+				if argv != nil {
+					t.Errorf("command(%q) returned an argv alongside its refusal: %v", tc.token, argv)
+				}
+				return
+			}
+			if !slices.Contains(argv, tc.token) {
+				t.Errorf("command(%q) = %v, want the token carried", tc.token, argv)
 			}
 		})
 	}
@@ -141,10 +200,14 @@ func TestCommandArgvCarriesNoSecretsOrPrompt(t *testing.T) {
 		Continuation: "thread-1",
 	}
 
-	argv := strings.Join(p.command(spec), "\x00")
+	got, err := p.command(spec)
+	if err != nil {
+		t.Fatalf("command(): %v", err)
+	}
+	argv := strings.Join(got, "\x00")
 	for _, secret := range []string{"sk-SECRET", "gh-SECRET", spec.Prompt, "run-7"} {
 		if strings.Contains(argv, secret) {
-			t.Errorf("argv leaks %q: %v", secret, p.command(spec))
+			t.Errorf("argv leaks %q: %v", secret, got)
 		}
 	}
 }
@@ -163,7 +226,7 @@ func TestEnvironComposition(t *testing.T) {
 	p := testProvider(t, map[string]any{
 		"api_key":         "provider-key",
 		"codex_home":      "/var/lib/ben/codex",
-		"env":             map[string]any{"GH_TOKEN": "provider-gh"},
+		"env":             map[string]any{"GH_TOKEN": "provider-gh", "TMPDIR": "/var/tmp/agent"},
 		"env_passthrough": []any{"HTTPS_PROXY"},
 	})
 	env := envMap(first(p.environ(harness.PublishValue{}, core.RunSpec{Env: map[string]string{"BEN_RUN_ID": "run-7"}})))
@@ -175,6 +238,7 @@ func TestEnvironComposition(t *testing.T) {
 		"CODEX_API_KEY": "provider-key",       // adapter auth surface, not the daemon's
 		"CODEX_HOME":    "/var/lib/ben/codex", // likewise: a stored login is a credential
 		"GH_TOKEN":      "provider-gh",
+		"TMPDIR":        "/var/tmp/agent",
 		"BEN_RUN_ID":    "run-7",
 	} {
 		if env[k] != want {

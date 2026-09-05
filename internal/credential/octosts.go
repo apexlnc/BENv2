@@ -42,6 +42,13 @@ const octoDeadlineHandoff = time.Second
 // octoExchangePath is the STS exchange endpoint, appended to the configured URL.
 const octoExchangePath = "/sts/exchange"
 
+// The only transport an issuer URL may name, and its default port — dropped so
+// two spellings of one endpoint reduce to one identity.
+const (
+	httpsScheme      = "https"
+	httpsDefaultPort = "443"
+)
+
 // octoHTTPTimeout bounds one exchange. An issuer that hangs would otherwise
 // hold a poll tick, a workspace fetch or an agent launch open indefinitely.
 const octoHTTPTimeout = 30 * time.Second
@@ -93,7 +100,17 @@ func (OctoSTSKind) New(_ core.SourceDescriptor, block map[string]any) (core.Cred
 	if err != nil {
 		return nil, err
 	}
-	s.client = &http.Client{Timeout: octoHTTPTimeout}
+	s.client = &http.Client{
+		Timeout: octoHTTPTimeout,
+		// The configured URL is the one HTTPS endpoint Describe approved. The
+		// default client follows redirects and preserves Authorization across a
+		// same-host scheme downgrade, which would put the projected token on a
+		// plaintext request. Surface the 3xx to the existing status classifier
+		// instead; no Location is another spelling of this source's authority.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	s.now = time.Now
 	return s, nil
 }
@@ -126,8 +143,9 @@ func parseOcto(block map[string]any) (*octoSource, error) {
 	}, "#")
 	return &octoSource{
 		descriptor: core.SourceDescriptor{
-			Kind:      OctoSTSKindName,
-			Authority: authority,
+			Kind:         OctoSTSKindName,
+			Authority:    authority,
+			PrincipalKey: authority,
 			// The complete definition: authority plus the one field authority
 			// deliberately ignores. Narrower and an `oidc_token_path` edit is
 			// missed; wider and a rename rebuilds.
@@ -152,12 +170,17 @@ func escapeDescriptorField(value string) string {
 // canonicalIssuerURL reduces a written URL to the endpoint it addresses, so two
 // spellings of one issuer produce one identity.
 //
-// Scheme and host are lowercased, a default port for the scheme is dropped, a
-// trailing slash is stripped and the path is otherwise preserved — a
-// path-mounted issuer is a real deployment. Userinfo, a query and a fragment are
-// refused rather than stripped, so an operator who wrote one learns it meant
-// nothing; userinfo is additionally the one component that could carry a
-// credential into a field printed in full.
+// The scheme MUST be https: the exchange this URL addresses carries the
+// projected OIDC token as a bearer credential, so a plaintext issuer is refused
+// here rather than warned about (ErrSourceURLScheme). It is a *load-time*
+// refusal in a pure Describe — a scheme check reads nothing and reaches nothing,
+// which is exactly the shape this path admits (SPEC §5.7, amendment 4).
+//
+// Host is lowercased, the default port is dropped, a trailing slash is stripped
+// and the path is otherwise preserved — a path-mounted issuer is a real
+// deployment. Userinfo, a query and a fragment are refused rather than stripped,
+// so an operator who wrote one learns it meant nothing; userinfo is additionally
+// the one component that could carry a credential into a field printed in full.
 func canonicalIssuerURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -165,8 +188,15 @@ func canonicalIssuerURL(raw string) (string, error) {
 		return "", fmt.Errorf("%w: it could not be parsed", ErrSourceURL)
 	}
 	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return "", fmt.Errorf("%w: %q is not http or https", ErrSourceURLScheme, u.Scheme)
+	switch scheme {
+	case httpsScheme:
+	case "http":
+		// The scheme is named but the URL is not echoed: the refusal is pasted
+		// into CI logs, and this is the one field that can carry userinfo.
+		return "", fmt.Errorf("%w: http would send the projected OIDC bearer token in the clear",
+			ErrSourceURLScheme)
+	default:
+		return "", fmt.Errorf("%w: %q is not https", ErrSourceURLScheme, u.Scheme)
 	}
 	switch {
 	case u.User != nil:
@@ -181,7 +211,7 @@ func canonicalIssuerURL(raw string) (string, error) {
 		return "", fmt.Errorf("%w: it names no host", ErrSourceURL)
 	}
 	port := u.Port()
-	if port == defaultPort(scheme) {
+	if port == httpsDefaultPort {
 		port = ""
 	}
 	authority := host
@@ -193,16 +223,6 @@ func canonicalIssuerURL(raw string) (string, error) {
 		authority = "[" + host + "]"
 	}
 	return scheme + "://" + authority + strings.TrimSuffix(u.EscapedPath(), "/"), nil
-}
-
-func defaultPort(scheme string) string {
-	switch scheme {
-	case "http":
-		return "80"
-	case "https":
-		return "443"
-	}
-	return ""
 }
 
 // octoSource performs the exchange.

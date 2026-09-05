@@ -173,6 +173,14 @@ type Errors struct {
 	// PublishCredential refuses a publish credential that cannot be resolved for
 	// an attempt (SPEC §5.2.8) — readiness, not structure.
 	PublishCredential error
+	// Continuation refuses a resume token argv cannot carry safely (#233,
+	// SPEC §7.1, §9.6). The token is minted from the child's own stream and
+	// becomes an element of the next attempt's argv, so the refusal is one an
+	// adapter owes wherever that argv is built.
+	Continuation error
+	// ExecutionDomain refuses when the local substrate cannot establish or
+	// launch its complete containment and quiet-evidence domain (SPEC §7.5).
+	ExecutionDomain error
 }
 
 // Options are what an adapter forwards to harness.Launch on the suite's behalf:
@@ -200,7 +208,10 @@ type Options struct {
 	// test that depends on a particular window pins that field itself.
 	Timings     harness.Timings
 	Transcripts harness.TranscriptStore
-	Signal      harness.SignalFunc
+	Signal      SignalFunc
+	// Domain is the process-backed adapter-test substrate. Production never
+	// receives this seam from configuration.
+	Domain harness.ExecutionDomain
 	// Publish is the publish credential's binding (SPEC §5.2.8): the child
 	// variable and the source it is minted from. An adapter's New must forward
 	// it, and the tests that set it assert on the child environment rather than
@@ -221,10 +232,15 @@ type Options struct {
 // The emitters have an exact contract, because the suite asserts on the event
 // sequence and on the transcript line count:
 //
-//	Init     one line → exactly one started event carrying SessionID
-//	Private  one line → no normalized meaning, i.e. exactly one heartbeat
-//	Text     one line → exactly one progress event whose Text is the argument
-//	Success  one line → a usage event equal to Usage, then succeeded
+//	Init           one line → exactly one started event carrying SessionID
+//	InitUntrusted  one line → *no* started event: the same announcement made with
+//	               HostileSessionID, which no adapter may mint a resume token
+//	               from (#233). It is activity like any other unreadable line, so
+//	               exactly one heartbeat.
+//	Private        one line → no normalized meaning, i.e. exactly one heartbeat
+//	Text           one line → exactly one progress event whose Text is the argument,
+//	               bounded at harness.MaxEventText with the cut stated (#235)
+//	Success        one line → a usage event equal to Usage, then succeeded
 //
 // One line each: the transcript is the raw stream verbatim (SPEC §7.2), and the
 // suite counts its lines.
@@ -248,6 +264,12 @@ type Fake interface {
 	Usage() core.Usage
 
 	Init(w io.Writer)
+	// InitUntrusted announces HostileSessionID in this harness's own line
+	// format. It is the adapter's own emitter rather than a raw line the suite
+	// writes, because the point is that the *translator* refuses it: a line the
+	// suite spelled itself could be malformed in some other way and pass for the
+	// wrong reason.
+	InitUntrusted(w io.Writer)
 	Private(w io.Writer)
 	Text(w io.Writer, text string)
 	Success(w io.Writer)

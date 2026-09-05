@@ -69,6 +69,84 @@ func TestParseProviderBinaryDefault(t *testing.T) {
 	}
 }
 
+func TestLocalWritesCoversEveryProviderGrant(t *testing.T) {
+	parallel(t)
+	for _, tt := range []struct {
+		name  string
+		cfg   core.AgentConfig
+		paths core.LocalRuntimePaths
+		want  core.LocalWriteScope
+	}{
+		{
+			name: "srt names configured and implicit grants",
+			cfg: core.AgentConfig{
+				Provider: map[string]any{
+					"permission_mode": "bypassPermissions", "api_key": "sk-test",
+					"sandbox_mode": SandboxSRT, "add_dirs": []any{"/srv/shared", "/var/tmp/agent"},
+				},
+				Publish: core.PublishCredential{Env: "GH_TOKEN", Var: "BEN_TEST_PUBLISH"},
+			},
+			want: core.LocalWriteScope{Roots: []string{
+				"/srv/shared", "/var/tmp/agent",
+				"/tmp/claude", "/private/tmp/claude",
+				"/home/ben/.claude/debug", "/home/ben/.npm/_logs",
+			}},
+		},
+		{
+			name: "srt resolves implicit grants from a provider HOME override",
+			cfg: core.AgentConfig{
+				Provider: map[string]any{
+					"permission_mode": "bypassPermissions", "api_key": "sk-test",
+					"sandbox_mode": SandboxSRT, "env": map[string]any{"HOME": "/home/agent"},
+				},
+				Publish: core.PublishCredential{Env: "GH_TOKEN", Var: "BEN_TEST_PUBLISH"},
+			},
+			paths: core.LocalRuntimePaths{DaemonHomeDir: "/home/daemon"},
+			want: core.LocalWriteScope{Roots: []string{
+				"/tmp/claude", "/private/tmp/claude",
+				"/home/agent/.claude/debug", "/home/agent/.npm/_logs",
+			}},
+		},
+		{
+			name: "none is explicitly unbounded",
+			cfg: core.AgentConfig{Provider: map[string]any{
+				"permission_mode": "bypassPermissions", "sandbox_mode": SandboxNone,
+			}},
+			want: core.LocalWriteScope{Unbounded: true},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			paths := tt.paths
+			if paths.DaemonHomeDir == "" {
+				paths.DaemonHomeDir = "/home/ben"
+			}
+			scope, err := (Kind{}).LocalWrites(tt.cfg, paths)
+			if err != nil {
+				t.Fatalf("LocalWrites: %v", err)
+			}
+			if !reflect.DeepEqual(scope, tt.want) {
+				t.Errorf("LocalWrites = %+v, want %+v", scope, tt.want)
+			}
+		})
+	}
+}
+
+func TestLocalWritesRefusesSRTWithoutAnAbsoluteHome(t *testing.T) {
+	parallel(t)
+	cfg := core.AgentConfig{
+		Provider: map[string]any{
+			"permission_mode": "bypassPermissions", "api_key": "sk-test",
+			"sandbox_mode": SandboxSRT,
+		},
+		Publish: core.PublishCredential{Env: "GH_TOKEN", Var: "BEN_TEST_PUBLISH"},
+	}
+	for _, home := range []string{"", "relative/home"} {
+		if _, err := (Kind{}).LocalWrites(cfg, core.LocalRuntimePaths{DaemonHomeDir: home}); !errors.Is(err, ErrSandbox) {
+			t.Errorf("LocalWrites(DaemonHomeDir=%q) = %v, want ErrSandbox", home, err)
+		}
+	}
+}
+
 func TestParseProviderRefusals(t *testing.T) {
 	parallel(t)
 	for _, tc := range []struct {
@@ -132,6 +210,11 @@ func TestParseProviderRefusals(t *testing.T) {
 		{
 			name:  "allowed_tools entry empty",
 			block: map[string]any{"permission_mode": "auto", "allowed_tools": []any{""}},
+			want:  ErrProviderValue,
+		},
+		{
+			name:  "relative add_dirs entry",
+			block: map[string]any{"permission_mode": "auto", "add_dirs": []any{"relative/agent"}},
 			want:  ErrProviderValue,
 		},
 		{
@@ -271,6 +354,11 @@ func TestStructuralRefusalsNeverPrintTheValue(t *testing.T) {
 			name:  "permission_mode unusable",
 			block: map[string]any{"permission_mode": "plan"},
 			field: "agent.provider.permission_mode", value: "plan", want: ErrPermissionMode,
+		},
+		{
+			name:  "relative add_dirs entry",
+			block: map[string]any{"permission_mode": "auto", "add_dirs": []any{"/srv/ok", "relative/secret"}},
+			field: "agent.provider.add_dirs[1]", value: "relative/secret", want: ErrProviderValue,
 		},
 		{
 			name:  "env_passthrough entry in the reserved namespace",

@@ -2,7 +2,10 @@ package codexexec
 
 import (
 	"bufio"
+	"github.com/srhg-ai-7cef3f93/ben/internal/agent/harness"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
@@ -152,6 +155,86 @@ func TestTranslateLines(t *testing.T) {
 				if got[i].Usage != nil && *got[i].Usage != *tc.want[i].Usage {
 					t.Errorf("event %d usage = %+v, want %+v", i, *got[i].Usage, *tc.want[i].Usage)
 				}
+			}
+		})
+	}
+}
+
+// Bounded where it is minted (#235): the transcript has the whole message, the
+// event carries at most harness.MaxEventText of it, with the cut stated.
+func TestOversizedProseIsBoundedAtTheBoundary(t *testing.T) {
+	parallel(t)
+	line := `{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"` +
+		strings.Repeat("x", harness.MaxEventText+1) + `"}}`
+	got := translate([]byte(line))
+	if len(got) != 1 || got[0].Type != core.EventProgress {
+		t.Fatalf("translate = %v, want one progress event", got)
+	}
+	if n := len(got[0].Text); n > harness.MaxEventText {
+		t.Errorf("text is %d bytes, want at most %d", n, harness.MaxEventText)
+	}
+	if !strings.HasPrefix(got[0].Text, "xxxx") || !strings.Contains(got[0].Text, "truncated") {
+		t.Errorf("text does not carry the message's own prefix and a truncation notice: %q…", got[0].Text[:16])
+	}
+}
+
+// The resume token is minted here, from the child's own JSON stream, and two
+// dispatches later it is an argv element the harness reads back
+// (`resume <THREAD_ID>`, see command). This is the first of the two independent
+// anchors on it, and unlike claude-code's it is a character class rather than a
+// shape: 0.147.0 mints UUIDv7 spellings but the id is documented opaque, so the
+// check admits any spelling a release might adopt and excludes every character
+// that would give an argv element a meaning of its own (#233, SPEC §7.1, §9.6).
+//
+// A refused id mints no started event at all — the same outcome as a
+// thread.started line carrying none, which the table above already covers — so
+// the line is still activity, the attempt runs, and the orchestrator is left
+// with no token to resume from.
+func TestThreadStartRefusesAThreadIDArgvCannotCarry(t *testing.T) {
+	parallel(t)
+	for _, tc := range []struct {
+		name    string
+		id      string
+		started bool
+	}{
+		{name: "the uuidv7 shape 0.147.0 mints", id: "019fe267-3027-73b2-95fc-09a5467477db", started: true},
+		{
+			// Opaque means opaque: a release that changed the spelling must not
+			// cost a resumable chain, so the class is wider than the shape.
+			name:    "another opaque spelling entirely",
+			id:      "thread_ABC-123",
+			started: true,
+		},
+		{name: "the longest id the bound admits", id: strings.Repeat("a", maxThreadID), started: true},
+		{name: "one byte past the bound", id: strings.Repeat("a", maxThreadID+1)},
+		{name: "far past the bound", id: strings.Repeat("a", 4096)},
+		{
+			// The one this ticket is about, and the reason it matters most here:
+			// the sandbox pins are argv, so an element the agent chose is an
+			// element that can restate them (sandboxOverrides).
+			name: "the sandbox override the pins exist to withhold",
+			id:   "--config=sandbox_workspace_write.network_access=true",
+		},
+		{name: "a bare flag", id: "-c"},
+		{name: "a leading dash on an otherwise legal id", id: "-019fe267"},
+		{name: "an interior equals", id: "thread=1"},
+		{name: "an interior space", id: "thread 1"},
+		{name: "a newline, which would be a second line to anything re-parsing it", id: "thread\n1"},
+		{name: "a quote", id: `thread'1`},
+		{name: "a path", id: "../../etc/passwd"},
+		{name: "a multibyte rune", id: "thread-é"},
+		{name: "empty", id: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := translate([]byte(`{"type":"thread.started","thread_id":` + strconv.Quote(tc.id) + `}`))
+			switch {
+			case tc.started && (len(got) != 1 || got[0].Type != core.EventStarted):
+				t.Fatalf("translate = %v, want one started event", got)
+			case tc.started && (got[0].Continuation != tc.id || got[0].SessionID != tc.id):
+				t.Errorf("started = {session %q, continuation %q}, want both %q",
+					got[0].SessionID, got[0].Continuation, tc.id)
+			case !tc.started && len(got) != 0:
+				t.Errorf("translate = %v, want no events: a refused id is not a start", got)
 			}
 		})
 	}

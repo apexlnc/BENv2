@@ -137,6 +137,65 @@ func approvingInstant(history []core.ClaimEvent, requiredLabels []string) (time.
 	return latest, true
 }
 
+// StandingApproval is approvingInstant's other half: the tracker-native *id* of
+// the event that completed the current application of the required-label set, or
+// zero when the set is not completely applied.
+//
+// The id rather than the timestamp, and that is the whole reason it is a second
+// function. This one answers "which approval is this", not "when was it": two
+// approvals a second apart must be distinguishable, and a second-granularity
+// timestamp cannot say they differ (SPEC §8.4). It is what a workspace cycle is
+// anchored to on a substrate whose sandbox outlives its claim (SPEC §6.7), which
+// makes a change in it the statement that one cycle ended and another began — the
+// remove-and-reapply that current labels alone cannot show (#252).
+//
+// Exported because the v2 assembly resolves the same anchor for the workspace
+// strategy (cmd/ben's trackerCycles). Two spellings of "which approval selects
+// the sandbox" would be two answers, and the one that disagreed would dispose
+// somebody else's tree.
+func StandingApproval(history []core.ClaimEvent, requiredLabels []string) int64 {
+	if len(requiredLabels) == 0 {
+		// Approval by a label nobody has to apply is not approval. The loader
+		// refuses an empty required set, so this is a restatement rather than a
+		// reachable branch — and the safe one, since the alternative reading is
+		// "every issue is approved by the same nonexistent event".
+		return 0
+	}
+	var anchor int64
+	for _, want := range requiredLabels {
+		id, ok := standingLabeledID(history, want)
+		if !ok {
+			return 0
+		}
+		if id > anchor {
+			anchor = id
+		}
+	}
+	return anchor
+}
+
+// standingLabeledID is standingLabeledAt by id: the event that began one label's
+// *current* application, if it is applied at all.
+func standingLabeledID(history []core.ClaimEvent, label string) (int64, bool) {
+	var id int64
+	var applied bool
+	for _, ev := range history {
+		if !strings.EqualFold(ev.Subject, label) {
+			continue
+		}
+		switch ev.Kind {
+		case core.ClaimEventLabeled:
+			id, applied = ev.ID, true
+		case core.ClaimEventUnlabeled:
+			id, applied = 0, false
+		}
+	}
+	if !applied || id <= 0 {
+		return 0, false
+	}
+	return id, true
+}
+
 // standingLabeledAt replays the change log for one label and reports when its
 // current application began, if it is applied at all.
 //
@@ -145,7 +204,35 @@ func approvingInstant(history []core.ClaimEvent, requiredLabels []string) (time.
 // approval, and taking that event's timestamp would date an approval that was
 // withdrawn.
 func standingLabeledAt(history []core.ClaimEvent, label string) (time.Time, bool) {
-	var at time.Time
+	event, ok := standingLabeledEvent(history, label)
+	return event.At, ok
+}
+
+// approvalCycleAnchor is the tracker-native identity of the standing approval,
+// as distinct from approvingInstant's timestamp. A remove-and-reapply can keep
+// the same assignment and content while selecting a new remote workspace cycle;
+// the event id is what makes those two approvals different even within one
+// second. The last required label to be applied selects the cycle, exactly as it
+// selects the approving instant.
+func approvalCycleAnchor(history []core.ClaimEvent, requiredLabels []string) (int64, bool) {
+	if len(requiredLabels) == 0 {
+		return 0, false
+	}
+	var anchor int64
+	for _, want := range requiredLabels {
+		event, ok := standingLabeledEvent(history, want)
+		if !ok || event.ID <= 0 {
+			return 0, false
+		}
+		if event.ID > anchor {
+			anchor = event.ID
+		}
+	}
+	return anchor, true
+}
+
+func standingLabeledEvent(history []core.ClaimEvent, label string) (core.ClaimEvent, bool) {
+	var event core.ClaimEvent
 	var applied bool
 	for _, ev := range history {
 		if !strings.EqualFold(ev.Subject, label) {
@@ -153,12 +240,12 @@ func standingLabeledAt(history []core.ClaimEvent, label string) (time.Time, bool
 		}
 		switch ev.Kind {
 		case core.ClaimEventLabeled:
-			at, applied = ev.At, true
+			event, applied = ev, true
 		case core.ClaimEventUnlabeled:
-			at, applied = time.Time{}, false
+			event, applied = core.ClaimEvent{}, false
 		}
 	}
-	return at, applied
+	return event, applied
 }
 
 // readApproval asks the tracker for §9.5's facts, or reports that it cannot.

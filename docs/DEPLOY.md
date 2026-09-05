@@ -9,11 +9,12 @@ deployment must be true of. This document is the procedure for *one* deployment:
 those requirements on a host, how to prove you have, and what BEN's own deployment does. The two
 are complementary; read §10 for what is required, and this for how.
 
-**These are the requirements for the eventual unattended deployment, not a claim that current
-`main` has passed the readiness gate.** See the [README's Status section](../README.md#status) for
-what remains open. Until it closes, use `ben run` only for supervised development and the scripted
-smoke profile ([SMOKE.md](SMOKE.md)) — and `deploy/ben.service` stays blocked by its
-`ExecStartPre` gate.
+**These are the requirements for an unattended deployment, not a claim that any deployment has
+been approved for one.** The readiness gate, #76, closed on 2026-08-20; what remains is the
+deployment-mode decision this document describes and, for public input, the containment
+qualification in #195. See the [README's Status section](../README.md#status). Until a deployment
+records that decision, use `ben run` only for supervised development and the scripted smoke profile
+([SMOKE.md](SMOKE.md)) — and `deploy/ben.service` stays blocked by its `ExecStartPre` gate.
 
 **If you are here to change BEN's own branch protection: Terraform is the only writer.** A
 hand-applied `gh api` rule is reverted silently, at exit 0, by the next Atlantis apply — read
@@ -53,7 +54,9 @@ SPEC §10.1 requires, for any daemon dispatching with no human present:
   open PR are inert until a human **approves** them — and on GitHub the credential that pushes a
   branch is ordinarily enough to merge it, approved or not. The agent completing the merge
   afterwards is intended, not a gap; what must not happen is the agent merging what no human
-  approved. Protect the default branch, and get all three parts:
+  approved. Protect every branch a workflow can select as its target — the repository default
+  when `workspace.base_branch` is omitted, or the configured branch when it is written — and get
+  all three parts:
 
   1. **Require a review**, and **dismiss it on any later push** so the approval binds to the
      commit that merges.
@@ -80,7 +83,7 @@ sudo useradd --system --create-home --home-dir /var/lib/ben --shell /usr/sbin/no
 sudo install -d -o ben -g ben -m 0700 /var/lib/ben/.local/share/ben /var/lib/ben/.local/state/ben
 ```
 
-### Upgrading into claim-scoped bases
+### Upgrading into claim-scoped bases and targets
 
 When upgrading from a build without claim epochs, stop the old daemon and first prove that its
 claim principal has **no assigned issue in the repository** — running, parked, or published and
@@ -97,21 +100,48 @@ instant and the new daemon deliberately parks it. An old `refs/ben/base/*` pin c
 the outgoing comparison fact after a **new** assignment event; it is never retrofitted onto the
 assignment already standing (SPEC §9.10).
 
+The same empty-principal drain is mandatory when upgrading from a build that recorded claim bases
+but not targets. Old local claim-base, daemon-side mirror-claim, and remote workspace-cycle records
+remain readable only as non-authorizing legacy state for their existing assignment. BEN parks that
+epoch rather than filling its target from today's workflow or repository default. Only a later
+assignment epoch may carry a valid outgoing base or cycle identity forward and write a complete
+base/target record before any hook or agent starts.
+
 Start from the shipped [sample systemd unit](../deploy/ben.service), not a hand-written fragment.
 It runs under the dedicated account and deliberately contains `ExecStartPre=/bin/false`; removing
 that line is the sample's explicit acknowledgement of risk-accepted mode. Do not remove it while
 the README's **Status** gates remain open.
 
-Even that unit gives you the dedicated non-root account and nothing more. In particular it does not
-give you **a run that cannot reach the daemon** — the agent runs as `ben`, so it shares the
-daemon's process identity — nor **a forge that enforces review**, which no unit file can supply.
+For local execution, the unit's `Delegate=yes` is required, and its explicit
+`RestrictNamespaces=no` must not be narrowed. systemd rejects every `clone3` call when any namespace
+restriction is active because seccomp cannot inspect `clone3`'s pointer argument; that also rejects
+BEN's mandatory atomic cgroup placement. BEN's readiness canary must prove unified cgroup v2 with
+`nsdelegate`, PID/mount/cgroup containment, pidfds,
+`cgroup.kill`, and cleanup under the unit's actual policy. A host that lacks or blocks any of those
+facts refuses the local adapter; do not work around that refusal with a process-group launcher.
+Remote/Airlock execution remains available. The service retains `KillMode=mixed`: BEN owns each
+domain's bounded graceful teardown, while systemd owns the outer `TimeoutStopSec` deadline.
+
+The destructive real-host proof is intentionally outside ordinary CI. On a disposable Linux
+systemd host with a `ben` account, run `scripts/test-systemd-localdomain.sh`. It compiles the
+package test, installs short-lived copies of the checked-in unit under `/run/systemd/system` with
+only executable/workflow/state paths and the documented startup gate adjusted, and uses no drop-in.
+It proves refusal without `Delegate=yes`, clean completion, a surviving `setsid` descendant, an
+abrupt `MainPID` restart, durable recovery identity, and startup cleanup. The test logs the installed
+systemd and kernel versions and removes its generated units and `/var/lib/ben-234-systemd-proof-*`
+state. Use a disposable host because it deliberately SIGKILLs its own fixture service.
+
+That execution domain accounts for descendants and hides parent/sibling cgroup controls, but it
+does not by itself give you **a run that cannot reach the daemon's credentials** — the agent still
+runs as `ben`, so files and sockets readable by that UID remain readable — nor **a forge that
+enforces review**, which no unit file can supply.
 The first needs a second identity for agent processes or a whole-process sandbox; the second is
-protection on the default branch. [Issue #83](https://github.com/srhg-ai-7cef3f93/ben/issues/83)
+protection on every selected target branch. [Issue #83](https://github.com/srhg-ai-7cef3f93/ben/issues/83)
 records BEN's applied protection half; [#155](https://github.com/srhg-ai-7cef3f93/ben/issues/155)
 and [#156](https://github.com/srhg-ai-7cef3f93/ben/issues/156) built the publish-identity half,
 which **Credential sources** below is how you configure. Whatever mechanism you use, prove it with
 the agent's actual credential rather than by
-reading the configuration back, and test **three** things — a direct push to the default branch is
+reading the configuration back, and test **three** things for every selected target — a direct push to the branch is
 refused; a pull request the agent opened cannot be merged with no approving review; and a pull
 request opened by *someone else* cannot be merged on the **agent's own** approval. The third is the
 one a configuration read-back will never tell you about.
@@ -138,9 +168,11 @@ daemon's heartbeat and startup recovery. There is no script to check those first
 The canary is `attended` and uses a separate `ben-kube-canary` queue label. Scaling it is a supervised
 smoke action, not an unattended deployment. The daemon and its agent still share the pod's process
 identity; putting both in one container does not establish protected mode's run/daemon boundary.
-The Argo Deployment therefore cannot be left at one replica after the operator leaves, and it must
-not be relabelled `risk-accepted` until #156 and #76 close and the forge-control proofs above pass
-with the actual minted publish identity.
+The Argo Deployment therefore cannot be left at one replica after the operator leaves, and #76's
+closure does not relabel it: #156 and #76 closed on 2026-08-19 and 2026-08-20 with the four
+behavioural forge-control probes waived on record as GitHub's own enforcement, and the shared-process
+pod still does not establish protected mode's run/daemon boundary. Relabelling it `risk-accepted` is
+an explicit decision with its own `accepted_because`, not a consequence of the gate closing.
 
 Build and smoke the image locally before publishing a multi-architecture index:
 
@@ -156,11 +188,29 @@ before publishing a Linux AMD64/ARM64 index to
 The ECR repository and the workflow's main-only `ben-w` GitHub OIDC role are managed in
 `NYDIG/terraform-srhg-cicd-nonprod` and must exist before the first publication.
 
+## The review controller
+
+Optional, and off until you turn it on. [`REVIEW.md`](REVIEW.md) is its runbook: the three
+identities it needs, the markers it reads its own state back out of, and the deployment gate.
+
+Two things about it belong here, in the §10.1 runbook, because they are properties of the
+*deployment* rather than of the controller:
+
+- **It never approves and never applies a required label.** It publishes advisory `COMMENT`
+  reviews, hands BEN's claim back, or removes `ben-queue`. The branch rule below is therefore
+  untouched by it: a human code owner's approval is still what merges a pull request, and adding
+  the controller does not create a second path to one.
+- **Its token is a fourth identity**, distinct from the tracker, base-fetch and publish credentials
+  of **Credential sources** below. It needs `issues: write` and `pull-requests: write` on this
+  repository and nothing else — in particular no `contents: write`, since it never pushes.
+
 ## The forge control: branch protection
 
-Requirement 3 in full: what to set on the default branch, what each field buys, and how to
-read it back afterwards. One rule comes first because meeting it after the fact costs you a
-control — it is specific to BEN's own repository, and the reason it exists is not.
+Requirement 3 in full: what to set on every branch selectable by `workspace.base_branch`, what
+each field buys, and how to read it back afterwards. Omission selects the repository default;
+an explicit value selects that branch. Repeat the rule and the proof for each value used by a
+deployed workflow. One rule comes first because meeting it after the fact costs you a control —
+it is specific to BEN's own repository, and the reason it exists is not.
 
 ### For BEN, Terraform is the only writer
 
@@ -191,7 +241,7 @@ printf '* @your-org/reviewers\n' > CODEOWNERS
 
 # 2. the branch rule — for a deployment with no declarative manager. For BEN's own
 #    repository this is Terraform's to write; see the warning above.
-gh api -X PUT repos/<owner>/<repo>/branches/<default-branch>/protection --input - <<'JSON'
+gh api -X PUT repos/<owner>/<repo>/branches/<target-branch>/protection --input - <<'JSON'
 {
   "required_pull_request_reviews": {
     "required_approving_review_count": 1,
@@ -248,7 +298,7 @@ the fields it did not name, so the check passed and the controls were gone. Ask 
 absence is the failure:
 
 ```sh
-gh api repos/<owner>/<repo>/branches/<default-branch>/protection -q '{
+gh api repos/<owner>/<repo>/branches/<target-branch>/protection -q '{
   reviews:            .required_pull_request_reviews.required_approving_review_count,
   dismiss_stale:      .required_pull_request_reviews.dismiss_stale_reviews,
   last_push_approval: .required_pull_request_reviews.require_last_push_approval,
@@ -270,8 +320,10 @@ carries no push allowlist — ask with `has()` rather than reading through.
   BEN-composed filesystem and network policy. It requires an isolated config directory, an
   environment-authenticated harness, a publish block and a git identity; readiness refuses when
   the host cannot deliver that posture.
-  [Issue #81](https://github.com/srhg-ai-7cef3f93/ben/issues/81) remains open only for a real
-  Claude-agent proof on a compatible host; the implementation landed in #149.
+  The implementation landed in #149; [issue #81](https://github.com/srhg-ai-7cef3f93/ben/issues/81)
+  closed on 2026-09-03 with the real-agent proof supplied by the Airlock canaries (#195), where the
+  substrate composes the sandbox-runtime wrapper. The adapter's own `sandbox_mode: srt` path has not
+  yet carried a real agent on a compatible host.
 - **No adapter setting proves protected mode by itself.** §10.1 states an outcome: the deployment
   must verify that the run cannot reach the tracker credential or daemon process on its platform.
 - **A container** is a workspace strategy, not an adapter setting. It is deferred (SPEC §6.1,
@@ -364,7 +416,8 @@ Every workflow records this choice in the required `deployment.mode` field: `pro
 `risk-accepted`, or the human-present `attended` exemption. `risk-accepted` also requires a
 non-blank `accepted_because`. Omission is a load refusal for `ben run` and `ben config effective`,
 regardless of the supervisor. The sample unit's `ExecStartPre` gate is an additional deliberate
-deployment acknowledgement, and stays until the README's **Status** gates close.
+deployment acknowledgement, and stays until a deployment records the mode decision the README's
+**Status** section describes.
 
 Risk-accepted mode relaxes that one requirement and no others. Branch protection in particular
 becomes *more* load-bearing, not less: with the label demoted to routing, PR review is the only
@@ -373,9 +426,9 @@ gate left.
 BEN's dogfood workflow is intended for risk-accepted mode, on the reasoning that its sole labeler
 is also the operator holding the credentials and reviewing every PR. That stops being true the
 moment a second principal can label — which is why SPEC §13 names it as a trigger for the
-container workspace strategy. It is not an approved unattended deployment until
-[issue #76](https://github.com/srhg-ai-7cef3f93/ben/issues/76) is complete — see the README's
-**Status** section for what is outstanding.
+container workspace strategy. It is not an approved unattended deployment:
+[issue #76](https://github.com/srhg-ai-7cef3f93/ben/issues/76) closed on 2026-08-20, but that
+closure records readiness, not the deployment-mode decision — see the README's **Status** section.
 
 The sample unit is shipped but blocked by default; this document describes the posture required
 before enabling it.

@@ -65,6 +65,9 @@ func TestStaticIsExplicitlyUnbounded(t *testing.T) {
 	if d.MinFreshTTL != 0 || d.Bounded() {
 		t.Fatalf("descriptor = %+v, want MinFreshTTL zero — explicitly unbounded", d)
 	}
+	if d.PrincipalKey != "" {
+		t.Fatalf("PrincipalKey = %q, want none for an opaque static token", d.PrincipalKey)
+	}
 	src := credential.NewEnv("BEN_TEST_UNBOUNDED")
 	tok, err := src.FetchFresh(context.Background(), core.PurposePublish)
 	if err != nil {
@@ -132,6 +135,10 @@ func TestALiteralsBindingKeyCarriesItsFullDigest(t *testing.T) {
 	if before.BindingKey == after.BindingKey {
 		t.Fatal("a rotated literal left the binding key unchanged; the reload would not rebuild")
 	}
+	if before.PrincipalKey != "" || after.PrincipalKey != "" {
+		t.Fatalf("literal principal keys = %q and %q, want none for opaque tokens",
+			before.PrincipalKey, after.PrincipalKey)
+	}
 	sum := sha256.Sum256([]byte("ghp-before"))
 	want := site + "#" + hex.EncodeToString(sum[:])
 	if before.BindingKey != want {
@@ -153,5 +160,8 @@ func TestAnEnvSourcesBindingKeyIsJustTheVariable(t *testing.T) {
 	d := credential.EnvDescriptor("GH_TOKEN")
 	if d.Authority != "env:GH_TOKEN" || d.BindingKey != "env:GH_TOKEN" {
 		t.Errorf("descriptor = %+v, want both keys to be the namespaced variable", d)
+	}
+	if d.PrincipalKey != "" {
+		t.Errorf("PrincipalKey = %q, want none: changing $GH_TOKEN may change service principal", d.PrincipalKey)
 	}
 }

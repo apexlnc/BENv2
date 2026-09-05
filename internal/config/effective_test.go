@@ -90,6 +90,74 @@ func TestEffectiveJSONRedactsAndCarriesProvenance(t *testing.T) {
 	}
 }
 
+// #192 deliberately shipped no substrate field; #194 lands it, and the property
+// that replaces "there is no such key" is the one that actually matters to an
+// operator: an unchanged v1 workflow keeps working, and says so.
+//
+// Not "the output is byte-for-byte what it was". The section is additive and
+// visible on purpose — a daemon's substrate is the first thing to check when a
+// claim behaves unexpectedly — so what is pinned is that omitting it resolves to
+// `local` by *default* provenance rather than by a value somebody wrote.
+func TestAnOmittedSubstrateResolvesToTheLocalDefault(t *testing.T) {
+	def, err := Load(writeWorkflow(t, validMinimal))
+	if err != nil {
+		t.Fatalf("Load v1 workflow: %v", err)
+	}
+	if def.Config.Substrate.Kind != SubstrateKindLocal || def.Config.Substrate.Remote() {
+		t.Fatalf("an omitted substrate resolved to %+v", def.Config.Substrate)
+	}
+	if def.Config.Substrate.Airlock != (AirlockConfig{}) {
+		t.Fatalf("a local substrate carries backend configuration: %+v", def.Config.Substrate.Airlock)
+	}
+	if got := def.Provenance["substrate.kind"].Source; got != SourceDefault {
+		t.Fatalf("substrate.kind provenance is %q, want %q", got, SourceDefault)
+	}
+	text := EffectiveText(def)
+	if !strings.Contains(text, "kind: local") {
+		t.Fatalf("EffectiveText does not report the substrate:\n%s", text)
+	}
+	// A local substrate renders no backend block at all: printing an empty one
+	// would read as configuration that is in effect.
+	if strings.Contains(text, "airlock:") {
+		t.Fatalf("EffectiveText rendered a backend block under a local substrate:\n%s", text)
+	}
+
+	raw, err := EffectiveJSON(def)
+	if err != nil {
+		t.Fatalf("EffectiveJSON: %v", err)
+	}
+	var doc struct {
+		Config struct {
+			Substrate struct {
+				Kind    string          `json:"kind"`
+				Airlock json.RawMessage `json:"airlock"`
+			} `json:"substrate"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode EffectiveJSON: %v", err)
+	}
+	if doc.Config.Substrate.Kind != SubstrateKindLocal {
+		t.Fatalf("EffectiveJSON substrate.kind = %q", doc.Config.Substrate.Kind)
+	}
+	// An explicit null rather than an absent key, so a consumer reads one shape
+	// whether or not a backend is configured.
+	if string(doc.Config.Substrate.Airlock) != "null" {
+		t.Fatalf("EffectiveJSON substrate.airlock = %s, want null", doc.Config.Substrate.Airlock)
+	}
+
+	// And writing the default explicitly is now a valid workflow rather than an
+	// unknown-field refusal.
+	withSubstrate := strings.Replace(validMinimal, "agent:\n", "substrate:\n  kind: local\nagent:\n", 1)
+	explicit, err := Load(writeWorkflow(t, withSubstrate))
+	if err != nil {
+		t.Fatalf("Load with an explicit local substrate: %v", err)
+	}
+	if got := explicit.Provenance["substrate.kind"].Source; got != SourceFile {
+		t.Fatalf("an explicitly written substrate.kind has provenance %q", got)
+	}
+}
+
 // Structural refusals carry their offending value as data
 // (core.ConfigValueError) and rendering decides by provenance (SPEC §5.8).
 // Textual scrubbing failed review twice — %q-escaping and short-value

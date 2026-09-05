@@ -43,7 +43,7 @@ func readySandboxRunner(t *testing.T, bin string, extra map[string]any) *Runner 
 		block[k] = v
 	}
 	t.Setenv(testPublish.Var, "gh-token-value")
-	r, err := New(Options{Provider: block, Publish: testPublishBinding()})
+	r, err := newTestRunner(Options{Provider: block, Publish: testPublishBinding()})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestReadyProbesEgressBehaviourally(t *testing.T) {
 			// about, so the runtime has to behave like the real one for the
 			// egress verdict to be the one under test.
 			block["env"] = map[string]any{fakeSandboxEnforceEnv: "read,write"}
-			r, err := New(Options{Provider: block, Publish: tc.publish})
+			r, err := newTestRunner(Options{Provider: block, Publish: tc.publish})
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -397,11 +397,15 @@ func TestStartRunsTheSandboxReadyVerified(t *testing.T) {
 	t.Setenv("PATH", after)
 
 	root := t.TempDir()
+	shared := filepath.Join(root, "base.git")
+	workspace := filepath.Join(root, "issues", "issue-7")
+	private := mkdir(t, root, "private", "issue-7")
+	seedSandboxWorktreeShape(t, shared, workspace)
 	spec := core.RunSpec{
 		Workspace: core.WorkspacePaths{
-			Path:         mkdir(t, root, "issues", "issue-7"),
-			SharedGitDir: mkdir(t, root, "base.git"),
-			PrivateDir:   mkdir(t, root, "private", "issue-7"),
+			Path:         workspace,
+			SharedGitDir: shared,
+			PrivateDir:   private,
 		},
 		Prompt: "do the thing",
 	}
@@ -480,7 +484,7 @@ func TestUnsandboxedReadyDoesNotRequireGH(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv(testPublish.Var, "gh-token-value")
 
-	r, err := New(Options{
+	r, err := newTestRunner(Options{
 		Provider: contract().Block(selfPath(t), nil),
 		Publish:  testPublishBinding(),
 	})

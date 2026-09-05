@@ -171,6 +171,27 @@ type Record struct {
 	// stopping records that a stop has been asked for but not confirmed; the
 	// claim is retained until it is (SPEC §9.8).
 	stopping bool
+	// budgetStop says §9.9's cost cap is what ordered *this* stop. onStopped
+	// uses it to classify the attempt and, absent a later exit, park the record.
+	//
+	// A per-stop signal rather than a read of FailureReason, for the reason
+	// transitionCaused, recordAttempt and the §9.11 log all take their cause as
+	// an argument: that field is sticky across attempts by design — a re-queue
+	// deliberately retains it (restoreBudgets) and beginPrepare does not clear
+	// it — so a record parked on a breach and re-dispatched still carries
+	// `budget_exceeded` while the next attempt runs. Reading it here parked an
+	// ordered exit that landed during that attempt instead of letting it leave,
+	// which for the `gone` variant is a record nothing ever revisits (#236).
+	//
+	// Cleared where it is consumed (onStopped) and at the start of every attempt.
+	// An exit that overtakes it changes the post-stop disposition below, not this
+	// cause: the attempt was still stopped because it breached the budget.
+	budgetStop bool
+	// finishAfterStop says an ordered exit owns what follows this stop. It is a
+	// disposition, separate from budgetStop's cause: an issue can disappear
+	// after the budget has already ordered the process stopped, in which case the
+	// record must leave while the attempt is still filed as budget-exceeded.
+	finishAfterStop bool
 	// keepOnStop and stopReason carry the reconciliation verdict across the
 	// stop: §9.8 keeps the workspace when an issue went unroutable and
 	// disposes it when the issue went terminal.
@@ -219,7 +240,7 @@ type Record struct {
 	// finish is a stop-and-exit deferred until pending work reports back.
 	finish *finishRequest
 	// releasing tracks an exit whose claim removal has not been confirmed yet.
-	// stopInFlight is the handle's single signal-ladder slot: without it the
+	// stopInFlight is the handle's single teardown slot: without it the
 	// tick that begins a stop would immediately retry it, and the exit and the
 	// quiescence probe — which ask the same handle the same question — would
 	// race two answers to it (see beginStop).
@@ -252,17 +273,19 @@ type Record struct {
 	// owedInFlight is the head being attempted. See owed.go.
 	owed         []owedEffect
 	owedInFlight bool
-	// disposalOwed says the workspace has already been queued for return, so a
-	// second exit does not queue another. The exit *can* be reached twice: a
-	// record that disposed on its way out and then had its release fail is finished
-	// again when the Get confirms its issue is gone (absence.go), and `done`
-	// disposes before its writes land. A second Dispose of a directory the first
-	// one removed fails, and a failing local effect is retried from the head
-	// forever — so the record would never be forgotten at all.
+	// disposalOwed says the workspace's terminal lifecycle action has already
+	// been queued, so a second exit does not queue another. The exit *can* be
+	// reached twice: a record that disposed on its way out and then had its
+	// release fail is finished again when the Get confirms its issue is gone
+	// (absence.go), and `done` disposes before its writes land. A second Dispose
+	// of a directory the first one removed fails, and a failing local effect is
+	// retried from the head forever — so the record would never be forgotten at
+	// all.
 	//
-	// First call wins, including its `keep` argument: the disposal was decided and
-	// queued under the facts known then, and reaching into a queued effect to
-	// change it is the sweep owed.go refuses to do for the same reason.
+	// First call wins, including its outcome and local `keep` choice: the action
+	// was decided and queued under the facts known then, and reaching into a
+	// queued effect to change it is the sweep owed.go refuses to do for the same
+	// reason.
 	disposalOwed bool
 	// claimBaseAbandonOwed makes the pending-epoch rollback exactly once on an
 	// ordered exit. It precedes claim release, closing the crash window in which
@@ -275,9 +298,9 @@ type Record struct {
 	ranThisAttempt bool
 	afterRunFired  bool
 	// eventsClosed records that this attempt's event stream is closed — the
-	// adapter has nothing further to say (SPEC §7.4). groupGone records that its
-	// whole process group is confirmed gone, which is the fact that means the
-	// workspace is free (SPEC §7.5, §9.8).
+	// adapter has nothing further to say (SPEC §7.4). domainQuiet records that its
+	// whole execution domain is confirmed quiet, which is the fact that means
+	// the workspace is free (SPEC §7.5, §9.8).
 	//
 	// Three facts, tracked separately because they permit different things: the
 	// stream closing permits a non-signalling observation, Done permits an active
@@ -287,10 +310,10 @@ type Record struct {
 	eventsClosed bool
 	// handleDone records RunHandle.Done: the process is reaped and its transcript
 	// is complete. It is a *phase edge*, not permission — it selects whether the
-	// group may be observed only (Probe) or actively cleaned (Stop), and
+	// domain may be observed only (Probe) or actively torn down (Stop), and
 	// authorizes neither reuse nor release (#79).
-	handleDone bool
-	groupGone  bool
+	handleDone  bool
+	domainQuiet bool
 	// outcome is what this attempt reported, held until the workspace is
 	// quiet. See holdOutcome.
 	outcome *runOutcome

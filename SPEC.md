@@ -6,6 +6,10 @@ Status: **v1, locked** (2026-08-06)
 
 | Date | Sections | Change | Authority |
 |---|---|---|---|
+| 2026-09-04 | §7.3 | **`output_overflow` joins the closed taxonomy, non-retryable.** A single stdout line past §7.5's scanner ceiling becomes a runner-owned verdict of its own, claimed by the reader that hit it through the same funnel as `stalled` and `timeout`, so the signal ladder runs and publication waits for it. The transcript records the cut as a BEN-namespaced line and deliberately retains **no fragment** of the oversized line: a fragment ending wherever the buffer ran out is the one shape a credential can straddle the stateless redacting writer unmatched. Before this the condition was indistinguishable from EOF — the child sat blocked on a full pipe, produced no activity, and `stall_timeout_ms` read it as `stalled`, retryable, so the retry reproduced it and burned `max_attempts` on a condition that is not transient. The same change bounds what the harness *holds* of the child's output without amending the sections that govern it: `progress(text)` is cut at 64 KiB where the adapter mints it, the notice stating the cut inside the bound (§7.2 is unchanged — the transcript keeps the whole line), and a readiness probe's captured output is retained to 64 KiB and refused past it (§7.1's `Ready` classifies from a bounded body) | [#235](https://github.com/srhg-ai-7cef3f93/ben/issues/235) — sign-off in review of [#287](https://github.com/srhg-ai-7cef3f93/ben/pull/287) |
+| 2026-09-03 | §7.1, §7.5, §9.8, §9.10 | **Linux local attempts use a non-escapable execution domain, not a POSIX process group.** BEN atomically places a trusted PID-namespace supervisor in a delegated cgroup-v2 leaf, then creates the cgroup namespace so it roots at that leaf. The supervisor covers every inherited proc/cgroup alias without detaching locked mounts, permits provider-created nested proc/cgroup2 mounts only where the kernel keeps them rooted at the attempt or descendants, and remains alive until the entire PID namespace is empty. `Probe` is read-only; `Stop` uses pidfd TERM then bounded `cgroup.kill`; both decide from supervisor exit with a populated-cgroup veto. Canonical boot, cgroup, PID/start and namespace evidence makes recovery reuse-safe. A provider-owned janitor removes quiet attempt trees, startup sweeps empty residue, and persistent cleanup failure refuses new local starts. The matrix is Linux-only and fail-closed with no process-group fallback. The mechanism landed dormant in #274; this #234 change atomically activates SPEC, production, fake, readiness and the shipped unit. | [#274](https://github.com/srhg-ai-7cef3f93/ben/issues/274) — [superseding v4 design](https://github.com/srhg-ai-7cef3f93/ben/issues/274#issuecomment-5529006448), [exact maintainer sign-off](https://github.com/srhg-ai-7cef3f93/ben/issues/274#issuecomment-5529097478) before implementation |
+| 2026-08-31 | §5.2.10 | **An `octo_sts` issuer is HTTPS-only.** Its exchange presents the projected workload-identity JWT as a bearer credential, so `http` is a load-time refusal rather than a supported transport or a warning; URL canonicalization therefore drops only the default HTTPS port | [#245](https://github.com/srhg-ai-7cef3f93/ben/issues/245) — explicit maintainer sign-off to fix the reviewed change in [#250](https://github.com/srhg-ai-7cef3f93/ben/pull/250) |
+| 2026-08-31 | §5.2, §5.4, §5.6, §5.8, §6.1, §6.2, §8.2, §8.4, §9.7, §9.10, §10.1, §11 | **One claim-scoped base/target branch, on local and Airlock substrates.** Optional `workspace.base_branch` selects an unqualified branch; omission selects the repository default when a new assignment epoch is first prepared. The selected target is persisted atomically with that epoch's verification base and is retained across retry, rollback, reload, restart and default movement. `target_branch` is trusted prompt data, while exact PR-base equality is authoritative publish evidence. `FindPR` refuses more than one exact-head open PR without choosing by order or target. Airlock's daemon-owned mirror selects and stores the same tuple; remote verification reads it from the mirror claim, never from workflow state or the sandbox. Targetless pre-amendment local, mirror and remote-cycle records are named, non-authorizing legacy state for their existing epoch; only a later assignment epoch may retain valid outgoing base/cycle facts and replace them with a complete tuple before hooks or launch. Deploy only after the existing empty-principal drain. | [#152](https://github.com/srhg-ai-7cef3f93/ben/issues/152) — accepted ticketprep packet `sha256:772099818aff9bd25682abe88cbc6852c8cb828b650c91fc4019b7dd7b6974be`: `DEC-01`–`DEC-05` selected `OPT-01`, `REC-01` accepted; implementation and this exact locked-spec edit explicitly authorized by the user |
 | 2026-08-20 | §3.1, §6.1, §6.2, §8.2, §8.4, §9.2, §9.5, §9.6, §9.7, §9.8, §9.10, §12.3 | **Claim-scoped verification bases.** The tracker-native ID of the current claim-establishing `assigned` event is the claim epoch. Before BEN projects `ben:claimed`, the workspace provider durably records a pending intent for that epoch. At its first claim-aware prepare, after remote-first reattachment and before any current-attempt hook, it derives #94's prior-work fact against the outgoing epoch's pin and atomically replaces the pending intent with `{epoch, current branch head}`. Every later prepare and every §9.7 read validates that same pair; retries, continuations, human unparks and restarts inside one assignment retain it, while an unassignment followed by reassignment creates a new epoch and base. Recovery never asks §9.7 against a missing, pending, unreadable or mismatched epoch. A matching pending epoch with no run marker resumes the pre-hook prepare; a pending epoch with a run marker, or an absent/unreadable/mismatched record, parks and cannot be unparked into a launch under that claim. The epoch and base are one atomic safety fact, so no crash can expose a new epoch with an old base or an old epoch with a new base. This narrows `done`; it changes no tracker write capability and preserves #94's evidence-derived attempt floor. | [#11](https://github.com/srhg-ai-7cef3f93/ben/issues/11) — exact contract explicitly approved before implementation and this locked-spec edit |
 | 2026-08-19 | §9.8, §11 | **A held release that cannot land is resolved by a read, not by the write.** A settled held-claim release remains owed and retried after failure, because a write's refusal cannot classify whether the issue or assignment still exists. Each failed attempt makes the claim eligible for a confirming `Get`: `ErrIssueNotFound`, or a successful read showing the configured principal no longer assigned, permits forgetting it; a failed read or continued assignment retains the claim and re-drives the same release. The confirmation shares §9.8's existing one-per-tick held-claim budget and cursor with sweep absences, so the two disjoint candidate sets form one fair rotation rather than two request allowances. This supersedes #148's K-absence/K-tick latency sentence: K is now the size of the stable union offered to that rotation. The confirmation neither re-derives the settled reason nor re-baselines `revision`, and it reads no `ClaimHistory`; `HeldClaims` failure does not gate it. During graceful shutdown, confirming a release ordered before the drain completes that already-ordered effect and may run under the same bound without initiating a new release or terminal projection | [#135](https://github.com/srhg-ai-7cef3f93/ben/issues/135) — [sign-off #5346274704](https://github.com/srhg-ai-7cef3f93/ben/issues/135#issuecomment-5346274704) before implementation |
 | 2026-08-19 | §5.2, §5.4, §5.5, §5.7, §5.8, §6.2, §7.1, §7.3, §7.7, §8, §8.4, §8.5, §9.2, §9.7, §9.8, §10.2, §11 | **Every tracker, base-fetch and publish credential is obtained from a credential source at the moment it is needed**, and a bounded source states a deadline BEN does not use a token past. Sixteen amendments, one invariant: **no source failure falls through to a different credential.** A top-level `credential_sources` map declares named sources under a closed registered kind set — `octo_sts` and `static` — each with a **strict per-kind schema** enforced by a `Describe` that is **pure**: no network, no filesystem, no instance, so a workload-identity config load-validates on a host holding no credential and `make workflow-check` stays credential-free. A partially configured source refuses; it never degrades to another kind. **Every legacy spelling compiles into an implicit source**, so there is exactly one runtime treatment and no nil-means-legacy branch. Credential errors carry a class — transient, permanent, or the **inert zero**, which parks — and that class **routes at exactly two sites**: §9.8's attempt retry at `Prepare`/`Start`, and §9.7's verification. It routes nothing on the tracker's own paths, where a read retries next tick and an owed write **stays owed across every class**; there it is read only for log severity. A transient §9.7 credential failure retries **in `verifying`**, once per poll tick, recording no attempt and routing no verdict — fail-closed covers evidence that contradicts or cannot be established, and a credential that could not be obtained establishes neither. `credential` joins §7.3's closed taxonomy as the retryable reason, and `preparing → needs-review` joins §9.2's table for the classes that park. An **empty token value** and **TTL insufficiency** are classified at the credential boundary, before any downstream GitHub request, git invocation or agent launch. Reload gains **pure, name-free bindings** replacing the raw `Config.Tracker` comparison: a rename with an identical definition is not a rebuild and an edit beneath an unchanged name is, with a loader-resolved literal's **full SHA-256** in the binding key so a rotated literal still rebuilds. Source identity (`Authority`) and definition (`BindingKey`) are **distinct keys**: Octo scope is in both, OIDC token path in the binding key only — so one projected service-account token federating two trust-policy identities is the intended deployment and loads. The §10.2 split becomes one rule over identities read from **loader provenance**: two credentials with equal authority are one credential however spelled, and tracker↔publisher equality is a load refusal. `Repository` and `RunnerOptions` carry **no credential scope**; each source instance owns its own, and §8.5's backoff gate is keyed by **(endpoint, authority)** rather than by the token. Out of scope, named: `github_app`, whose private-key custody the interfaces admit without anticipating | [#156](https://github.com/srhg-ai-7cef3f93/ben/issues/156) — contract reviewed over ten revisions before filing; all sixteen amendments signed off before code, per the ticket's acceptance list |
@@ -200,6 +204,13 @@ with an error naming the required newer BEN.
   holds `<workflow_key>/base.git` and `<workflow_key>/issues/<workspace_key>/` (§6.2).
   `~` expanded; relative paths resolve against the directory containing `WORKFLOW.md`;
   normalized to absolute before use.
+- `base_branch` (string, OPTIONAL) — the unqualified branch a fresh issue workspace is cut from
+  and its pull request MUST target. It is preserved unchanged and untrimmed, MUST be valid UTF-8
+  of 1–255 bytes, MAY contain slashes, MUST NOT begin with `-`, `refs/`, or `origin/`, and
+  `refs/heads/<value>` MUST pass Git's `check-ref-format`. Omission selects the repository's
+  then-current default branch when each new assignment epoch first prepares; it does not create a
+  process-lifetime default. A written value whose remote branch is absent, or an omitted value
+  whose advertised default branch is absent, is a readiness refusal before dispatch (§11).
 
 #### 5.2.5 `agent` (object)
 
@@ -301,7 +312,7 @@ a downgrade to another kind (§5.7):
 
 | kind | REQUIRED, non-blank after trimming | canonicalization |
 |---|---|---|
-| `octo_sts` | `url`, `scope`, `identity`, `oidc_token_path`; all four MUST be literal scalars — no `$VAR` reference or interpolation | `url` parsed; scheme MUST be `http` or `https`; scheme and host lowercased, a default port for the scheme dropped, trailing slash stripped, path preserved; userinfo, query and fragment REFUSED. The other three are trimmed and otherwise preserved |
+| `octo_sts` | `url`, `scope`, `identity`, `oidc_token_path`; all four MUST be literal scalars — no `$VAR` reference or interpolation | `url` parsed; scheme MUST be `https`; scheme and host lowercased, the default HTTPS port dropped, trailing slash stripped, path preserved; userinfo, query and fragment REFUSED. The other three are trimmed and otherwise preserved |
 | `static` | `value`, and it MUST be **exactly one `$VAR` reference** — not a literal, not an interpolation | the variable name |
 
 An unknown key in a source block is a refusal, per §5.3: a typo in `oidc_token_path` that silently
@@ -389,6 +400,7 @@ The closed variable set:
 | `issue` | The full normalized issue object (§8.3): `identifier`, `title`, `body`, `labels`, `state`, `assignees`, `blockers`, `url`, `created_at`, `updated_at` |
 | `attempt` | Integer attempt number; `null`/absent only when the numbered attempt is 1. A newly established claim can begin at 2 under §9.6 when git evidence says work may already exist |
 | `workspace` | Absolute workspace path (string) |
+| `target_branch` | Trusted string: the target branch retained with this claim epoch's verification base (§6.2) |
 | `run` | `run.id` (unique per attempt), `run.previous_outcome` (`null` when this record has no previous run outcome, including an evidence-derived attempt floor; otherwise `"succeeded"` after a clean-exit continuation or the failure reason string from §7.3), and `run.previous_attempt` (the prior attempt's account — see below) |
 
 The daemon is always headless; there is no shared behavioral posture knob.
@@ -484,7 +496,8 @@ When — and only when — the task is complete:
 1. Commit all changes. Work only on the branch already checked out in this
    workspace; never create, switch, or force-update branches.
 2. Push it: `git push origin HEAD`.
-3. Open a pull request against the default branch with `gh pr create`, and put
+3. Open a pull request against `{{ target_branch }}` with
+   `gh pr create --base {{ target_branch | shellescape }}`, and put
    `Fixes #{{ issue.identifier }}` in the PR body so the issue closes on merge.
 4. Do not merge the pull request. Do not close the issue.
 
@@ -560,6 +573,10 @@ laptop without secrets and in CI, where it is what load-validates the repo's own
 `credential_sources` (§5.2.10) is rendered **in full**: it holds no secret. A `static` source's
 `value` is a variable reference and is printed as written.
 
+`workspace.base_branch` renders unchanged with file provenance when written. Omission renders
+`<repository-default>` in text and `null` in JSON, with default provenance; introspection does not
+contact the repository to replace that selector with a branch name.
+
 **Credential policy.** An explicit `$VAR` that resolves empty is rejected by the **loader**,
 per §5.5, before any adapter is consulted — the workflow named a secret and the host did not
 supply it, which is a fact about the file and needs no adapter to see it. An **omitted**
@@ -598,8 +615,9 @@ narrower workspace consumer additionally supplies the expected claim epoch on ev
 can durably begin an epoch before label projection, and can read the epoch/base pair without
 preparing during recovery. Those are consumer-specific safety/evidence operations, for the same
 reason `PublishFacts` and the pre-hook #94 observation do not widen the strategy interface.
-`Workspace` carries the positive claim epoch beside `BaseSHA`; the pair is inseparable input to
-verification. A zero epoch authorizes no hook, launch, reuse or success verdict.
+`Workspace` carries the positive claim epoch beside `BaseSHA` and `TargetBranch`; once pinned, the
+triple is inseparable input to prompt rendering and verification. A zero epoch, empty base, or
+empty target authorizes no hook, launch, reuse or success verdict.
 
 v1 ships exactly **one** strategy: git worktree + per-issue branch. (GitHub-first means the
 target is always a git repo; snapshot-copy has no v1 user.)
@@ -607,7 +625,8 @@ target is always a git repo; snapshot-copy has no v1 user.)
 ### 6.2 Worktree strategy
 
 - **Base repo.** The daemon owns its source: a **bare clone** (`base.git`) created on first
-  run and fetched before each attempt. Worktrees are cut from it. Nothing lives inside any
+  run and fetched before each attempt. The branch retained for the claim is fetched, and fresh
+  worktrees are cut from it. Nothing lives inside any
   repo working tree; there is no human-managed checkout to inherit state from. Any unexpected
   base-clone state is **fail-closed**: loud error, no auto-repair. Base-clone fetch
   authenticates with the tracker credential (§10.2). A repository carries a credential
@@ -631,7 +650,7 @@ target is always a git repo; snapshot-copy has no v1 user.)
   commits in production; treat this as load-bearing). Reattach is **remote-first** (#16):
   every prepare probes origin for `ben/<workspace_key>`, fetching it into a non-branch ref
   namespace (fetch cannot move a checked-out branch). Branch on origin but not local → the
-  local branch is created at the remote head, never derived from the default branch (a
+  local branch is created at the remote head, never derived from the selected base branch (a
   daemon that has never seen the issue attaches the existing work — the #11 handoff). Both
   exist → a local branch strictly behind fast-forwards; strictly ahead (unpushed work)
   attaches as-is; true divergence **fails closed** — fast-forwarding either way would
@@ -642,8 +661,9 @@ target is always a git repo; snapshot-copy has no v1 user.)
   it. Commits never pushed before the root is lost are unrecoverable (§3.1).
 
   **Claim base.** The workspace provider owns one durable claim-base record per workspace key.
-  Its authorizing state is `pinned(epoch, base_sha)`; the only transitional state is
-  `pending(epoch, outgoing_pin?)`. The outgoing pin, when present, remains a reachable git fact
+  Its authorizing state is `pinned(epoch, base_sha, target_branch)`; the only transitional state is
+  `pending(epoch, outgoing_pin?)`. The outgoing pin includes its target when it was recorded by
+  this version and remains a reachable git fact
   until the transition finishes. Creating the pending intent is durable and idempotent for one
   epoch. Repeating it for an already pinned matching epoch is a no-op; a conflicting pending
   intent is not overwritten.
@@ -651,12 +671,13 @@ target is always a git repo; snapshot-copy has no v1 user.)
   After remote-first reattachment has settled the local issue branch, and before `after_create`,
   `before_run`, a run marker or an agent can mutate it, the provider observes the current branch
   head against the outgoing pin for §9.6 and atomically replaces the pending record with
-  `pinned(epoch, current_head)`. Recovery can therefore observe the old pinned record, the new
-  pending intent retaining that old pin, or the new pinned record — never a torn epoch/base pair.
-  The current head is the fetched default head for a genuinely fresh issue and the reattached issue
+  `pinned(epoch, current_head, selected_target)`. Recovery can therefore observe the old pinned record, the new
+  pending intent retaining that old pin, or the new pinned record — never a torn epoch/base/target
+  tuple. The current head is the fetched selected-target head for a genuinely fresh issue and the reattached issue
   head otherwise. Retries, continuations, human unparks and restarts in the same epoch read the
-  existing pin and MUST NOT remint it. A later claim-establishing assignment ID creates a new
-  pending epoch and, at its first prepare, a new base.
+  existing base and target and MUST NOT remint either, even after configuration or repository-default
+  movement. A later claim-establishing assignment ID creates a new pending epoch and, at its first
+  prepare, a new base and target.
 
   Branch identity and pushed commits still reconstruct from origin. The claim-base record does not:
   its missing, unreadable or contradictory shape is a positive failure to establish the safety
@@ -835,17 +856,22 @@ instance they started with, since §5.4 already forbids a reload from restarting
 RunHandle: { Events <-chan Event, Done, Probe, Stop(mode) }
 ```
 
-`Probe` and `Stop` answer the same question — is this run's process group gone — and are **not
-interchangeable**. `Probe` MUST only observe: one existence check, no signal ladder, no verdict
-claimed, no effect on the stream or the run's lifecycle. `Stop` acts and then observes. A caller
-that merely needs the answer MUST use `Probe`, because the earliest moment the answer is wanted is
-while a finished run's process may still be flushing its transcript, and a signal there would
-truncate the record §7.2 requires verbatim.
+`Probe` and `Stop` answer the same substrate-neutral question — is this run's **execution domain
+positively quiet** — and are not interchangeable. The substrate owns its domain and evidence: a
+local run uses §7.5's kernel domain, while a remote run uses backend domain-quiet evidence. Neither
+core nor the shared contract interprets a PID, process group, signal, cgroup, namespace, or remote
+session.
 
-`Done` is the phase edge between them, not permission for anything: before it, `Probe` is the only
-permissible question; after it, anything still in the group has outlived the process that owned it,
-so a signal is both safe and necessary. Neither fact authorizes reuse or release — only a
-**confirmed** termination does (§9.8).
+`Probe` MUST only observe: one fresh read-only evaluation of the domain's quiet evidence, no
+teardown, no verdict claimed, no cleanup enqueued, and no effect on stream, transcript, or
+lifecycle. `Stop` performs the substrate's bounded teardown and then evaluates the same predicate.
+A caller that merely needs the answer MUST use `Probe`, including while a finished direct process
+may still be flushing its transcript.
+
+`Done` is a phase edge, not permission for reuse or release: before it, `Probe` is the only
+permissible question; after it, `Stop` may tear down domain members that outlived direct execution.
+A clean natural exit MUST confirm quiet without prior signal delivery. Only confirmed domain quiet
+authorizes workspace reuse, disposal, verification, or claim release (§9.8).
 
 There is no separate Resume method: **continuation is an adapter-opaque token** carried in
 the `RunSpec`, minted by the adapter in a prior `started` event, stored but never interpreted
@@ -879,6 +905,7 @@ retained verbatim in the per-run transcript (§10.3). `usage` is best-effort nor
 | `killed` | no | Deliberate stop |
 | `budget_exceeded` | no | Orchestrator-initiated on cost-cap breach; parks as `needs-review` (§9.9) |
 | `credential` | yes | A **transient** failure to obtain a credential. An unknown or permanent credential failure is not a run failure: it parks (§9.2) |
+| `output_overflow` | no | The runner's own verdict on a single stdout line past the scanner ceiling (§7.5): the reader that hit it claims it, the run is killed, and the transcript marks the cut. Not transient — the same agent on the same input reproduces it — so no attempt is spent retrying it |
 
 Verdicts are **static** — the orchestrator applies retry policy (§9.6) without inspecting
 agent internals.
@@ -893,16 +920,71 @@ means "the agent claims done" — real success is the orchestrator's git-fact ve
 
 ### 7.5 Process discipline
 
-`Setpgid` process groups; `Stop` = SIGTERM to `-pgid`, grace period, SIGKILL; strict
-Start → drain-streams → Wait ordering; line-scanner buffer raised well past the 64 KiB
-default (10 MiB RECOMMENDED). `Stop` reports **confirmed/unconfirmed** termination —
-unconfirmed feeds the claim-retention rule (§9.8).
+**Local execution domain.** Each supported local attempt owns a fresh Linux cgroup-v2 leaf and a
+trusted BEN supervisor which is PID 1 of fresh user, PID, cgroup, and mount namespaces. The trusted
+child MUST first be created atomically in the leaf with `clone3(CLONE_INTO_CGROUP|CLONE_PIDFD|
+CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNS)`. `CLONE_NEWCGROUP` MUST NOT be a clone flag: after
+placement and UID/GID mapping, the trusted child MUST call `unshare(CLONE_NEWCGROUP)` before
+supervisor exec or any untrusted code, so the cgroup namespace roots at the attempt leaf.
 
-`Probe` reports the same verdict from a **single non-signalling observation** of the group, and
-MUST NOT signal, claim a verdict, or disturb the stream (§7.1). Both operations own the same
-evidence: **only `ESRCH` on the group proves disappearance**. Every other answer — `EPERM`, an
-unknown error, a cancelled context — is unconfirmed, because the safe direction costs a retained
-claim and another tick while the other costs two agent processes in one worktree (§9.8).
+The less-privileged mount namespace's inherited mounts MAY be locked and MUST NOT be assumed
+individually detachable. Before untrusted exec the supervisor MUST make propagation private;
+snapshot every inherited proc, cgroup, and cgroup2 alias; stack inert read-only covers over
+noncanonical aliases; stack fresh private procfs and leaf-rooted read-only cgroup2 mounts at their
+canonical paths; and verify by mount identity and filesystem facts that every old alias is
+unreachable. It MUST close ancestor-control and namespace descriptors and place the provider in a
+nested user namespace with no capability over the supervisor-owned containment namespaces. A
+process group MAY exist for job control but is not termination evidence.
+
+Untrusted code MAY create further user, cgroup, mount, and PID namespaces and MAY mount fresh
+procfs/cgroup2 filesystems when host policy permits. This is not a readiness failure: a new cgroup
+namespace MUST root at the caller's current attempt leaf or a descendant, and a new procfs MUST be
+governed by the attempt PID namespace or a descendant. Such a cgroup2 view MAY create and organize
+descendant cgroups but MUST NOT expose or permit migration to the delegated parent, daemon, or
+sibling attempt. `no_new_privs` MUST NOT be treated as a namespace or mount prohibition. The
+provider adds no syscall filter solely to forbid these nested mounts.
+
+The supervisor reports direct-provider exit separately and remains PID 1 until every process in
+the attempt PID namespace exits naturally. Thus `setsid`, double-fork, exec, and nested namespaces
+neither escape accounting nor turn direct-process exit into quiet. A provider MUST NOT see or
+migrate to the delegated parent or a sibling attempt. The daemon retains the clone pidfd and
+attempt-cgroup descriptor; untrusted code receives neither.
+
+**Quiet predicate.** Local positive quiet is a host-boot mismatch, or positive proof that the
+recorded PID-namespace init exited. A still-live exact supervisor is unconfirmed even if its cgroup
+is empty, removed, swept, or replaced. Matching `cgroup.events` `populated 1` is unconfirmed and
+vetoes an exit observation as a containment invariant violation. After supervisor exit, quiet is
+confirmed unless the matching cgroup is positively populated: Linux kills all remaining
+PID-namespace members when its init exits. Malformed/reused identity, a torn or failed observation,
+cancellation, and every unknown result are unconfirmed. Leader exit, direct `wait`, `Done`, pipe
+EOF, elapsed time, signal history, process-group `ESRCH`, cgroup emptiness, and cgroup removal alone
+are not quiet evidence.
+
+Local `Probe` performs one read-only pidfd/process-identity and cgroup evaluation; it sends no
+signal and writes, removes, or enqueues nothing. Local `Stop` observes first, sends TERM only
+through the recorded supervisor pidfd, waits one grace, applies recursive `cgroup.kill`, and waits
+at most one further grace for the same predicate. A failed pidfd TERM skips to `cgroup.kill`; it
+never falls back to a numeric PID or process group. It reports confirmed only on the predicate.
+Stream-drain and scanner bounds are unchanged.
+
+**Resource cleanup.** The local provider MUST register every created attempt with a provider-owned
+janitor which outlives its handle. After positive supervisor exit and recursive cgroup emptiness,
+the janitor removes nested cgroups and the leaf bottom-up with descriptor-relative identity checks
+and bounded retries. Startup MUST sweep canonical empty attempt trees left by a crash and retain
+populated trees without killing them. Cleanup is not a quiet verdict, does not clear a marker, and
+is never caused by `Probe`. Persistent cleanup failure MUST fail closed for future local starts
+rather than permit unbounded accumulation.
+
+**Support.** Local execution is supported only where the runtime can exercise unified cgroup-v2
+delegation with `nsdelegate`, `cgroup.kill`, descriptor-relative cleanup, the ordered
+clone-then-cgroup-unshare protocol, the required user/PID/cgroup/mount namespaces,
+locked-mount-safe alias cover, contained provider-created namespace/mount behavior,
+`openat2`/`statx`, `pidfd_open`, and `pidfd_send_signal`. The nested-mount canary MAY observe a
+host-policy denial or successful leaf/descendant-rooted mounts; it MUST refuse only a broader view
+or successful parent/sibling migration. `Ready` and `Start` MUST otherwise refuse when a required
+primitive is absent, blocked, or fails the containment/cleanup canary. There is no process-group
+fallback. Unsupported platforms remain build/test/inspection and remote-execution platforms but
+MUST refuse a real local run.
 
 ### 7.6 Secrets and I/O
 
@@ -1040,6 +1122,12 @@ TrackerAdapter:
 
 The orchestrator decides *when* per its policy (§9); the adapter decides *how* the calls
 render on the tracker.
+
+`FindPR` enumerates open pull requests for the exact issue-branch head across every returned page,
+stopping only when enumeration is exhausted or a second candidate proves ambiguity. Zero returns
+no PR; exactly one returns its complete facts, including its base branch; more than one returns the
+shared `ErrPRAmbiguous`, independent of update order or target. It MUST NOT select the newest or
+filter candidates by the expected target.
 
 **A tracker adapter is constructed from explicit options**: the provider block, the workflow key,
 the claim assignee, and a credential source. Legacy in-provider credentials are compiled into an
@@ -1474,8 +1562,8 @@ floor. A human re-queue that retains the assignment retains the epoch and base t
 ### 9.7 Verification (git facts)
 
 For the first `Prepare` of a claim epoch, after remote-first reattachment and before any
-current-attempt hook, atomically record `{claim_epoch, branch HEAD}` as that claim's verification
-base (§6.2). On every attempt and during recovery, the epoch MUST equal §9.10 step 2's current
+current-attempt hook, atomically record `{claim_epoch, branch HEAD, target_branch}` as that claim's
+verification base (§6.2). On every attempt and during recovery, the epoch MUST equal §9.10 step 2's current
 claim-establishing assignment ID before publish evidence is read. Thus “branch advanced” means
 that **this claim** added commits. A controller unassignment followed by BEN reassignment remints
 the base at the prior PR head; a no-op reviser cannot satisfy leg 1 from commits an earlier claim
@@ -1484,10 +1572,13 @@ produced. On `succeeded`:
 1. **Branch advanced** — the local issue branch HEAD differs from and descends from the
    recorded base SHA.
 2. **Branch on origin** — the pushed branch exists remotely with those commits.
-3. **PR exists** — `FindPR` returns an open PR for the branch.
+3. **PR exists and joins the target** — `FindPR` returns exactly one open PR for the branch, and
+   its base branch exactly equals the claim's retained `target_branch`.
 
 All three → `done` (publish milestone comment with PR link, dispose workspace, retain claim).
-Missing evidence after a clean exit → continuation track (§9.6). Evidence contradicting the
+No PR after a clean exit → continuation track (§9.6). One PR against another target is contradictory
+evidence → `needs-review`; multiple exact-head open PRs are an ambiguity error and fail closed.
+Other evidence contradicting the
 claim (e.g. no commits at `max_turns`, or verification itself fails ambiguously) →
 `needs-review`, workspace kept. Fail closed: verification errors never count as success.
 
@@ -1677,9 +1768,17 @@ an idle tick over any number of records reads no history at all, and the ordinar
 either, the list response having settled it. A parked record's rules read no history at all, and
 its `Get` is spent only on the absence they may not act on.
 
-**Stop semantics:** *interrupt* (let the done-signal drive completion) vs *stop* (discard).
-A stop whose termination is **unconfirmed retains the claim** — a possibly-alive process must
-never share a workspace with a replacement; retry the stop next tick.
+Every terminal outcome is held until its execution domain is positively quiet. Before `Done`,
+reconciliation may only `Probe`; after `Done`, it may `Stop`. Events-close and Done may arrive in
+either order, but both use one predicate: a naturally completed empty domain progresses without a
+signal, while a surviving member remains unconfirmed until bounded teardown or later natural quiet.
+Scheduler order changes neither safety nor liveness.
+
+An unconfirmed domain retains the handle, claim, workspace, run marker, and concurrency slot, reads
+no publish evidence, and retries on later ticks. Graceful shutdown likewise completes only after
+every held local or remote domain is confirmed quiet; the supervisor's existing outer deadline
+remains the final bound. Removal of an already-quiet substrate resource may continue in its provider
+janitor and does not weaken that domain decision.
 
 **Shutdown semantics.** A graceful shutdown (§11) **initiates no new release and no new terminal
 projection**. It stops dispatch, interrupts every in-flight run, waits for confirmed termination
@@ -1741,22 +1840,32 @@ assumption the tracker could not confirm.
    interrupted projection, and recovery completes the projection by removing it.
 4. **Classify.**
 
-   **The workspace precondition.** A workspace whose previous run is not confirmed gone MUST
-   NOT be reused, disposed, or released. Before launching an attempt the daemon records a
-   per-workspace **run marker** meaning *a run may be live in this workspace*, upgraded once
-   the run exists with evidence sufficient to ask later whether it still does; the marker is
-   removed only when that run is confirmed gone — the same fact, and the same linearization
-   point, that frees a workspace at run time (§9.8).
+   **The workspace precondition.** Before launch, the daemon writes the run marker. Once a run
+   domain exists it upgrades the marker with substrate-owned evidence identifying that domain, not
+   merely its direct process. The identified marker is evaluated by the same read-only positive
+   quiet predicate used at run time. Only confirmed domain quiet removes the marker; live,
+   unreadable, unsupported, malformed, reused, or otherwise unconfirmed evidence retains the claim
+   and workspace and is re-evaluated. A marker not upgraded across the launch window remains
+   `unknown_launch` and parks as before.
 
-   Recovery reads the marker in three states:
+   Linux local evidence is a versioned canonical payload naming the host boot,
+   delegated/root/attempt cgroup device and inode identities, unpredictable attempt name,
+   supervisor host PID and start ticks, its immutable PID-namespace device/inode identity, and its
+   launch-fixed cgroup-namespace identity. Live observation uses the clone pidfd; restart
+   observation first opens a pidfd and compares immutable procfs identities before interpreting
+   liveness. Cgroup discovery and cleanup are descriptor-relative after initial validated procfs
+   discovery; a missing, swept, or replaced cgroup is not disappearance. A reboot proves an old
+   local domain quiet.
 
-   - **Absent** — the workspace is free.
-   - **Present, carrying identifying evidence** — the run is probed. Only proof of its absence
-     frees the workspace; every other answer, an error included, means *possibly live*.
-   - **Present without that evidence** — the **launch outcome is unknown**. The marker survives
-     a crash before the launch, a crash after it and before the upgrade, and an interrupted
-     cleanup of a launch that failed. The three are indistinguishable and one of them has a
-     live run in it.
+   The local provider owns cgroup-resource cleanup independently of the marker: a janitor removes a
+   positively exited and recursively empty attempt tree, and startup sweeps canonical empty crash
+   residue while preserving populated trees. Neither action clears the marker or proves quiet. The
+   shipped systemd profile delegates the subtree but retains `KillMode=mixed`; after abrupt
+   main-process failure, recovery confirms only by proving the recorded PID-namespace init exited
+   and applying the populated-cgroup veto, not by assuming systemd teardown or an absent path. An
+   exact supervisor surviving manual replacement remains possibly live. Legacy same-boot `pgid`
+   evidence remains possibly live even on group `ESRCH`; remote evidence keeps its backend-defined
+   identity and domain-quiet proof. Core and the universal contract interpret no scheme.
 
    A candidate whose workspace is **possibly live** is retained: the claim and the workspace
    are kept, nothing is disposed or released, no agent is dispatched, and the question is asked
@@ -1830,20 +1939,25 @@ assumption the tracker could not confirm.
 
 | Claim-base state | Run marker / history | Recovery |
 |---|---|---|
-| `pinned` for the current epoch | ordinary marker states | Use that base; apply the existing workspace precondition and ordinary projection classification. |
+| `pinned` for the current epoch, with a target | ordinary marker states | Use that base and target; apply the existing workspace precondition and ordinary projection classification. |
 | `pending` for the current epoch | marker absent and no current-cycle `ben:running` evidence | Ask no publish-evidence question. Resume the claim-aware first-`Prepare` path; re-run §9.5 first where the approved content pin did not survive. The pending→pinned transition precedes hooks and launch. |
 | `pending` for the current epoch | any marker entry, or current-cycle `ben:running` evidence | Park epoch-faulted. Under the specified ordering a run cannot have begun while the epoch was pending, so this is torn or legacy state, not a state from which to infer success. |
-| absent, unreadable, multiply represented, or for another epoch | any | Park epoch-faulted. Do not verify against an older base and do not mint a historical base from the branch now present. |
+| absent, unreadable, targetless legacy, multiply represented, or for another epoch | any | Park epoch-faulted. Do not verify against an older base and do not mint a historical base or target from the branch or repository default now present. |
 
    Run-marker absence says only “the workspace is free now”; it is not evidence that no earlier run
    occurred and cannot repair a missing or mismatched epoch. Conversely, the epoch check does not
    weaken the run-marker precondition: a matching pinned epoch whose run may still be live still
    waits, and an unknown launch still parks under the existing rule.
 
-   Deploy the epoch-aware version only while `ClaimedByPrincipal` is empty — no running, parked or
-   held claim for that principal. A pre-epoch assignment has no trustworthy epoch/base pair and is
-   deliberately parked. Historical pins may be used only as the outgoing fact of a **new assignment
-   created after the upgrade**; they are never retrofitted onto a claim already standing.
+   Deploy the epoch-and-target-aware version only while `ClaimedByPrincipal` is empty — no running,
+   parked or held claim for that principal. A pre-epoch assignment has no trustworthy epoch/base
+   pair, and a targetless pre-amendment record has no trustworthy historical target; either is
+   deliberately parked. A targetless local claim-base, daemon-side mirror claim, or remote workspace
+   cycle is readable only as named non-authorizing legacy state for the same epoch. Historical bases
+   and remote cycle identity may be carried only as outgoing facts of a **new assignment created
+   after the upgrade**, which resolves and atomically writes a complete target-bearing record before
+   hooks or launch. Today's configuration or repository default is never retrofitted onto a claim
+   already standing.
 
    Then, on the effective projection:
 
@@ -1937,7 +2051,8 @@ every startup.
    deployment MUST verify that its chosen mechanism achieves it on its own platform rather than
    assume it. The v1 adapters' per-command sandboxing does not establish it on its own — a
    boundary around the agent's subprocesses is not a boundary around the agent.
-3. **The forge enforces review.** The default branch MUST require review before merge, and the
+3. **The forge enforces review.** Every branch selectable by `workspace.base_branch` — including
+   the repository default selected by omission — MUST require review before merge, and the
    agent's publish identity MUST NOT be able to push to it directly, to **satisfy** that
    requirement itself, or to **bypass** it. Without this, §3.4's "the human gate is PR review" is
    a convention rather than a control: on a forge where the credential that pushes a branch also
@@ -2104,7 +2219,7 @@ jobs from B04 until #47.
 
 | Command | Behavior |
 |---|---|
-| `ben run [path]` | Run the daemon for the workflow at `path` (default `./WORKFLOW.md`). Selects adapters by `tracker.kind`/`agent.kind` from the kind registry, then `Structural` → `New` → `Ready`; refuses to start on any (§5.7). `signal.NotifyContext` graceful shutdown, per §9.8: stop dispatch, interrupt in-flight runs, wait for confirmed termination wherever a handle exists, and complete the effects already ordered, including bounded confirmation of a failed held release ordered before the drain. |
+| `ben run [path]` | Run the daemon for the workflow at `path` (default `./WORKFLOW.md`). Selects adapters by `tracker.kind`/`agent.kind` from the kind registry, then `Structural` → `New` → `Ready`; after the offline base-cache identity check, workspace readiness resolves the configured branch or current repository default with the tracker credential and refuses an absent branch before bundle publication or launch. The same applies on every workspace rebuild. Refuses to start on any readiness failure (§5.7). `signal.NotifyContext` graceful shutdown, per §9.8: stop dispatch, interrupt in-flight runs, wait for confirmed termination wherever a handle exists, and complete the effects already ordered, including bounded confirmation of a failed held release ordered before the drain. |
 | `ben status [--json]` | Render the white-box state files (§10.3). Read-only; works while the daemon runs. |
 | `ben config effective [--json]` | §5.8. |
 

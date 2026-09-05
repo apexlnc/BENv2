@@ -3,6 +3,7 @@ package template
 import (
 	"errors"
 	"maps"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -61,7 +62,7 @@ func TestLoadAcceptsClosedSetUsage(t *testing.T) {
 		"plain text, no liquid at all",
 		"{{ issue.identifier }} {{ issue.title }} {{ issue.body }} {{ issue.url }}",
 		"{{ issue.state }} {{ issue.created_at }} {{ issue.updated_at }}",
-		"{{ attempt }} {{ workspace }} {{ run.id }} {{ run.previous_outcome }}",
+		"{{ attempt }} {{ workspace }} {{ target_branch }} {{ run.id }} {{ run.previous_outcome }}",
 		"{{ issue.labels }} {{ issue.labels.size }} {{ issue.labels.first }} {{ issue.labels.last }}",
 		"{{ issue.labels[0] }} {{ issue.assignees[1] }}",
 		"{{ issue.state.size }} {{ workspace.size }}",
@@ -602,7 +603,7 @@ When — and only when — the task is complete:
 1. Commit all changes. Work only on the branch already checked out in this
    workspace; never create, switch, or force-update branches.
 2. Push it: ` + "`git push origin HEAD`" + `.
-3. Open a pull request against the default branch with ` + "`gh pr create`" + `, and put
+3. Open a pull request against ` + "`{{ target_branch }}`" + ` with ` + "`gh pr create --base {{ target_branch | shellescape }}`" + `, and put
    ` + "`Fixes #{{ issue.identifier }}`" + ` in the PR body so the issue closes on merge.
 4. Do not merge the pull request. Do not close the issue.
 
@@ -619,12 +620,15 @@ not survive the claim boundary — inspect the workspace and continue.
 
 func TestCanonicalSnippetFirstAttempt(t *testing.T) {
 	p := mustLoad(t, canonicalSnippet)
-	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 1, Workspace: "/w", Run: Run{ID: "r-1"}}, Limits{})
+	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 1, Workspace: "/w", TargetBranch: "main", Run: Run{ID: "r-1"}}, Limits{})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	if !strings.Contains(out, "Fixes #123") {
 		t.Errorf("output missing issue identifier:\n%s", out)
+	}
+	if !strings.Contains(out, `gh pr create --base 'main'`) {
+		t.Errorf("output missing trusted target branch:\n%s", out)
 	}
 	for _, absent := range []string{"This is attempt", "previous session"} {
 		if strings.Contains(out, absent) {
@@ -635,7 +639,7 @@ func TestCanonicalSnippetFirstAttempt(t *testing.T) {
 
 func TestCanonicalSnippetContinuation(t *testing.T) {
 	p := mustLoad(t, canonicalSnippet)
-	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 2, Workspace: "/w", Run: Run{ID: "r-2", PreviousOutcome: "succeeded"}}, Limits{})
+	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 2, Workspace: "/w", TargetBranch: "main", Run: Run{ID: "r-2", PreviousOutcome: "succeeded"}}, Limits{})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -651,7 +655,7 @@ func TestCanonicalSnippetContinuation(t *testing.T) {
 
 func TestCanonicalSnippetFailureRetry(t *testing.T) {
 	p := mustLoad(t, canonicalSnippet)
-	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 3, Workspace: "/w", Run: Run{ID: "r-3", PreviousOutcome: string(core.FailureStalled)}}, Limits{})
+	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 3, Workspace: "/w", TargetBranch: "main", Run: Run{ID: "r-3", PreviousOutcome: string(core.FailureStalled)}}, Limits{})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -667,7 +671,7 @@ func TestCanonicalSnippetFailureRetry(t *testing.T) {
 
 func TestCanonicalSnippetEvidenceFloor(t *testing.T) {
 	p := mustLoad(t, canonicalSnippet)
-	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 2, Workspace: "/w", Run: Run{ID: "r-2"}}, Limits{})
+	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 2, Workspace: "/w", TargetBranch: "main", Run: Run{ID: "r-2"}}, Limits{})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -697,13 +701,43 @@ func TestSchemaMatchesEngineBehavior(t *testing.T) {
 	}
 }
 
-func TestRenderBindsWorkspaceAndRun(t *testing.T) {
-	p := mustLoad(t, "{{ workspace }} {{ run.id }}")
-	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 1, Workspace: "/data/ws/issues/123", Run: Run{ID: "run-7"}}, Limits{})
+func TestShellEscapePreservesGitValidTargetAsOneArgument(t *testing.T) {
+	const target = `release/$USER-$(id)-"quoted"-'single';false`
+	p := mustLoad(t, canonicalSnippet)
+	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 1, TargetBranch: target}, Limits{})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-	if out != "/data/ws/issues/123 run-7" {
+	const commandPrefix = "gh pr create --base "
+	start := strings.Index(out, commandPrefix)
+	if start < 0 {
+		t.Fatalf("rendered canonical snippet has no publish command:\n%s", out)
+	}
+	argument := out[start+len(commandPrefix):]
+	end := strings.Index(argument, "`, and put")
+	if end < 0 {
+		t.Fatalf("rendered canonical command has no argument terminator:\n%s", out)
+	}
+	argument = argument[:end]
+
+	cmd := exec.Command("sh", "-c", `set -- `+argument+`; test "$#" -eq 1 || exit 91; printf '%s' "$1"`)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "USER=expanded"}
+	got, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shell round trip: %v: %s\nrendered argument: %s", err, got, argument)
+	}
+	if string(got) != target {
+		t.Fatalf("shell round trip = %q, want %q; rendered argument: %s", got, target, argument)
+	}
+}
+
+func TestRenderBindsWorkspaceTargetAndRun(t *testing.T) {
+	p := mustLoad(t, "{{ workspace }} {{ target_branch }} {{ run.id }}")
+	out, err := p.Render(Vars{Issue: testIssue(), Attempt: 1, Workspace: "/data/ws/issues/123", TargetBranch: "release/stable", Run: Run{ID: "run-7"}}, Limits{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if out != "/data/ws/issues/123 release/stable run-7" {
 		t.Errorf("Render = %q", out)
 	}
 }

@@ -7,9 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
-	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
@@ -27,16 +25,12 @@ import (
 type handle struct {
 	launch  Launch
 	timings Timings
-	cmd     *exec.Cmd
-	// pgid is the child's process group; Setpgid makes it the leader, so the
-	// group id is its pid (SPEC §7.5).
-	pgid   int
-	limits core.RunLimits
+	domain  DomainRun
+	limits  core.RunLimits
 
-	// stdout and stderr are read ends this package owns. They are deliberately
-	// not cmd.StdoutPipe/StderrPipe: Wait closes those the instant the process
-	// exits, discarding whatever is still buffered — which loses the terminal
-	// result line and turns a successful run into a phantom crash.
+	// stdout and stderr are read ends this package owns. The execution domain
+	// receives only their write ends, so direct-process exit cannot close these
+	// before the buffered terminal result has been drained.
 	stdout, stderr *os.File
 
 	// life is every lifecycle decision this run makes (see lifecycle.go).
@@ -51,10 +45,10 @@ type handle struct {
 
 	lines    chan []byte
 	activity chan struct{}
-	exited   chan struct{}
+	exited   <-chan struct{}
 	// terminated closes once the pump has emitted a terminal event.
 	terminated chan struct{}
-	// cleaned closes when a promised signal ladder has finished, whatever its
+	// cleaned closes when a promised domain teardown has finished, whatever its
 	// outcome. Nothing about the run is published before then (awaitCleanup).
 	cleaned     chan struct{}
 	cleanedOnce sync.Once
@@ -62,15 +56,6 @@ type handle struct {
 	// waits for it, so "the run is over" also means "the forensic record is
 	// complete" (see reap).
 	flushed chan struct{}
-	// recorded closes once the run's evidence has been offered to the marker
-	// sink and its verdict is known (SPEC §9.10). The pump waits for it before
-	// publishing anything, because a verdict claimed after a terminal event has
-	// already been published cannot replace it — a fast child would otherwise be
-	// reported as `succeeded` while its workspace stayed possibly-live with an
-	// un-upgraded marker. The readers, Wait and the watchdog all start ahead of
-	// it: reaping in particular must be running, or the ladder a failed sink
-	// walks would poll a zombie that answers signal 0 forever.
-	recorded chan struct{}
 	// abort unblocks a pending emit when the consumer is not coming back.
 	abort     chan struct{}
 	abortOnce sync.Once
@@ -88,12 +73,11 @@ type handle struct {
 	tail []byte
 }
 
-func newHandle(l Launch, cmd *exec.Cmd, stdout, stderr *os.File) *handle {
+func newHandle(l Launch, domain DomainRun, stdout, stderr *os.File) *handle {
 	return &handle{
 		launch:     l,
 		timings:    l.Timings,
-		cmd:        cmd,
-		pgid:       cmd.Process.Pid,
+		domain:     domain,
 		limits:     l.Limits,
 		redact:     newRedactor(l.Redact),
 		stdout:     stdout,
@@ -102,23 +86,21 @@ func newHandle(l Launch, cmd *exec.Cmd, stdout, stderr *os.File) *handle {
 		done:       make(chan struct{}),
 		lines:      make(chan []byte),
 		activity:   make(chan struct{}, 1),
-		exited:     make(chan struct{}),
+		exited:     domain.DirectDone(),
 		terminated: make(chan struct{}),
 		cleaned:    make(chan struct{}),
 		flushed:    make(chan struct{}),
 		stranded:   make(chan struct{}),
-		recorded:   make(chan struct{}),
 		abort:      make(chan struct{}),
 	}
 }
 
 func (h *handle) Events() <-chan core.Event { return h.events }
 
-// Done is closed when the harness process has been reaped *and* the transcript
-// has been written and closed. It reports the process, not the whole group: a
-// descendant that survives SIGKILL is reported through Stop's unconfirmed
-// verdict instead (SPEC §9.8), because that is the answer the orchestrator acts
-// on when deciding whether to retain a claim.
+// Done is closed when the direct provider has ended *and* the transcript has
+// been written and closed. It is a phase edge, not domain-quiet evidence: a
+// surviving descendant is reported through Probe/Stop's unconfirmed verdict
+// (SPEC §9.8), which decides whether the claim remains retained.
 //
 // Including the transcript is what makes Done usable as the signal to archive
 // or dispose: the record is written by the reader goroutines, which nothing else
@@ -127,22 +109,10 @@ func (h *handle) Events() <-chan core.Event { return h.events }
 func (h *handle) Done() <-chan struct{} { return h.done }
 
 func (h *handle) run(ctx context.Context, transcript io.WriteCloser) {
-	// Bounds the stdin-copying goroutine: a harness that exits without reading
-	// the whole prompt would otherwise keep Wait from returning.
-	h.cmd.WaitDelay = h.timings.PostExitDrain
-
 	var readers sync.WaitGroup
 	readers.Add(2)
 	go func() { defer readers.Done(); h.readStdout(transcript) }()
 	go func() { defer readers.Done(); h.readStderr() }()
-	go func() {
-		// Exit codes are advisory only (SPEC §7.4), so the Wait error is
-		// deliberately discarded: what the stream did decides the outcome.
-		// Wait is safe to run alongside the readers because the pipes are ours,
-		// not cmd's — it has no descriptors of theirs to close.
-		_ = h.cmd.Wait()
-		close(h.exited)
-	}()
 	go func() {
 		defer close(h.flushed)
 		readers.Wait()
@@ -180,19 +150,6 @@ func (h *handle) boundStream() {
 	case <-h.abort:
 		// Nobody will read this run's events again, so there is nothing left to
 		// deliver and no reason to wait out the window.
-		h.closePipes()
-		return
-	}
-	// The bound may not start while publication is gated (see recorded). The
-	// pump is waiting, not absent, so stranding here would release the readers
-	// from a collector that is about to arrive — and for a child that exits
-	// faster than the marker upgrade takes, the line stranded is the terminal
-	// one, turning a successful run into failed/crashed. The window itself is
-	// unchanged; it now begins when collection can, which is what it always
-	// assumed.
-	select {
-	case <-h.recorded:
-	case <-h.abort:
 		h.closePipes()
 		return
 	}
@@ -235,7 +192,7 @@ func (h *handle) readStdout(transcript io.Writer) {
 	defer close(h.lines)
 
 	sc := bufio.NewScanner(h.stdout)
-	sc.Buffer(make([]byte, 0, 64<<10), maxScanLine)
+	sc.Buffer(make([]byte, 0, 64<<10), MaxScanLine)
 	// handOff goes false once the event stream has no consumer; the transcript
 	// keeps filling either way.
 	handOff := true
@@ -268,9 +225,49 @@ func (h *handle) readStdout(transcript io.Writer) {
 			handOff = false
 		}
 	}
-	// A scanner error — a line past maxScanLine, or the read end closed by the
-	// post-exit bound — ends the stream. The lifecycle then classifies from
-	// whether a terminal event arrived (inStreamEnded).
+	// The scan has stopped, and *why* is the reader's to classify before it
+	// reports the stream ended (#235). A line past MaxScanLine is the one
+	// scanner error that is the child's doing rather than this package's, and
+	// it has to be claimed here: the scanner cannot continue past it, so
+	// nothing else would drain the pipe, and the child would sit blocked on a
+	// full pipe producing no activity until the stall window read it as
+	// `stalled` — retryable, for a condition that is not.
+	if errors.Is(sc.Err(), bufio.ErrTooLong) {
+		h.overflow(transcript)
+	}
+	// Every other way the scan ends — EOF, or the read end closed by the
+	// post-exit bound — is the stream ending, and the lifecycle classifies from
+	// whether a terminal event arrived (inStreamEnded). The deferred close
+	// above delivers that *after* any verdict claimed here, so the pump can
+	// never read the end of the stream before the reason for it.
+}
+
+// overflow is the reader's claim (SPEC §7.3, §7.5; #235): the child wrote one
+// line past MaxScanLine, so the stream is being cut here and the run ended with
+// failed(output_overflow). It is the same shape as the watchdog's stall and
+// timeout claims — a runner-owned verdict, and the bounded teardown it promises —
+// and it goes through the same funnel (expire), so publication waits for that
+// teardown exactly as it does for theirs.
+//
+// The transcript records the cut before the claim, as a BEN-namespaced line
+// beside the harness's own (see finishTranscript). What it does *not* record is
+// the head of the oversized line, deliberately. §7.2's "retained verbatim" is a
+// claim about whole lines: the redacting writer is stateless on the strength of
+// every write being one complete line (redactingWriter), and a 10 MiB fragment
+// ending wherever the buffer ran out is the one shape a credential can straddle
+// unmatched. A marker saying where the record stops is honest; a fragment that
+// might carry half a token is not worth what it would tell an operator.
+func (h *handle) overflow(transcript io.Writer) {
+	line, err := json.Marshal(map[string]any{
+		"type":        "ben:truncated",
+		"limit_bytes": MaxScanLine,
+		"text": "a stdout line exceeded the scanner ceiling; the stream was cut here, " +
+			"nothing past this point was retained, and the harness claimed failed(output_overflow)",
+	})
+	if err == nil {
+		_, _ = transcript.Write(append(line, '\n'))
+	}
+	h.expire(core.FailureOutputOverflow)
 }
 
 // readStderr drains stderr, which the child would otherwise block on once the
@@ -352,28 +349,29 @@ func (h *handle) watchdog(ctx context.Context) {
 	}
 }
 
-// expire is the liveness paths' claim. The ladder's answer is discarded on
-// purpose, and the reason is the one in core.Termination: it is a probe, not a
-// memory.
+// expire is the runner-owned verdicts' claim: the two liveness windows, the
+// reader's overflow (#235), and a failed evidence sink at Start. The teardown's
+// answer is discarded on purpose, and the reason is the one in
+// core.Termination: it is a probe, not a memory.
 //
-// A liveness window has no caller to answer, so the only thing it could do with
-// the boolean is *remember* it — and the fact anyone acts on is whether the
-// group is gone now, not whether it was gone when the watchdog fired. The
+// None of these has a caller to answer, so the only thing it could do with the
+// boolean is *remember* it — and the fact anyone acts on is whether the
+// domain is quiet now, not whether it was quiet when the verdict was claimed. The
 // orchestrator asks for that itself, with Stop, before it lets anything touch
 // the workspace: the terminal event this expiry produces is held until that
 // probe confirms, and an unconfirmed one retains the claim (SPEC §7.5, §9.8;
-// orchestrator confirmQuiet, Record.groupGone). A remembered unconfirmed would
+// orchestrator confirmQuiet, Record.domainQuiet). A remembered unconfirmed would
 // be the worse answer twice over — staler than the probe, and sticky, so a claim
-// would be retained forever over a group that has since died.
+// would be retained forever over a domain that has since gone quiet.
 func (h *handle) expire(r core.FailureReason) {
-	h.claim(context.Background(), r, h.timings.StopGrace)
+	h.claim(context.Background(), r, core.StopInterrupt)
 }
 
-// claim records the run's outcome and walks the signal ladder for its process
-// group, reporting whether the group is gone.
+// claim records the run's outcome and asks the execution domain to perform its
+// bounded teardown, reporting whether the domain is quiet.
 //
 // The two halves are one function because they are one promise: claiming a
-// verdict is what parks publication in awaitCleanup, and only a ladder that runs
+// verdict is what parks publication in awaitCleanup, and only a teardown that runs
 // to a conclusion releases it. There are two callers — a liveness window and
 // Stop — and neither can reach the first half without the second, so a claim
 // that nothing ever cleans up cannot be made.
@@ -382,38 +380,38 @@ func (h *handle) expire(r core.FailureReason) {
 // stream, and the terminal event is published from there with the verdict
 // applied (lifecycleState.resolve), so there is exactly one publication path
 // however a run ends.
-func (h *handle) claim(ctx context.Context, r core.FailureReason, grace time.Duration) bool {
+func (h *handle) claim(ctx context.Context, r core.FailureReason, mode core.StopMode) bool {
 	h.life.on(input{kind: inVerdict, reason: r})
-	return h.signalLadder(ctx, grace)
+	return h.teardown(ctx, mode)
 }
 
-// awaitCleanup blocks until the signal ladder that a claimed verdict promised
+// awaitCleanup blocks until the domain teardown that a claimed verdict promised
 // has finished.
 //
 // Nothing about the run may be published before then. A liveness failure means
-// the runner has decided the attempt is over and is killing its process group;
+// the runner has decided the attempt is over and is tearing its domain down;
 // announcing that while a descendant is still running would hand the
 // orchestrator a workspace it believes is idle and is not (SPEC §9.8). The wait
-// is bounded by the ladder itself — two graces at most — and short-circuits when
+// is bounded by the domain itself and short-circuits when
 // the consumer has already been abandoned.
 //
-// The ladder that *gives up* releases this wait too, so the paragraph above is a
-// statement about the ordinary case and not a guarantee about the group. It
+// A teardown that *gives up* releases this wait too, so the paragraph above is a
+// statement about the ordinary case and not a guarantee about the domain. It
 // cannot be one: a run that refused to publish would never close Done either, so
 // the orchestrator would be left with no outcome and nothing to ask about. What
 // gates workspace reuse is not this event but the confirmed/unconfirmed answer
 // the orchestrator asks Stop for once the run has ended, and an unconfirmed one
 // retains the claim (SPEC §7.5, §9.8). So publication is ordered behind cleanup
-// wherever cleanup can conclude, and honest about the group wherever it cannot.
+// wherever cleanup can conclude, and honest about the domain wherever it cannot.
 //
 // Both ways out record themselves in the lifecycle *before* releasing this wait
-// (see signalLadder and abortEmit), which is what makes the resolve that follows
+// (see teardown and abortEmit), which is what makes the resolve that follows
 // settle rather than ask to wait again.
 func (h *handle) awaitCleanup() {
 	if !h.life.claimed() {
-		// The harness ended on its own terms; no ladder was promised, and
-		// whatever it may have left behind is the workspace's problem to
-		// dispose, not a live process the runner is racing.
+		// The harness ended on its own terms; no teardown was promised, and
+		// the orchestrator will separately require the domain's positive quiet
+		// answer before it lets anything else touch the workspace.
 		return
 	}
 	select {
@@ -432,13 +430,6 @@ func (h *handle) awaitCleanup() {
 // strand the reader mid-send on an unbuffered channel, and that goroutine owns
 // the transcript — so the forensic record would never be closed.
 func (h *handle) pump() {
-	// Publication waits for the marker verdict (see recorded). An abort releases
-	// it too: nobody will read this run's events again, so there is no ordering
-	// left to protect and holding here would strand the drain below.
-	select {
-	case <-h.recorded:
-	case <-h.abort:
-	}
 	lines := h.dispatch()
 	close(h.events)
 	if lines != nil {
@@ -542,11 +533,18 @@ func (h *handle) feed(in input) bool {
 // Usage, never from Text. Redaction still cannot change how a run is judged —
 // what changed is that one field is now retained rather than counted and
 // discarded.
+//
+// The same funnel bounds Text (#235). Each adapter's translate already does, at
+// the boundary where the raw payload becomes the field — that is the anchor
+// that covers a substrate calling Translate without this package in the path —
+// and this is the second one, for the adapter that forgets: it is a no-op on
+// text the boundary bounded, and it is what lets the conformance suite assert
+// the bound against the harness rather than against each adapter's memory.
 func (h *handle) emit(ev core.Event) bool {
 	if ev.Time.IsZero() {
 		ev.Time = time.Now().UTC()
 	}
-	ev.Text = h.redact.apply(ev.Text)
+	ev.Text = BoundText(h.redact.apply(ev.Text))
 	select {
 	case h.events <- ev:
 		return true
@@ -555,34 +553,22 @@ func (h *handle) emit(ev core.Event) bool {
 	}
 }
 
-// Probe observes the process group and reports whether it is gone, without
-// touching it (SPEC §7.5; #79).
+// Probe delegates one read-only execution-domain observation (SPEC §7.5;
+// #79, #234).
 //
-// One existence check, nothing else: no verdict claimed, no ladder, no abort, no
-// lifecycle input. That is the whole point of it existing next to Stop — the
+// One fresh observation, nothing else: no verdict claimed, no teardown, no
+// abort, no lifecycle input. That is the whole point of it existing next to Stop — the
 // caller that needs this answer earliest is the orchestrator the instant a run's
 // event stream closes, and at that moment the process may still be flushing its
-// transcript. Asking with Stop then would SIGTERM a group about to exit on its
-// own and truncate §7.2's record; asking with Probe costs one syscall and
+// transcript. Asking with Stop then could disturb a domain about to exit on its
+// own and truncate §7.2's record; asking with Probe costs one observation and
 // changes nothing.
-//
-// Only ESRCH is confirmation (see groupAlive). A cancelled context is
-// unconfirmed rather than an error, because "we did not get to look" and "it is
-// still there" call for the same caution (SPEC §9.8).
 func (h *handle) Probe(ctx context.Context) core.Termination {
-	if ctx.Err() != nil {
-		return core.TerminationUnconfirmed
-	}
-	if h.groupAlive() {
-		return core.TerminationUnconfirmed
-	}
-	return core.TerminationConfirmed
+	return h.domain.Probe(ctx)
 }
 
-// Stop signals the process group and reports honestly whether it died
-// (SPEC §7.5, §9.8). Both modes walk the same ladder — SIGTERM, grace,
-// SIGKILL — because that is what the spec fixes; discard is simply less
-// patient, since its output is being thrown away.
+// Stop asks the execution domain to perform its bounded teardown and reports
+// the same quiet predicate as Probe (SPEC §7.5, §9.8).
 //
 // Only discard aborts the stream, and that is the whole of the difference
 // (#79). An abort closes the output pipes (boundStream), so aborting on an
@@ -596,8 +582,8 @@ func (h *handle) Probe(ctx context.Context) core.Termination {
 // two callers:
 //
 //   - Stopping a live run: its consumer is still draining events, and the run
-//     context that would end it is cancelled only once the group is confirmed
-//     gone (orchestrator onStopped).
+//     context that would end it is cancelled only once the domain is confirmed
+//     quiet (orchestrator onStopped).
 //   - The quiescence probe a finished run owes its workspace: Events is already
 //     closed by then, so the pump is past emitting and is draining raw lines
 //     (see pump) — there is no send for an abort to release.
@@ -606,17 +592,12 @@ func (h *handle) Probe(ctx context.Context) core.Termination {
 // falsified: the pipes stay open, the readers keep writing the transcript, and
 // Done closes once the process really does end, with the record complete.
 func (h *handle) Stop(ctx context.Context, mode core.StopMode) core.Termination {
-	grace := h.timings.StopGrace
 	if mode == core.StopDiscard {
 		// Nobody will read this run's events again.
 		defer h.abortEmit()
-		// A floor, not a window of its own: a discard still has to give the
-		// group a real chance to die between the two signals, however short the
-		// configured grace is.
-		grace = max(grace/10, 100*time.Millisecond)
 	}
 
-	if h.claim(ctx, core.FailureKilled, grace) {
+	if h.claim(ctx, core.FailureKilled, mode) {
 		return core.TerminationConfirmed
 	}
 	// Possibly still alive: the claim must be retained rather than handing a
@@ -624,74 +605,15 @@ func (h *handle) Stop(ctx context.Context, mode core.StopMode) core.Termination 
 	return core.TerminationUnconfirmed
 }
 
-// signalLadder is SPEC §7.5's SIGTERM → grace → SIGKILL, driven by the *group's*
-// disappearance rather than the leader's: a harness that spawned tools of its own
-// leaves them in the group, and stopping at the leader would leave them running
-// in the workspace. It reports whether the group is gone.
-//
-// Completing the ladder is what releases anything waiting in awaitCleanup, so
-// every exit path must close cleaned — including the one that gives up. The
-// lifecycle is told before the channel closes, so a waiter released by it always
-// sees the finished cleanup.
-func (h *handle) signalLadder(ctx context.Context, grace time.Duration) bool {
+// teardown releases anything waiting in awaitCleanup whether or not the domain
+// could be confirmed. The lifecycle is told before the channel closes, so a
+// waiter released by it always sees the completed bounded attempt.
+func (h *handle) teardown(ctx context.Context, mode core.StopMode) bool {
 	defer h.cleanedOnce.Do(func() {
 		h.life.on(input{kind: inCleanupFinished})
 		close(h.cleaned)
 	})
-
-	if !h.groupAlive() {
-		return true
-	}
-	_ = h.launch.Signal(h.pgid, syscall.SIGTERM)
-	if h.awaitGroupGone(ctx, grace) {
-		return true
-	}
-	_ = h.launch.Signal(h.pgid, syscall.SIGKILL)
-	return h.awaitGroupGone(ctx, grace)
-}
-
-// groupAlive probes for any surviving group member. Signal 0 delivers nothing;
-// an error (ESRCH) is the confirmation that the group is gone. A leader that
-// has exited but not been reaped still answers, which is why this is polled
-// alongside Wait rather than checked once.
-//
-// Group and member probes are not interchangeable: a just-killed member keeps
-// answering a signal-0 probe on its own pid for a few milliseconds after the
-// group as a whole has stopped answering. The group is the question that matters
-// here — "is anything left that could still touch the workspace" — and erring
-// toward alive only costs an unconfirmed verdict, which is the safe direction
-// (SPEC §9.8).
-// Only ESRCH proves disappearance. Every other error — EPERM above all, which
-// says the group exists and we may not signal it — means something is still
-// there, and reading it as "gone" would report a confirmed termination over a
-// live process. Unknown errors fail closed the same way: an unconfirmed stop
-// costs a retained claim, a wrong confirmation costs a shared workspace
-// (SPEC §9.8).
-func (h *handle) groupAlive() bool {
-	err := h.launch.Signal(h.pgid, syscall.Signal(0))
-	if err == nil {
-		return true
-	}
-	return !errors.Is(err, syscall.ESRCH)
-}
-
-func (h *handle) awaitGroupGone(ctx context.Context, d time.Duration) bool {
-	deadline := time.NewTimer(d)
-	defer deadline.Stop()
-	tick := time.NewTicker(h.timings.GroupPoll)
-	defer tick.Stop()
-	for {
-		if !h.groupAlive() {
-			return true
-		}
-		select {
-		case <-tick.C:
-		case <-deadline.C:
-			return !h.groupAlive()
-		case <-ctx.Done():
-			return !h.groupAlive()
-		}
-	}
+	return h.domain.Stop(ctx, mode) == core.TerminationConfirmed
 }
 
 // reap closes Done once the process has been reaped, any promised cleanup has
@@ -699,7 +621,7 @@ func (h *handle) awaitGroupGone(ctx context.Context, d time.Duration) bool {
 // linger past a terminal event.
 //
 // Its kill claims no verdict: the outcome has been published, and a verdict now
-// could not change it (lifecycleState.resolve). What it owes is the ladder, and
+// could not change it (lifecycleState.resolve). What it owes is teardown, and
 // that is the same obligation either way.
 func (h *handle) reap() {
 	defer close(h.done)
@@ -713,7 +635,7 @@ func (h *handle) reap() {
 	select {
 	case <-h.exited:
 	case <-time.After(h.timings.StopGrace):
-		h.signalLadder(context.Background(), h.timings.StopGrace)
+		h.teardown(context.Background(), core.StopInterrupt)
 		<-h.exited
 	}
 }

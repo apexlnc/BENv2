@@ -102,6 +102,16 @@ func TestRateLimitClosesTheGateWithoutSpendingRequests(t *testing.T) {
 			_, err := adapter.FindPR(context.Background(), core.Issue{Identifier: "1"}, "ben/x")
 			return err
 		}},
+		{"ContentApproval", func() error {
+			_, err := adapter.ContentApproval(context.Background(), core.Issue{Identifier: "1"})
+			return err
+		}},
+		{"RemotePR", func() error {
+			_, err := adapter.RemotePR(context.Background(), core.RemotePRQuery{
+				Issue: core.Issue{Identifier: "1"}, Repository: "github.test/acme/widgets", Branch: "ben/x",
+			})
+			return err
+		}},
 		{"Get", func() error { _, err := adapter.Get(context.Background(), "1"); return err }},
 		// Both recovery reads resolve the claim principal first, which is
 		// itself a request: gating only the work that follows would spend one

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/srhg-ai-7cef3f93/ben/internal/agent/harness"
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 )
 
@@ -80,7 +81,7 @@ func translate(line []byte) []core.Event {
 
 	switch l.Type {
 	case "system":
-		if l.Subtype != "init" || l.SessionID == "" {
+		if l.Subtype != "init" || !validSessionID(l.SessionID) {
 			return nil
 		}
 		// The session id is both identity and the opaque resume token: it is
@@ -107,7 +108,11 @@ func translate(line []byte) []core.Event {
 		if len(texts) == 0 {
 			return nil
 		}
-		return []core.Event{{Type: core.EventProgress, Text: strings.Join(texts, "\n")}}
+		// Bounded here, where the raw payload becomes the one event field a
+		// consumer retains (#235): everything between this line and the
+		// orchestrator's 16 KiB tail is a queue, and a queue holds whatever it
+		// is handed. The transcript already has the whole message.
+		return []core.Event{{Type: core.EventProgress, Text: harness.BoundText(strings.Join(texts, "\n"))}}
 
 	case "result":
 		var events []core.Event
@@ -124,6 +129,59 @@ func translate(line []byte) []core.Event {
 	default:
 		return nil
 	}
+}
+
+// validSessionID reports whether an announced session id is the shape this
+// harness actually mints. It is the first of two independent anchors on a token
+// that the child's own JSON stream chooses and the *next* attempt's argv carries
+// (SPEC §7.1, §9.6); the second is in command.go, where the same string becomes
+// `--resume <token>`.
+//
+// This is the anchor that belongs here. SPEC §3.6 puts translation of a raw
+// provider payload at the adapter boundary, and this line is that payload:
+// everything past it — the started event, the run record, the state directory,
+// the next RunSpec — treats the token as opaque and is right to, because "opaque
+// to the orchestrator" (SPEC §7.1) is a statement about who may *interpret* it,
+// not a licence for nobody to validate it. The adapter that mints it from an
+// attacker-controlled stream is the only party that knows what shape it has.
+//
+// claude-code session ids are UUIDs — verified against 2.1.221, see
+// testdata/stream-success.jsonl — so the exact check is available and is the one
+// used, rather than a character class that would still accept a token nothing
+// here ever emits. Hex digits are accepted in either case: a UUID's case carries
+// no meaning, and refusing an uppercase spelling would be this adapter inventing
+// a rule about a future release rather than reading the one it measured.
+//
+// A failing id mints no started event at all, which is the same answer an absent
+// one already got: the line stays activity, so the run continues (SPEC §7.2),
+// and the attempt ends with no resume token — costing one fresh session, which
+// is the conservative direction. Reporting it as `SessionID` while withholding
+// it as `Continuation` was the alternative and is worse: it would write an
+// identity into the §10.3 record that this function has already concluded the
+// harness did not produce.
+func validSessionID(id string) bool {
+	// 8-4-4-12 hex, hyphens at the fixed offsets, and nothing else. Indices are
+	// byte offsets, so a multibyte rune anywhere fails on one test or the other.
+	const uuidLen = 36
+	if len(id) != uuidLen {
+		return false
+	}
+	for i := range len(id) {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if id[i] != '-' {
+				return false
+			}
+			continue
+		}
+		if !isHexDigit(id[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexDigit(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
 // resultReason maps a failed result to the closed failure taxonomy
@@ -175,3 +233,18 @@ func mentionsAny(haystack string, needles ...string) bool {
 	}
 	return false
 }
+
+// Translate is this adapter's raw-line boundary, exported for the substrate
+// that cannot reach it through harness.Launch (#194, #46).
+//
+// The v2 backend runs the same argv somewhere else and hands BEN opaque process
+// bytes; internal/remote frames those bytes into complete lines and then calls a
+// remote.Translator. That translator has to be *this* function, because parsing
+// a provider record is the provider adapter's business and nothing else's
+// (SPEC §3.6, §7.7) — a second implementation behind the substrate would be a
+// second opinion about what a claude-code line means.
+//
+// A function value rather than a method: it is stateless by construction, and
+// making that visible is what keeps the remote path from acquiring per-attempt
+// state the local path does not have.
+func Translate(line []byte) []core.Event { return translate(line) }

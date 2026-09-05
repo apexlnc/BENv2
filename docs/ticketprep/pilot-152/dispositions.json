@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "packet_digest": "sha256:772099818aff9bd25682abe88cbc6852c8cb828b650c91fc4019b7dd7b6974be",
+  "items": [
+    {
+      "suggestion_id": "DEC-01",
+      "disposition": "accepted",
+      "selected_option_id": "DEC-01-OPT-01"
+    },
+    {
+      "suggestion_id": "DEC-02",
+      "disposition": "accepted",
+      "selected_option_id": "DEC-02-OPT-01"
+    },
+    {
+      "suggestion_id": "DEC-03",
+      "disposition": "accepted",
+      "selected_option_id": "DEC-03-OPT-01"
+    },
+    {
+      "suggestion_id": "DEC-04",
+      "disposition": "accepted",
+      "selected_option_id": "DEC-04-OPT-01"
+    },
+    {
+      "suggestion_id": "DEC-05",
+      "disposition": "accepted",
+      "selected_option_id": "DEC-05-OPT-01"
+    },
+    {
+      "suggestion_id": "REC-01",
+      "disposition": "accepted"
+    }
+  ]
+}

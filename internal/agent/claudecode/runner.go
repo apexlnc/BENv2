@@ -6,7 +6,7 @@
 // What this package owns is the claude-specific half: which argv to build,
 // which environment variables carry the credential, what one line of the stream
 // means, and what readiness asks of the binary. The process lifecycle, liveness
-// windows, signal ladder, and transcript retention are the same obligation for
+// windows, execution-domain teardown, and transcript retention are the same obligation for
 // every process-per-attempt harness and live in internal/agent/harness.
 //
 // Two consequences of the contract that the interface does not make obvious:
@@ -47,7 +47,8 @@
 //	                 provider strings are $VAR-resolved and argv is public.
 //	allowed_tools    → --allowed-tools, one flag per entry.
 //	disallowed_tools → --disallowed-tools, one flag per entry.
-//	add_dirs         → --add-dir. Empty is the norm; the workspace is the boundary.
+//	add_dirs         → --add-dir, absolute paths only. Empty is the norm; the
+//	                 workspace is the boundary.
 //	env              Extra child environment entries.
 //	env_passthrough  Daemon environment variable names to forward. Names only,
 //	                 so a secret does not become a load-time requirement.
@@ -147,16 +148,25 @@
 // What the posture states, each measured against srt 0.0.73 rather than assumed
 // (#81 F1–F6 and the gaps after them):
 //
-//   - The **shared git dir** is in `allowRead` *and* `allowWrite`. srt does not
-//     special-case linked worktrees, so `git commit` fails on `index.lock`
-//     without the write, and reports "not a git repository" without the read —
-//     allowWrite does not imply read, and SPEC §5.2.4's default root under
-//     `$HOME` is what makes that reachable. It arrives on the RunSpec because
-//     the file that would answer `git rev-parse --git-common-dir` is one srt
-//     leaves writable by design, and §6.2 reattaches.
-//   - `denyWrite` covers `base.git/hooks`, `base.git/config`,
-//     `<workspace>/.git`, and the directory holding BEN's own settings file and
-//     git config — the agent's routes to configuring its next attempt.
+//   - The **shared git dir itself is in neither allow list**. Its measured
+//     mutable `objects`, `refs`, `logs` and current worktree-admin directories
+//     enter both; fixed files (`config`, `HEAD`, `info/exclude`, optional
+//     packed-refs) enter `allowRead` only. A read-only parent masks nested write
+//     binds on Linux, while a writable parent lets a run move denied-file
+//     mounts aside. The narrower set preserves commits, keeps
+//     `base.git/worktrees` read-only, and prevents an older sandbox from writing
+//     a sibling admin dir created later. Automatic Git maintenance is disabled
+//     in BEN's global config because its common-root lock files are intentionally
+//     outside this set. The shared root arrives on the RunSpec because the file
+//     that would answer `git rev-parse --git-common-dir` is agent-writable and
+//     §6.2 reattaches.
+//   - `denyWrite` covers `base.git/hooks`, `base.git/config`, the current
+//     `base.git/worktrees/<key>/{commondir,config.worktree,gitdir}`,
+//     `<workspace>/.git`, and the directory holding BEN's own settings file
+//     and git config — the agent's routes to configuring its next attempt. The
+//     Git pointer only selects a real direct child inside the provider-reported
+//     shared root, and both reciprocal pointers must lead back to the reported
+//     paths (#232).
 //   - **`enableWeakerNetworkIsolation` is pinned on darwin.** Seatbelt breaks
 //     Go's macOS platform verifier, so `gh` fails with `x509: OSStatus -26276`
 //     and a run commits, pushes, and cannot open a PR. srt documents the flag as
@@ -194,8 +204,10 @@
 // And what it does not claim, because a posture oversold is worse than one
 // absent:
 //
-//   - **`$HOME` is not sealed.** srt adds `~/.claude/debug` and `~/.npm/_logs`
-//     to its own default write paths whatever this file says.
+//   - **The runtime's built-in write set remains.** srt adds `/tmp/claude`,
+//     `/private/tmp/claude`, `~/.claude/debug` and `~/.npm/_logs` whatever this
+//     file says. CLAUDE_CODE_TMPDIR changes the child's TMPDIR but does not
+//     remove those fixed grants; LocalWrites reports all four directory trees.
 //   - **`git push -u` prints two errors even when it succeeds.** The `-u`
 //     bookkeeping writes branch tracking into the *shared* repository config,
 //     which this posture denies; measured, the ref lands and git exits 0 with
@@ -241,9 +253,11 @@ package claudecode
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -261,7 +275,9 @@ const KindName = "claude-code"
 
 // Kind is the package-level agent.kind registration (SPEC §5.7, §7.1; BUILD
 // assembly decision 13): the entry points that exist before any runner does.
-type Kind struct{}
+// domain is an unexported contract-test seam; registry construction leaves it
+// nil and therefore selects the process-lifetime production domain.
+type Kind struct{ domain harness.ExecutionDomain }
 
 var _ core.RunnerKind = Kind{}
 
@@ -272,6 +288,37 @@ var _ core.RunnerKind = Kind{}
 func (Kind) Structural(cfg core.AgentConfig) error {
 	_, err := ParseProvider(cfg)
 	return err
+}
+
+// LocalWrites reports the complete write scope beyond the workspace and
+// inherited TMPDIR. Under sandbox_mode none the run is explicitly unbounded.
+// Under srt, Claude owns TMPDIR inside the workspace private tree; in addition
+// to add_dirs, srt itself always grants two fixed temp trees and two paths
+// beneath the inherited HOME. CLAUDE_CODE_TMPDIR moves the child's TMPDIR but
+// does not remove those built-in grants (srt 0.0.73).
+func (Kind) LocalWrites(cfg core.AgentConfig, paths core.LocalRuntimePaths) (core.LocalWriteScope, error) {
+	p, err := ParseProvider(cfg)
+	if err != nil {
+		return core.LocalWriteScope{}, err
+	}
+	if p.SandboxMode == SandboxNone {
+		return core.LocalWriteScope{Unbounded: true}, nil
+	}
+	home := paths.DaemonHomeDir
+	if configured, ok := p.Env["HOME"]; ok {
+		home = configured
+	}
+	if home == "" || !filepath.IsAbs(home) {
+		return core.LocalWriteScope{}, fmt.Errorf("%w: sandbox_mode %s requires an absolute inherited HOME to report its implicit write paths", ErrSandbox, SandboxSRT)
+	}
+	roots := slices.Clone(p.AddDirs)
+	roots = append(roots,
+		"/tmp/claude",
+		"/private/tmp/claude",
+		filepath.Join(home, ".claude", "debug"),
+		filepath.Join(home, ".npm", "_logs"),
+	)
+	return core.LocalWriteScope{Roots: roots}, nil
 }
 
 // ForwardedEnvVars names the variables this adapter copies into a child by
@@ -303,7 +350,7 @@ func (Kind) Model(provider map[string]any) (string, []string) {
 // The nil is returned explicitly rather than as a typed *Runner: a refusal must
 // leave the caller with a nil interface, or `runner, err := kind.New(...)`
 // hands back something non-nil to call methods on after it has already failed.
-func (Kind) New(opts core.RunnerOptions) (core.AgentRunner, error) {
+func (k Kind) New(opts core.RunnerOptions) (core.AgentRunner, error) {
 	r, err := New(Options{
 		Provider:       opts.Provider,
 		Publish:        opts.Publish,
@@ -311,6 +358,7 @@ func (Kind) New(opts core.RunnerOptions) (core.AgentRunner, error) {
 		TranscriptDir:  opts.TranscriptDir,
 		OnRun:          opts.OnRun,
 		Timings:        harness.Timings{StopGrace: opts.StopGrace},
+		Domain:         k.domain,
 	})
 	if err != nil {
 		return nil, err
@@ -354,14 +402,12 @@ type Runner struct {
 
 	transcripts harness.TranscriptStore
 	onRun       core.RunEvidenceSink
+	domain      harness.ExecutionDomain
 	// redact are the bound block's credential values, kept out of retained
 	// transcripts (SPEC §10.3). Read off credentialKeys through
 	// harness.CredentialValues, so this adapter states each credential once.
 	redact  []string
 	timings harness.Timings
-	// signal sends sig to a process group; injectable so a test can simulate a
-	// process the kernel will not kill for us.
-	signal harness.SignalFunc
 }
 
 // Options configures a Runner.
@@ -387,9 +433,9 @@ type Options struct {
 	// every issue, so a sink that could not name the workspace would upgrade the
 	// wrong marker.
 	OnRun core.RunEvidenceSink
-
-	// signal is test-only (see Runner.signal).
-	signal harness.SignalFunc
+	// Domain overrides the process-lifetime Linux execution domain in contract
+	// tests. Production leaves it nil.
+	Domain harness.ExecutionDomain
 }
 
 // New binds the provider configuration to a runner. Binding at construction is
@@ -403,6 +449,10 @@ func New(opts Options) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	domain := opts.Domain
+	if domain == nil {
+		domain = harness.LocalDomain()
+	}
 	r := &Runner{
 		provider:       p,
 		publish:        opts.Publish,
@@ -410,8 +460,8 @@ func New(opts Options) (*Runner, error) {
 		redact:         harness.CredentialValues(opts.Provider, credentialKeys),
 		transcripts:    opts.Transcripts,
 		onRun:          opts.OnRun,
+		domain:         domain,
 		timings:        opts.Timings,
-		signal:         opts.signal,
 	}
 	if r.transcripts == nil {
 		if opts.TranscriptDir != "" {
@@ -425,15 +475,27 @@ func New(opts Options) (*Runner, error) {
 
 // Capabilities reports what this harness supports (SPEC §7.1). Resume is the
 // session id carried in RunSpec.Continuation; usage arrives on the result line.
-func (r *Runner) Capabilities() core.Capabilities {
-	return core.Capabilities{Resume: true, Usage: true}
-}
+func (r *Runner) Capabilities() core.Capabilities { return capabilities() }
+
+// capabilities is the one declaration behind both substrates. A function rather
+// than a package variable, for the reason remote.hookOrder is unexported: a
+// value at package scope is a mutable global, and this one decides whether a
+// continuation token may be handed to a run.
+//
+// One declaration because it is one fact. Resume and usage are properties of the
+// CLI's own protocol — a session id in the stream and a result line carrying
+// tokens — so a remote run has exactly the same two, and two literals would be
+// two places for that to stop being true.
+func capabilities() core.Capabilities { return core.Capabilities{Resume: true, Usage: true} }
 
 // Ready checks the bound configuration against the world: the binary exists,
 // identifies itself as Claude Code, and holds a usable credential (SPEC §7.1).
 // Catching any of it here is the difference between one loud refusal at startup
 // and every dispatch burning a workspace to rediscover it.
 func (r *Runner) Ready(ctx context.Context) error {
+	if err := r.domain.Ready(ctx); err != nil {
+		return fmt.Errorf("%w: %w", ErrExecutionDomain, err)
+	}
 	path, err := r.resolveBinary()
 	if err != nil {
 		return err
@@ -637,7 +699,10 @@ func (r *Runner) Start(ctx context.Context, spec core.RunSpec) (core.RunHandle, 
 	if err != nil {
 		return nil, err
 	}
-	argv := p.command(spec)
+	argv, err := p.command(spec)
+	if err != nil {
+		return nil, err
+	}
 	argv[0] = binary
 
 	// Per attempt, before the environment is composed. Refusing here costs one
@@ -673,7 +738,10 @@ func (r *Runner) Start(ctx context.Context, spec core.RunSpec) (core.RunHandle, 
 		if err != nil {
 			return nil, err
 		}
-		paths := p.sandboxPathsFor(spec, binary, gh)
+		paths, err := p.sandboxPathsFor(spec, binary, gh)
+		if err != nil {
+			return nil, err
+		}
 		if err := p.writeSandbox(paths, identity); err != nil {
 			return nil, err
 		}
@@ -692,7 +760,7 @@ func (r *Runner) Start(ctx context.Context, spec core.RunSpec) (core.RunHandle, 
 	if err != nil {
 		return nil, fmt.Errorf("claude-code: %w", err)
 	}
-	return harness.Start(ctx, harness.Launch{
+	handle, err := harness.Start(ctx, harness.Launch{
 		Name:       KindName,
 		Argv:       argv,
 		Env:        env,
@@ -705,8 +773,12 @@ func (r *Runner) Start(ctx context.Context, spec core.RunSpec) (core.RunHandle, 
 		Redact:     redact,
 		OnRun:      harness.BindEvidence(r.onRun, spec),
 		Timings:    r.timings,
-		Signal:     r.signal,
+		Domain:     r.domain,
 	})
+	if errors.Is(err, harness.ErrExecutionDomain) {
+		return nil, fmt.Errorf("%w: %w", ErrExecutionDomain, err)
+	}
+	return handle, err
 }
 
 // specErrors names this adapter's refusals for the shared RunSpec checks

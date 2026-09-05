@@ -23,15 +23,23 @@ import (
 // and what let a stale read from a previous cycle drop a claim established by
 // the next one.
 //
-// heldClaim is what remains after conversion: no workspace, no runner,
-// nothing to stop (SPEC §9.2). It is not local state but a cache of a fact
-// the tracker can enumerate, which is why recovery rebuilds the whole set
-// rather than persisting it (SPEC §9.8; B10 adopts one at its two `done`
-// verdicts).
+// heldClaim is what remains after conversion: no runner and nothing to stop
+// (SPEC §9.2). It is not local state but a cache of a fact the tracker can
+// enumerate, which is why recovery rebuilds the whole set rather than
+// persisting it (SPEC §9.8; B10 adopts one at its two `done` verdicts).
 type heldClaim struct {
 	issue core.Issue
 	// prURL is the pull request the claim is being held for (SPEC §9.8).
 	prURL string
+	// workspace is the *opaque* identity of the workspace cycle this claim's work
+	// lived in, carried so that the release verdict can name it to the ended-cycle
+	// obligation (cycle.go, #252). Zero on the local path and on any provider
+	// whose workspace does not outlive its claim — cycleWorkspace decides, so the
+	// held record does not have to.
+	//
+	// Narrower than the run record's on purpose, and the obligation narrows it
+	// again: nothing here is a host path or a fact a run could have authored.
+	workspace core.Workspace
 	// revision is the §8.3 change token last observed. It triggers a history
 	// read and never decides anything by itself.
 	revision string
@@ -66,6 +74,10 @@ type heldClaim struct {
 	// never overlap the release it would cancel: a result token can discard a
 	// stale write's completion, but it cannot unsend the write. Failed operations
 	// are retried rather than assumed.
+	//
+	// An ended cycle's disposal is deliberately *not* one of these: it is keyed by
+	// issue rather than by record, because the same obligation outlives whichever
+	// owner noticed it (cycle.go).
 	inFlight bool
 }
 
@@ -112,12 +124,27 @@ func (o *Orchestrator) driveHold(ctx context.Context, r *Record) {
 	// principal from a different snapshot than the history would answer a
 	// question nobody asked.
 	b := o.bundle()
+	required, workspaces := b.Definition.Config.Tracker.RequiredLabels, b.Workspaces
 	r.convertInFlight = true
 	go func() {
 		events, err := b.Tracker.ClaimHistory(ctx, issue)
+		// The workspace cycle's own question, asked from the same read, because the
+		// conversion is a window nothing else covers. Reconciliation adopts the
+		// issue's *current* revision on its way to `done`, and the held record is
+		// baselined to it here — so a withdrawal and re-application that happened
+		// before this instant leaves no later revision mismatch, the sweep never buys
+		// a history read, and the cycle this claim published from is disposed by
+		// nobody (#252).
+		superseded, approvalErr := cycleSuperseded(ctx, workspaces, issue, StandingApproval(events, required))
 		o.send(ctx, signal{
 			kind: sigClaimAnchor, issue: id, token: token, err: err,
-			anchor: claimCycleAnchor(events, b.ClaimPrincipal),
+			anchor:          claimCycleAnchor(events, b.ClaimPrincipal),
+			cycleSuperseded: superseded, cycleApprovalErr: approvalErr,
+			// The revision these answers were computed against. Reconciliation can
+			// adopt a newer one onto the record while this worker is blocked, and
+			// baselining the held record to *that* would consume the trigger that
+			// buys the next read for a change nothing has looked at.
+			issueRevision: issue.Revision,
 		})
 	}()
 }
@@ -140,6 +167,13 @@ func (o *Orchestrator) onClaimAnchor(ctx context.Context, r *Record, s signal) {
 		// issue's read does forever: readyToConvert has already established the
 		// record owes nothing, so nothing else would ever revisit it (SPEC §9.8
 		// refreshes neither `done` nor an ordered exit).
+		//
+		// A gone issue ends the workspace cycle — no approval on this tracker will
+		// address it again — and this record is the last thing that knows which
+		// sandbox it was, so the obligation is registered before the record goes
+		// (#252, cycleEndedBy).
+		o.oweEndedCycle(r.Issue.Identifier, o.bundle().Workspaces, r.Workspace,
+			"issue is gone from the tracker")
 		o.log.Info("dropping the finished run: the issue is gone from the tracker",
 			"issue", r.Issue.Identifier)
 		o.forget(r.Issue.Identifier)
@@ -155,6 +189,43 @@ func (o *Orchestrator) onClaimAnchor(ctx context.Context, r *Record, s signal) {
 		}
 		return
 	}
+	if errors.Is(s.cycleApprovalErr, ErrApprovalUnread) {
+		// The log names no standing approval — and here, unlike on the sweep path,
+		// nothing has just read the labels from a list. The likeliest reading is the
+		// one the sweep can rule out and this cannot: the required set really was
+		// removed, and retrying would retry an issue that has left the workflow
+		// forever.
+		//
+		// So it is settled against current state, by the same `Get` a missing
+		// *anchor* is settled by — whose verdicts already cover every answer this
+		// question has: the set is gone (owe the cycle, release), the issue is
+		// terminal or gone (the same), or the labels are complete after all and the
+		// log is merely behind (retain, and ask again).
+		o.confirmDoneOwnership(ctx, r)
+		return
+	}
+	if s.cycleApprovalErr != nil {
+		// The provider could not read its own record, which is neither of the above.
+		// Nothing converts and nothing is released; the next tick re-drives the
+		// conversion (retryPendingExits).
+		o.log.Warn("could not read the workspace cycle's approval at conversion; retrying next tick",
+			"issue", r.Issue.Identifier, "error", s.cycleApprovalErr)
+		return
+	}
+	if s.cycleSuperseded {
+		// The approval this claim's workspace cycle is anchored to was withdrawn and
+		// applied again before the claim could be retained. Cycle A ended at the
+		// withdrawal, and this record is the last thing that knows which sandbox it
+		// was — so it never becomes a held claim at all: the disposal is owed and the
+		// claim released, and the reapproved issue is dispatched afresh into cycle B
+		// once the obligation confirms.
+		o.log.Info("the approval anchoring this workspace cycle was withdrawn before the claim was retained",
+			"issue", r.Issue.Identifier, "workspace", r.Workspace.Key)
+		o.oweEndedCycle(r.Issue.Identifier, o.bundle().Workspaces, r.Workspace,
+			"the approval anchoring this workspace cycle was withdrawn")
+		o.release(ctx, r, "the approval anchoring this workspace cycle was withdrawn")
+		return
+	}
 	if s.anchor == 0 {
 		// The log does not show the assignment that established this claim.
 		// That is the *absence* of a fact, which §9.10 never reads as
@@ -164,7 +235,7 @@ func (o *Orchestrator) onClaimAnchor(ctx context.Context, r *Record, s signal) {
 		o.confirmDoneOwnership(ctx, r)
 		return
 	}
-	o.convertToHeld(r, s.anchor)
+	o.convertToHeld(r, s.anchor, s.issueRevision)
 }
 
 // confirmDoneOwnership settles a missing anchor against current assignment.
@@ -187,8 +258,19 @@ func (o *Orchestrator) onDoneOwnership(ctx context.Context, r *Record, s signal)
 	// One record, one moment: the configuration in force now is what this
 	// verdict is taken under (SPEC §5.4 gives reconciliation to the reload).
 	def := o.definition()
+	// The workspace cycle first, from the same facts and for cycleEndedBy's
+	// reason: two of the branches below drop this record on a *disappearance*, and
+	// a disappearance that is also a close or a revoked label ends the cycle. This
+	// record is the last thing that knows which sandbox that was — `on_success`
+	// disposed the claim at `done` and, under the suspend remote review requires,
+	// left the tree allocated (#252).
+	res := refreshResult{issue: s.refetched, err: s.err}
+	why, cycleEnded := o.cycleEndedBy(def, res)
+	if cycleEnded {
+		o.oweEndedCycle(id, o.bundle().Workspaces, r.Workspace, why)
+	}
 	switch {
-	case gone(refreshResult{issue: s.refetched, err: s.err}):
+	case gone(res):
 		// Deleted or transferred: no claim of ours survives it.
 		o.log.Info("dropping the finished run: the issue is gone from the tracker", "issue", id)
 		o.forget(id)
@@ -216,6 +298,12 @@ func (o *Orchestrator) onDoneOwnership(ctx context.Context, r *Record, s signal)
 	// retaining here is not caution; it is deferring a settled verdict to a
 	// history read that may never resolve, while the claim it holds blocks the
 	// issue for everyone.
+	// Both also end the *workspace cycle*, and this record is the only thing that
+	// still knows which one. It reached `done` — so `on_success` already disposed
+	// the claim and, under the suspend remote review requires, left the sandbox
+	// allocated — and it is about to release without ever becoming a held claim,
+	// which is the route that would otherwise settle the obligation. Owed before
+	// the release is ordered; driveOwed holds that release behind it (#252).
 	case !o.active(def, *s.refetched):
 		o.log.Info("releasing the retained claim: the issue went terminal", "issue", id)
 		o.release(ctx, r, "issue went terminal before the claim cycle could be anchored")
@@ -237,12 +325,22 @@ func (o *Orchestrator) onDoneOwnership(ctx context.Context, r *Record, s signal)
 
 // convertToHeld is the handoff, and the only place a `done` run record is
 // removed.
-func (o *Orchestrator) convertToHeld(r *Record, anchor int64) {
+func (o *Orchestrator) convertToHeld(r *Record, anchor int64, revision string) {
 	id := r.Issue.Identifier
 	o.held[id] = &heldClaim{
-		issue:       r.Issue,
-		prURL:       r.PRURL,
-		revision:    r.Issue.Revision,
+		issue: r.Issue,
+		prURL: r.PRURL,
+		// The revision the conversion's reads were taken against, never the record's
+		// current one. They can differ — reconciliation adopts a fresh issue while
+		// the conversion worker is out — and the record's would claim this cycle
+		// question was asked about a change it was not. Behind is safe and
+		// self-correcting: the next sweep sees a mismatch and buys the read. Ahead
+		// is the trigger spent on an answer nobody gave.
+		revision: revision,
+		// Read off the record that is being handed over, and read *now*: this is
+		// the one instant both owners exist, and after it nothing else knows which
+		// workspace cycle this claim's work lived in.
+		workspace:   cycleWorkspace(o.bundle().Workspaces, r.Workspace),
 		cycleAnchor: anchor,
 		token:       o.newToken(),
 	}
@@ -312,7 +410,7 @@ const heldConfirmationsPerTick = 1
 //     signed rule and wants its own decision, as this one did.
 //
 // A settled release's own *write* is outside all of this on purpose: it is an owed
-// write, one per releasing record per tick, driven by retryHeldReleases rather than
+// write, one per releasing record per tick, driven by retryHeldExits rather than
 // by this read (see its comment for why that coupling is refused). What it is not
 // outside is the confirmation term above — a release that keeps failing asks the
 // same question an absence does, and pays out of the same budget (#135).
@@ -331,7 +429,7 @@ func (o *Orchestrator) sweepHeld(ctx context.Context, res sweepResult, cur snaps
 	}
 	if res.err != nil {
 		// Refresh failure → keep everything; retry next tick. Settled releases are
-		// unaffected: retryHeldReleases drives those and it does not run from here,
+		// unaffected: retryHeldExits drives those and it does not run from here,
 		// and the confirmation that can resolve an unlandable one is offered
 		// whether or not this read returned (offerHeldConfirmations).
 		if !o.logCredentialFailure("held-claim sweep failed; retrying next tick", "", res.err) {
@@ -456,13 +554,14 @@ func (o *Orchestrator) classifyHeld(ctx context.Context, id string, h *heldClaim
 	}
 }
 
-// retryHeldReleases re-drives every settled release independently of the sweep.
+// retryHeldExits re-drives every settled exit independently of the sweep.
 //
 // A release that has been decided is an owed write like any other, and the
 // list read is not its precondition — gating the retry on that read would
 // couple an already-decided write to an unrelated request, so a tracker
 // failing the list call would leave settled claims standing for as long as it
-// kept failing.
+// kept failing. The ended-cycle disposal ahead of it is owed on the same terms
+// and retried by the same loop.
 //
 // Retried, and never abandoned on its own failure: what a refused write proves is
 // nothing (#134). The claim leaves only on evidence — the tracker accepting the
@@ -474,10 +573,13 @@ func (o *Orchestrator) classifyHeld(ctx context.Context, id string, h *heldClaim
 // the liveness that a shared in-flight slot needs and the safety that two slots
 // could not provide: a confirmation may forget the record, and forgetting cannot
 // retract a release already waiting on the serial effect queue.
-func (o *Orchestrator) retryHeldReleases(ctx context.Context) {
+func (o *Orchestrator) retryHeldExits(ctx context.Context) {
 	for id, h := range o.held {
 		if h.releasing {
-			o.driveHeldRelease(ctx, id, h)
+			// A no-op while this issue's ended cycle still owes a disposal; that
+			// obligation is driven under its own bound (cycle.go), and clearing it
+			// re-drives this.
+			o.driveHeldExit(ctx, id, h)
 		}
 	}
 }
@@ -486,6 +588,16 @@ func (o *Orchestrator) retryHeldReleases(ctx context.Context) {
 // it. Dropping first would lose the retry — a 503 or a refused enqueue would
 // leave the claim standing with nothing tracking it, and a stranded claim
 // blocks the issue for everyone including us (SPEC §8.3).
+//
+// Every route here is a tracker fact that ends the *workspace cycle* as well as
+// the claim: the complete required-label set removed, or the issue terminal. A
+// reapproval after either mints a different cycle address, so the sandbox this
+// claim used becomes unreachable at this instant — which is why the ended-cycle
+// disposal is settled here and nowhere else. The route that does *not* pass
+// through here is the one that must not dispose: a controller unassigning BEN
+// with every required label still standing leaves the cycle alive for the next
+// claim epoch, and that arrives as an absence from the sweep read
+// (offerHeldConfirmations → onHeldConfirmed's dropHeld).
 func (o *Orchestrator) releaseHeld(ctx context.Context, id string, h *heldClaim, why string) {
 	if h.releasing {
 		return
@@ -505,7 +617,30 @@ func (o *Orchestrator) releaseHeld(ctx context.Context, id string, h *heldClaim,
 	}
 	h.releasing = true
 	h.why = why
+	o.oweEndedCycle(id, o.bundle().Workspaces, h.workspace, why)
 	o.log.Info("releasing the retained claim", "issue", id, "reason", why)
+	o.driveHeldExit(ctx, id, h)
+}
+
+// driveHeldExit drives the release, once nothing stands in front of it.
+//
+// The order is the contract, and it is the opposite of what saving a tick would
+// suggest. An ended cycle's disposal goes first because the tracker claim is what
+// makes that obligation findable: while it stands, §9.10 step 1 enumerates the
+// issue and the held sweep re-derives this same verdict, so a crash costs a tick.
+// Releasing first and crashing costs a sandbox — nothing names it afterwards, and
+// the backend's idle timer is measured in days (#252, cycle.go).
+//
+// The disposal is not started here. It belongs to the tick's bounded driver, and
+// starting one from this side would spend that budget from inside the walk over
+// the held set the budget is a decision about — classifyHeld settles this verdict
+// for free for every record one sweep response contains, so a backlog-wide
+// gesture would start K of them at once. The ordinary path loses nothing:
+// driveEndedCycles runs later in the same tick than the sweep that settles this.
+func (o *Orchestrator) driveHeldExit(ctx context.Context, id string, h *heldClaim) {
+	if h.inFlight || o.endedCycleOwed(id) {
+		return
+	}
 	o.driveHeldRelease(ctx, id, h)
 }
 
@@ -567,13 +702,22 @@ func (o *Orchestrator) confirmHeldClaim(ctx context.Context, id string, h *heldC
 func (o *Orchestrator) checkHeldHistory(ctx context.Context, id string, h *heldClaim, fresh core.Issue) {
 	b := o.bundle()
 	issue, token, principal := fresh, h.token, b.ClaimPrincipal
+	required, workspaces := b.Definition.Config.Tracker.RequiredLabels, b.Workspaces
 	h.inFlight = true
 	go func() {
 		events, err := b.Tracker.ClaimHistory(ctx, issue)
 		anchor := claimCycleAnchor(events, principal)
+		// The other thing this read can settle that current state cannot: a required
+		// label withdrawn and *restored* since the claim was retained. The set is
+		// complete again by the time the sweep looks, so only the standing approval
+		// having moved says it happened — and the provider's durable record is what
+		// it is compared against, because that record is the authority on which cycle
+		// the retained sandbox belongs to (#252).
+		superseded, approvalErr := cycleSuperseded(ctx, workspaces, issue, StandingApproval(events, required))
 		o.send(ctx, signal{
 			kind: sigHeldHistory, issue: id, token: token, err: err,
 			refetched: &issue, anchor: anchor, verified: closedInCycle(events, anchor),
+			cycleSuperseded: superseded, cycleApprovalErr: approvalErr,
 		})
 	}()
 }
@@ -606,12 +750,35 @@ func (o *Orchestrator) onHeldConfirmed(ctx context.Context, s signal) {
 		return
 	}
 	h.inFlight = false
+	// The workspace cycle, asked *before* the two drops below and from the same
+	// facts. Those drops answer "is there still a claim of ours here" — a
+	// different question, and one an issue that is both closed and unassigned
+	// answers first — so without this a cycle could end on a read that then threw
+	// away the only thing naming its sandbox (#252, cycleEndedBy). An issue that
+	// is merely unassigned while its labels stand ends nothing, which is the
+	// changes-requested route and stays a no-dispose.
+	//
+	// Only for a record that is **not** already releasing, and that exclusion is
+	// not caution. This read is spent for two disjoint reasons (offerHeldConfirmations),
+	// and for the second — a settled release the tracker keeps refusing — the
+	// release has already been *attempted*, which driveHeldExit permits only once
+	// the cycle's disposal has been confirmed. So a fresh obligation here would be
+	// a second disposal of a cycle already disposed: a redundant backend call under
+	// `on_revoked: suspend`, and worse than redundant if the backend has since gone
+	// away, because the release it re-gates was about to land. Same rule sweepHeld
+	// applies from the other side — a settled verdict is never re-derived.
+	res := refreshResult{issue: s.refetched, err: s.err}
+	if !h.releasing {
+		if why, ended := o.cycleEndedBy(o.definition(), res); ended {
+			o.oweEndedCycle(id, o.bundle().Workspaces, h.workspace, why)
+		}
+	}
 	// release_owed and reason name the settled release this read may have been
 	// spent to resolve, so the two drops below say what became of it. Without
 	// them the operator log ends on "retrying next tick" for a write that is
 	// never attempted again.
 	switch {
-	case gone(refreshResult{issue: s.refetched, err: s.err}):
+	case gone(res):
 		// Deleted or transferred: there is nothing left to release.
 		o.log.Info("dropping the retained claim: the issue is gone from the tracker",
 			"issue", id, "release_owed", h.releasing, "reason", h.why)
@@ -642,7 +809,7 @@ func (o *Orchestrator) onHeldConfirmed(ctx context.Context, s signal) {
 		// The confirming read and the write are consecutive, never concurrent.
 		// Re-drive here rather than waiting a tick: this is what lets them share
 		// one slot without leaving the release idle after an inconclusive answer.
-		o.driveHeldRelease(ctx, id, h)
+		o.driveHeldExit(ctx, id, h)
 	}
 }
 
@@ -679,6 +846,42 @@ func (o *Orchestrator) onHeldHistory(ctx context.Context, s signal) {
 		o.releaseHeld(ctx, id, h, "issue was closed inside this claim cycle")
 		return
 	}
+	// The other thing this log can show that current state cannot: the approval
+	// that anchors this claim's **workspace cycle** was withdrawn and applied
+	// again since it was retained.
+	//
+	// classifyHeld's label check cannot see it — the set is complete again by the
+	// time the sweep looks, so the issue reads exactly as it did — while the
+	// sandbox this claim published from has become unreachable, because the new
+	// application is a new approval and selects a different cycle address
+	// (remotews.BeginClaimBase). Cycle A ended at the removal and cycle B began at
+	// the reapplication, which is precisely what #252 asks BEN to notice; without
+	// it, A is disposed by nobody.
+	//
+	// Treated as the revocation it is: the claim is released, so the reapproved
+	// issue is dispatched afresh into B, and A's disposal is owed against the
+	// address this record has been carrying since it was converted.
+	if s.cycleApprovalErr != nil {
+		// The provider could not say which cycle it holds, which is the absence of
+		// an answer rather than "unchanged". No verdict and — the part that matters —
+		// no re-baseline of the revision below: that bump is what buys the next read,
+		// and spending it here would settle the question by never asking it again.
+		o.log.Warn("could not read the workspace cycle's approval; asking again on the next observed change",
+			"issue", id, "error", s.cycleApprovalErr)
+		return
+	}
+	if s.cycleSuperseded {
+		// The approval this claim's workspace cycle is anchored to was withdrawn and
+		// applied again. Cycle A ended at the withdrawal; the reapplication is cycle
+		// B, at a different address. The claim is released with A's disposal owed, so
+		// the reapproved issue is dispatched afresh into B — and the obligation holds
+		// it out of dispatch until the backend confirms, which is what stops B's
+		// claim beginning before A is gone.
+		o.log.Info("the approval anchoring this claim's workspace cycle was withdrawn and re-applied",
+			"issue", id, "workspace", h.workspace.Key)
+		o.releaseHeld(ctx, id, h, "the approval anchoring this workspace cycle was withdrawn")
+		return
+	}
 	// The bump was something else — a comment, a label, a re-assignment.
 	// Re-baseline, so the same revision does not buy a second read.
 	h.issue = *s.refetched
@@ -698,7 +901,23 @@ func (o *Orchestrator) heldFor(s signal) (string, *heldClaim, bool) {
 // dropHeld removes a held record, and with it the last thing tracking the
 // issue. Only ever called on confirmed evidence: the tracker accepted the
 // release, or said the claim is not ours to release.
+//
+// What it does **not** take with it is an unfinished ended-cycle disposal. That
+// obligation is keyed by cycle address rather than carried here (cycle.go),
+// precisely so that the two routes into it — the issue is gone, the principal is
+// no longer assigned — cannot drop the last thing that knew a sandbox needed
+// releasing, or conflate two cycles for one issue.
+//
+// Those are also the two routes on which the obligation *outlives every owner*:
+// there is no record and no held claim left to hold it, only the entry and the
+// tick that drives it. It is the case `drained` keeps its own clause for, and the
+// line below is the operator's account of a claim leaving while its allocation
+// has not.
 func (o *Orchestrator) dropHeld(id string) {
+	if o.endedCycleOwed(id) {
+		o.log.Info("dropping a retained claim whose ended workspace cycle is not yet disposed; "+
+			"the disposal outlives it and is retried on later ticks", "issue", id)
+	}
 	delete(o.held, id)
 	o.mu.Lock()
 	delete(o.published, id)

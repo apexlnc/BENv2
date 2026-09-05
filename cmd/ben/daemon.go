@@ -14,7 +14,10 @@ import (
 
 	agentharness "github.com/srhg-ai-7cef3f93/ben/internal/agent/harness"
 	"github.com/srhg-ai-7cef3f93/ben/internal/config"
+	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 	"github.com/srhg-ai-7cef3f93/ben/internal/orchestrator"
+	"github.com/srhg-ai-7cef3f93/ben/internal/remote"
+	"github.com/srhg-ai-7cef3f93/ben/internal/remotews"
 	"github.com/srhg-ai-7cef3f93/ben/internal/state"
 	"github.com/srhg-ai-7cef3f93/ben/internal/workspace"
 )
@@ -63,7 +66,8 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 	}
 	defer files.close() //nolint:errcheck // reported below through daemon's error
 
-	if err := daemon(context.Background(), path, log, newBuilder(log, files.dir.Transcripts()).build, files); err != nil {
+	b := newBuilder(log, files.dir)
+	if err := daemon(context.Background(), path, log, b.build, files, b.Review); err != nil {
 		// Already logged in structured form at the point it was known; this is
 		// the line a human running it in a terminal reads.
 		fmt.Fprintf(stderr, "ben: %v\n", err)
@@ -78,8 +82,16 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 // are fields (see runtime.go).
 type buildFunc func(context.Context, *config.WorkflowDefinition, *orchestrator.Bundle, config.AdapterChange) (*orchestrator.Bundle, error)
 
+// reviewFunc reports the review controller the build produced, or nil for a
+// workflow that declares none (#204).
+//
+// A function rather than the leg itself, because the leg does not exist until
+// the watcher has built revision 1 — which happens inside config.Watch, below.
+// The same shape, and the same reason, as orchestratorCell's hooks.
+type reviewFunc func() *reviewLeg
+
 // daemon builds the runtime, starts the loop, and drains it on a signal.
-func daemon(ctx context.Context, path string, log *slog.Logger, build buildFunc, files *stateFiles) error {
+func daemon(ctx context.Context, path string, log *slog.Logger, build buildFunc, files *stateFiles, review reviewFunc) error {
 	// The hooks the watcher calls are supplied at Watch time, and Watch builds
 	// revision 1 before it returns — so they exist before the loop they ask.
 	// See orchestratorCell.
@@ -114,7 +126,11 @@ func daemon(ctx context.Context, path string, log *slog.Logger, build buildFunc,
 	// rather than the state it was in when the signal landed.
 	files.attach(o, log)
 
-	return supervise(o, log)
+	var leg *reviewLeg
+	if review != nil {
+		leg = review()
+	}
+	return supervise(o, log, leg)
 }
 
 // daemonConfig is the orchestrator configuration `ben run` builds.
@@ -134,13 +150,9 @@ func daemonConfig(
 		Runtime:       runtime,
 		Revalidate:    revalidate,
 		PrepRetryable: prepRetryable,
-		// SPEC §9.10's workspace precondition, asked across a restart. The harness
-		// owns the local process substrate and this is its restart-side probe: only
-		// ESRCH, or a boot identity that cannot describe a live process, frees a
-		// workspace. Without it every marker identifying a previous run stays
-		// possibly-live forever, so an issue whose agent really did die is retained
-		// and never resumed.
-		RunGone: agentharness.EvidenceGone,
+		// SPEC §9.10's workspace precondition, asked across a restart, and routed
+		// to whichever substrate minted the evidence (runGone).
+		RunGone: runGone(runtime),
 		Log:     log,
 	}
 	if files != nil {
@@ -164,11 +176,20 @@ func daemonConfig(
 // afterwards, and never before the drain returns — the context passed to
 // AgentRunner.Start descends from it, so cancelling it on the signal would
 // abandon exactly the processes shutdown exists to stop (SPEC §11, §9.8).
-func supervise(o *orchestrator.Orchestrator, log *slog.Logger) error {
+//
+// The review controller rides the same lifecycle and is deliberately *not* part
+// of the orchestrator's errgroup (#204). It is a separate authority with a
+// separate credential and a separate failure mode: a forge that will not answer
+// its sweep must cost a delayed review round, never a daemon that stops coding.
+// So it is started after recovery, cancelled on the signal like any other
+// reader, and its shutdown is not what the drain waits for — draining waits for
+// *execution domains*, and the reviewer's is the backend's or the child's,
+// both of which the session's own quiet gate already accounts for.
+func supervise(o *orchestrator.Orchestrator, log *slog.Logger, review *reviewLeg) error {
 	sigCtx, stopNotify := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	// Deliberately deferred rather than called when the first signal lands. A
 	// second SIGTERM must **not** kill a daemon mid-drain: BUILD.md's acceptance
-	// forbids exiting while a process group is unconfirmed, and restoring the
+	// forbids exiting while an execution domain is unconfirmed, and restoring the
 	// default disposition would do exactly that. Repeat signals are absorbed by
 	// the handler this keeps installed, and logged (see logRepeatSignals).
 	defer stopNotify()
@@ -184,12 +205,26 @@ func supervise(o *orchestrator.Orchestrator, log *slog.Logger) error {
 	// A failed pass is warn-and-continue (SPEC §6.4), not a refusal to start: the
 	// candidate read is a tracker request like any other, and a daemon that exited
 	// because GitHub was briefly down would be less available than one that starts
-	// and retries on later ticks. Recover has already held those candidates out of
-	// dispatch by the only means that works — it created no records for issues it
-	// could not read, and the adapter's dispatchable verdict excludes anything
-	// assigned.
+	// and retries on later ticks. Recover has already held unsafe work out of
+	// dispatch: it creates no records for tracker candidates it could not read (and
+	// assigned issues are not dispatchable), while an unreadable local ended-cycle
+	// record raises a global dispatch barrier until a complete retry identifies its
+	// owner.
 	if err := o.Recover(loopCtx); err != nil {
 		log.Warn("recovery did not complete; starting anyway and retrying on later ticks (SPEC §6.4)", "error", err)
+	}
+
+	// After Recover, before the loop's first tick: startup reconciliation of
+	// retained review runs completes inside Run, and a replacement review must
+	// not be dispatched into an execution domain a previous process left live.
+	reviewDone := make(chan struct{})
+	if review != nil {
+		go func() {
+			defer close(reviewDone)
+			review.Run(loopCtx)
+		}()
+	} else {
+		close(reviewDone)
 	}
 
 	loop := make(chan error, 1)
@@ -222,6 +257,7 @@ func supervise(o *orchestrator.Orchestrator, log *slog.Logger) error {
 	if err := <-loop; err != nil {
 		return err
 	}
+	<-reviewDone
 	return nil
 }
 
@@ -242,7 +278,7 @@ func logRepeatSignals(log *slog.Logger, o *orchestrator.Orchestrator) func() {
 			case <-done:
 				return
 			case s := <-repeats:
-				log.Warn("already shutting down; waiting for every run's process group to be confirmed gone. "+
+				log.Warn("already shutting down; waiting for every run's execution domain to be confirmed quiet. "+
 					"BEN does not bound this — the supervisor's TimeoutStopSec does (SPEC §9.8, deploy/ben.service)",
 					"signal", s.String(), "runs_outstanding", len(o.Status()))
 			}
@@ -304,17 +340,68 @@ func (c *orchestratorCell) quiescent() bool {
 // prepRetryable classifies a workspace Prepare failure for SPEC §9.2's two prep
 // edges. Keeping it here is what keeps the loop provider-agnostic (§6.1).
 //
-// Exactly one failure retries, and the asymmetry is §6.6's: a hook is operator
-// code and can fail for reasons that pass on the next attempt — a flaky network
-// install, a lock another process held. Every other named refusal is the
-// provider reporting state it will not guess about — a base repository pointing
-// somewhere else, a worktree whose registration disagrees with the disk, a
-// branch that diverged from origin — and retrying those spends attempts to
-// re-derive the same answer, then reports `failed` with the *last* one as the
-// reason. §6.6 fails closed on ambiguity, and an unrecognized error is
-// ambiguous.
+// Few failures retry, and the asymmetry is §6.6's: a hook is operator code and
+// can fail for reasons that pass on the next attempt — a flaky network install, a
+// lock another process held. Every other named refusal is the provider reporting
+// state it will not guess about — a base repository pointing somewhere else, a
+// worktree whose registration disagrees with the disk, a branch that diverged
+// from origin, a workspace-cycle record naming another repository — and retrying
+// those spends attempts to re-derive the same answer, then reports `failed` with
+// the *last* one as the reason. §6.6 fails closed on ambiguity, and an
+// unrecognized error is ambiguous.
+//
+// Both substrates' hook sentinels are listed, and the third entry is the one
+// that has no local counterpart. remote.ErrNotQuiet is a prepare refused because
+// the *previous* attempt's execution domain has not been positively observed
+// quiet (SPEC §9.8). It is transient by construction — the backend will
+// eventually report quiet, or the claim's own reconciliation will act — and it is
+// exactly the case where retrying is right and failing the claim is not: nothing
+// about this issue is wrong, a foreign process is merely still ending.
 func prepRetryable(err error) bool {
-	return errors.Is(err, workspace.ErrHookFailed)
+	return errors.Is(err, workspace.ErrHookFailed) ||
+		errors.Is(err, remote.ErrHookFailed) ||
+		errors.Is(err, remote.ErrNotQuiet)
+}
+
+// runGone routes §9.10's "is the run this evidence identifies confirmed gone?"
+// to the substrate that minted the evidence.
+//
+// Routed on the *scheme* rather than on the configuration, because the two can
+// disagree honestly: a marker written by a previous daemon under the local
+// substrate outlives a restart, and answering it with the remote prober — or
+// vice versa — would be answering a question about one mechanism with another's
+// evidence. core.RunEvidence names its scheme precisely so this can be a switch
+// instead of an assumption.
+//
+// Every unrecognized case is `false`, which recovery reads as possibly live.
+// That is the direction that costs a retained claim and another tick; the other
+// one puts a second agent in a workspace (core.RunEvidence, SPEC §7.5).
+func runGone(runtime orchestrator.RuntimeSource) func(core.RunEvidence) (bool, error) {
+	return func(evidence core.RunEvidence) (bool, error) {
+		switch evidence.Scheme {
+		case core.RunEvidenceLocal, agentharness.LocalEvidenceScheme:
+			return agentharness.EvidenceGone(evidence)
+		case remotews.EvidenceScheme:
+			snap, _ := runtime.Load()
+			if snap.Runtime == nil {
+				return false, fmt.Errorf("no runtime is published, so %q evidence cannot be probed", evidence.Scheme)
+			}
+			prober, ok := snap.Runtime.Workspaces.(remoteRunProber)
+			if !ok {
+				return false, fmt.Errorf("%T cannot probe %q run evidence", snap.Runtime.Workspaces, evidence.Scheme)
+			}
+			return prober.RunGone(evidence)
+		}
+		return false, fmt.Errorf("run evidence scheme %q is not one this daemon can probe", evidence.Scheme)
+	}
+}
+
+// remoteRunProber is remotews.Provider's half of the answer above, asked for by
+// assertion like every other consumer-specific need of this assembly: the loop's
+// Workspaces seam is narrower than the provider, and this is the assembly's
+// question rather than the loop's.
+type remoteRunProber interface {
+	RunGone(core.RunEvidence) (bool, error)
 }
 
 // recordDeployment logs the §10.1 declaration once, at startup.

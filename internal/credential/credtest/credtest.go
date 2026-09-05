@@ -12,11 +12,17 @@
 // exchange, the mapping from a provider's status codes onto a class, and the
 // canonicalization rules of its own fields — everything whose correctness is a
 // statement about one issuer rather than about the contract.
+//
+// The one field rule that is *not* a kind's own is TLS. Every kind here presents
+// or obtains a bearer credential, so "a remote endpoint is https" is a statement
+// about the contract, and it lives in testEndpointsRequireTLS (#245) rather than
+// being restated once per kind and diverging.
 package credtest
 
 import (
 	"context"
 	"maps"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -54,6 +60,16 @@ type Case struct {
 	// non-zero UsableUntil and are subject to every TTL gate; an unbounded one's
 	// carry zero and are subject to none.
 	Bounded bool
+	// StablePrincipal says the source definition fixes one downstream service
+	// principal across token rotation. A false case must leave PrincipalKey
+	// empty so a principal-scoped consumer cannot mistake source identity for
+	// service identity.
+	StablePrincipal bool
+	// NoRemoteEndpoints is the explicit exception for a source that neither
+	// presents nor obtains a credential over the network. Without it, the
+	// minimal block must expose at least one HTTP(S) endpoint for the shared TLS
+	// contract to exercise.
+	NoRemoteEndpoints bool
 
 	// Rotate changes the credential the world holds, so the suite can prove that
 	// FetchFresh sees the new one and Authority does not move.
@@ -83,6 +99,7 @@ func Contract(t *testing.T, c Case) {
 	t.Run(c.Name+"/describe is pure", func(t *testing.T) { testDescribeIsPure(t, c) })
 	t.Run(c.Name+"/required fields", func(t *testing.T) { testRequiredFields(t, c) })
 	t.Run(c.Name+"/unknown keys refuse", func(t *testing.T) { testUnknownKey(t, c) })
+	t.Run(c.Name+"/endpoints require TLS", func(t *testing.T) { testEndpointsRequireTLS(t, c) })
 	t.Run(c.Name+"/binding key covers every field", func(t *testing.T) { testBindingKeyCoversEveryField(t, c) })
 	t.Run(c.Name+"/keys carry no secret", func(t *testing.T) { testKeysCarryNoSecret(t, c) })
 	t.Run(c.Name+"/deadline matches boundedness", func(t *testing.T) { testDeadline(t, c) })
@@ -127,6 +144,9 @@ func testDescribeAccepts(t *testing.T, c Case) {
 	}
 	if c.Bounded != d.Bounded() {
 		t.Errorf("MinFreshTTL = %s (bounded %v), want bounded %v", d.MinFreshTTL, d.Bounded(), c.Bounded)
+	}
+	if got := d.PrincipalKey != ""; got != c.StablePrincipal {
+		t.Errorf("PrincipalKey populated = %v, want stable principal %v", got, c.StablePrincipal)
 	}
 	// A name is not part of what a source *is*. Nothing here has supplied one,
 	// and there is nowhere for one to go — which is what makes a rename not a
@@ -185,6 +205,81 @@ func testRequiredFields(t *testing.T, c Case) {
 	}
 }
 
+// Every remote endpoint a credential source names MUST be https (#245).
+//
+// A `credential_sources` kind exists to present or obtain a bearer credential,
+// and the endpoint in its own block is where that credential goes on the wire:
+// `octo_sts` sends the projected workload-identity JWT there in an
+// `Authorization: Bearer` header, and `projected_oidc`'s issuer is the identity
+// the same class of token is minted against. An on-path observer who captures
+// one replays it for the whole of its life. Three implementations of that rule
+// existed one package apart — `octo_sts` accepted `http://` while
+// `projected_oidc` and `internal/airlock` refused it — which is what this
+// assertion is here to prevent recurring.
+//
+// The independent boundary AGENTS.md asks for is that this is **derived, not
+// declared**: the suite reads the kind's own minimal block, finds every field
+// spelled as an HTTP(S) URL, refuses a block that is already plaintext, and
+// requires the http spelling of every https field to be refused at Describe.
+// There is no per-case endpoint list to forget to extend, so a future kind with
+// a remote endpoint inherits the rule by running the suite — and a kind that
+// later gains one inherits it without editing anything here. A source with no
+// remote endpoint must say so explicitly; absence cannot silently turn this
+// contract into a skipped test.
+//
+// A kind with a genuine need for a plaintext endpoint cannot quietly opt out; it
+// has to argue the exception here, where every other kind's authors will read it.
+func testEndpointsRequireTLS(t *testing.T, c Case) {
+	block := c.Block()
+	checked := 0
+	for _, key := range sortedKeys(block) {
+		u, ok := remoteHTTPURL(block[key])
+		if !ok {
+			continue
+		}
+		checked++
+		t.Run(key, func(t *testing.T) {
+			if strings.EqualFold(u.Scheme, "http") {
+				t.Errorf("the minimal valid block names a plaintext %q; the bearer credential this "+
+					"endpoint carries would be readable to anyone on the path", key)
+				return
+			}
+			u.Scheme = "http"
+			plaintext := c.Block()
+			plaintext[key] = u.String()
+			if _, err := c.Kind.Describe(plaintext); err == nil {
+				t.Errorf("Describe accepted a plaintext %q; the bearer credential this endpoint "+
+					"carries would be readable to anyone on the path, and a warning is a refusal "+
+					"nobody reads", key)
+			}
+		})
+	}
+	if checked == 0 {
+		if c.NoRemoteEndpoints {
+			t.Skip("this source has no remote endpoint")
+		}
+		t.Fatal("the minimal block names no HTTP(S) endpoint; set NoRemoteEndpoints only for a source that never sends or obtains a credential over the network")
+	}
+	if c.NoRemoteEndpoints {
+		t.Error("NoRemoteEndpoints is set, but the minimal block names a remote endpoint")
+	}
+}
+
+func remoteHTTPURL(value any) (*url.URL, bool) {
+	raw, ok := value.(string)
+	if !ok {
+		return nil, false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil, false
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return nil, false
+	}
+	return u, true
+}
+
 func testUnknownKey(t *testing.T, c Case) {
 	block := c.Block()
 	block["not_a_field"] = "x"
@@ -234,6 +329,9 @@ func testKeysCarryNoSecret(t *testing.T, c Case) {
 		}
 		if strings.Contains(d.BindingKey, secret) {
 			t.Errorf("BindingKey %q carries a secret", d.BindingKey)
+		}
+		if strings.Contains(d.PrincipalKey, secret) {
+			t.Errorf("PrincipalKey %q carries a secret", d.PrincipalKey)
 		}
 	}
 }

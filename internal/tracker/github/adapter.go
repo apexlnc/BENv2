@@ -137,6 +137,7 @@ type Adapter struct {
 var (
 	_ core.TrackerAdapter        = (*Adapter)(nil)
 	_ core.ContentApprovalSource = (*Adapter)(nil)
+	_ core.RemotePRSource        = (*Adapter)(nil)
 )
 
 // And the §8.5 request budget, which the orchestrator discovers by assertion:
@@ -731,25 +732,34 @@ func (a *Adapter) FindPR(ctx context.Context, issue core.Issue, branch string) (
 		Direction:   "desc",
 		ListOptions: gh.ListOptions{PerPage: perPage},
 	}
-	prs, _, err := a.client.PullRequests.List(ctx, a.cfg.owner, a.cfg.repo, opts)
-	if err != nil {
-		return nil, fmt.Errorf("listing pull requests for %s: %w", branch, a.gate.observe(err))
-	}
-
-	for _, pr := range prs {
-		// The head filter is a server-side convenience, not a guarantee we
-		// let decide evidence.
-		if pr.GetHead().GetRef() != branch || pr.GetState() != "open" {
-			continue
+	var found *core.PR
+	for {
+		prs, resp, err := a.client.PullRequests.List(ctx, a.cfg.owner, a.cfg.repo, opts)
+		if err != nil {
+			return nil, fmt.Errorf("listing pull requests for %s: %w", branch, a.gate.observe(err))
 		}
-		return &core.PR{
-			Number: pr.GetNumber(),
-			URL:    pr.GetHTMLURL(),
-			State:  "open",
-			Branch: branch,
-		}, nil
+		for _, pr := range prs {
+			// The head filter is a server-side convenience, not a guarantee we
+			// let decide evidence.
+			if pr.GetHead().GetRef() != branch || pr.GetState() != "open" {
+				continue
+			}
+			if found != nil {
+				return nil, fmt.Errorf("%w: branch %s", core.ErrPRAmbiguous, branch)
+			}
+			found = &core.PR{
+				Number:     pr.GetNumber(),
+				URL:        pr.GetHTMLURL(),
+				State:      "open",
+				Branch:     branch,
+				BaseBranch: pr.GetBase().GetRef(),
+			}
+		}
+		if resp.NextPage == 0 {
+			return found, nil
+		}
+		opts.Page = resp.NextPage
 	}
-	return nil, nil
 }
 
 // Claim assigns the issue to the token's identity and verifies by read-back:

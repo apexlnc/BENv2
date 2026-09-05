@@ -36,9 +36,9 @@
 //  1. kill -9 → restart → converge
 //     HERE, in two tests, because §12.3-1 asks for two things.
 //     TestAKilledDaemonRecoversAndConverges is convergence and its condition:
-//     both answers §9.10's run probe can give — the agent that died with the
-//     daemon, and the one whose process group outlived it, retained and
-//     dispatching nothing until it is confirmed gone.
+//     both answers §9.10's run probe can give — the domain that became quiet
+//     with the daemon, and the one that outlived it, retained and dispatching
+//     nothing until it is confirmed quiet.
 //     TestARestartFinishesTheProjectionItDiedInsideOf is "any point": the three
 //     windows §12.3-1 names between the writes of a multi-write projection —
 //     after the assignment and before ben:claimed, mid-`done` with the labels
@@ -106,7 +106,7 @@
 //     HERE — TestAPublishedClaimIsReleasedWhenTheIssueClosesWithoutARestart.
 //
 //  12. a reclaimed issue cannot publish on the previous assignment's work
-//     HERE — TestAReclaimScopesSuccessToTheNewAssignmentEpoch. The real
+//     HERE — TestReclaimRepinsPriorPublishedHeadBeforeSuccessCanRepeat. The real
 //     verifier consumes the fake provider's independently modelled epoch/base
 //     pair across E1 publish, controller unassignment, E2 no-op, sticky human
 //     unpark and E2 descendant commit. The pending/pinned crash matrix is
@@ -119,4 +119,10 @@
 // stays true now that nothing is outstanding: a t.Skip reads as coverage in a
 // test run and rots quietly, while a row here is a claim a reviewer can check
 // against the suite — including the rows that deliberately point somewhere else.
+//
+// Every test named above is resolved against the module by
+// internal/arch/testnames_test.go, so a row pointing at a function or a file
+// that does not exist fails `make check` rather than sending a reader looking
+// for something that is not there. Row 12 named a test that had never existed,
+// from the commit the map arrived in until #244.
 package integration

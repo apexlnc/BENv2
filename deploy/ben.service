@@ -6,8 +6,9 @@
 # stdout and nothing else, so journald is the sink and `journalctl -u ben` is
 # the reader.
 #
-# Two settings below are load-bearing rather than conventional. They are
-# KillMode and TimeoutStopSec, and both exist because of how BEN stops.
+# Four settings below are load-bearing rather than conventional. Delegate and
+# RestrictNamespaces establish the §7.5 local execution substrate; KillMode and
+# TimeoutStopSec preserve BEN's ordered shutdown.
 
 # ---------------------------------------------------------------------------
 # READ THIS BEFORE RUNNING IT UNATTENDED (SPEC §10.1, normative)
@@ -74,6 +75,21 @@ User=ben
 Group=ben
 WorkingDirectory=/srv/ben
 
+# Local attempts require a writable cgroup-v2 subtree. BEN divides this
+# delegated service cgroup into a daemon-only supervisor branch and random
+# attempt leaves, then gives each attempt private user, PID, mount and cgroup
+# namespaces. Delegate alone is not the containment boundary: the PID namespace
+# supervisor and leaf-rooted cgroup namespace are. Readiness runs the complete
+# canary and refuses if the host cannot prove that arrangement.
+Delegate=yes
+
+# Keep the default namespace surface explicit. systemd implements every
+# non-false RestrictNamespaces value by rejecting clone3 wholesale because a
+# seccomp filter cannot inspect its pointer argument. BEN requires clone3 for
+# atomic cgroup placement, so narrowing this setting makes readiness refuse.
+# The §7.5 supervisor, not this directive, contains provider-created namespaces.
+RestrictNamespaces=no
+
 # EDIT: **remove this line** only once the unattended readiness gate named in
 # README.md is complete, you have read the §10.1 block at the top, and you hold
 # requirements 1 and 3. Until then the unit refuses to start.
@@ -107,8 +123,8 @@ EnvironmentFile=/etc/ben/env
 # systemd's default is control-group: SIGTERM to *every* process in the unit's
 # cgroup at once — which is BEN and every agent it has launched, simultaneously.
 # That is precisely what §9.8's shutdown exists to avoid. BEN interrupts each
-# run itself, through the §7.5 signal ladder, and waits for a confirmed
-# termination before it releases a claim or reuses a worktree; a signal that
+# run itself through the §7.5 bounded execution-domain teardown and waits for
+# confirmed quiet before it releases a claim or reuses a worktree; a signal that
 # reaches the agents behind its back turns an orderly drain into a race with it.
 #
 # mixed sends SIGTERM to the main process only and leaves the rest to BEN, then
@@ -129,7 +145,7 @@ KillMode=mixed
 # §9.10 recovery to reconstruct on the next start. That is the specified
 # outcome, not corruption, and B10 has landed, so it is now what actually
 # happens rather than what is planned. The ExecStartPre gate above stays for the
-# other reason README.md names — the forge control — not for this one.
+# other reason README.md names — the deployment-mode decision — not for this one.
 TimeoutStopSec=600
 
 Restart=on-failure

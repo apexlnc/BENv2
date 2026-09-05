@@ -118,6 +118,9 @@ func TestFailureReasonRetryable(t *testing.T) {
 		FailureLaunchError:    false,
 		FailureKilled:         false,
 		FailureBudgetExceeded: false,
+		// The harness's own verdict on a line past the scanner ceiling (#235):
+		// not transient, so a retry would reproduce it.
+		FailureOutputOverflow: false,
 		// `credential` names a *transient* credential failure specifically
 		// (SPEC §7.3, amendment 8), which is what makes it retryable. An unknown
 		// or permanent one is not a run failure at all — it parks — so it never

@@ -4,6 +4,15 @@ import (
 	"strings"
 )
 
+// frontMatterFirstLine is the 1-based file line the front matter's first line
+// sits on. splitFrontMatter requires `---` at line 1 and hands on everything
+// after it, so a line inside the front matter is one short of the same line in
+// the file — and a refusal that quotes the shortfall points an operator's editor
+// at the key above the one it means. bodyLine below does this job for the other
+// half of the document; this constant does it for the front matter, whose offset
+// is fixed by the `---` rule rather than by where the delimiter turned up.
+const frontMatterFirstLine = 2
+
 // splitFrontMatter separates the YAML front matter from the prompt body
 // (SPEC §5.1). The file must begin with a `---` line; the front matter runs
 // until the next `---` line; everything after is the body, trimmed. bodyLine

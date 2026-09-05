@@ -48,6 +48,18 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 	o.recovered.Store(true)
 
 	cur := o.configNow()
+	var cycleErr error
+	if source, ok := cur.Runtime.Workspaces.(endedCycleSource); ok {
+		refs, err := source.EndedCycles(ctx)
+		if err != nil {
+			cycleErr = fmt.Errorf("recovery ended-cycle disposal read: %w", err)
+			o.applyCycleScan(cur.Runtime.Workspaces, nil, err, true)
+		} else {
+			o.applyCycleScan(cur.Runtime.Workspaces, refs, nil, true)
+		}
+	} else {
+		o.cycleScanFailed = false
+	}
 	if o.cfg.FailureReasons == nil {
 		// §9.10 step 6's cap, said out loud. Without this line an unimplemented
 		// dependency and a genuine cold start produce the identical comment —
@@ -95,9 +107,23 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 			o.log.Warn("recovery could not read the claims this principal holds; starting without reconstructing them, and retrying on later ticks",
 				"principal", cur.Runtime.ClaimPrincipal, "error", err)
 		}
-		return fmt.Errorf("recovery candidate read: %w", err)
+		return errors.Join(cycleErr, fmt.Errorf("recovery candidate read: %w", err))
 	}
 
+	if cycleErr != nil {
+		// The unreadable record cannot say which candidate it owns. Hold the whole
+		// candidate set unclassified and owe step 1 again; adopting any one could
+		// resume a replacement while its old cycle was being deleted. The durable
+		// scan blocks ordinary dispatch until it succeeds, then the candidate retry
+		// reconstructs these records before dispatch reopens.
+		o.scanOwed = true
+		// Step 5 needs the same ownership set. Leave the whole pass owed; a
+		// successful durable scan and candidate retry unblock it in that order.
+		o.sweepPassOwed = true
+		o.sweepBundle = cur.Runtime
+		o.publishIdentityWork()
+		return cycleErr
+	}
 	o.log.Info("recovering", "candidates", len(candidates), "principal", cur.Runtime.ClaimPrincipal)
 	for _, issue := range candidates {
 		o.recoverCandidate(ctx, issue, cur)
@@ -112,7 +138,7 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 		o.sweepBundle = cur.Runtime
 	}
 	o.publishIdentityWork()
-	return nil
+	return cycleErr
 }
 
 // The §9.10 step 5 sweep: dispose the workspaces of issues in a terminal tracker
@@ -275,6 +301,20 @@ func (o *Orchestrator) grantDisposal(identifier string) bool {
 	if _, retained := o.held[identifier]; retained {
 		return false
 	}
+	if o.endedCycleOwed(identifier) {
+		// An ended workspace cycle whose disposal is still owed owns this issue as
+		// surely as a record does, and it can outlive every record (#252). Two
+		// completions over one cycle is the collision this reservation exists to
+		// prevent, arrived at from the side that has no record to notice.
+		//
+		// ownedIssues excludes it from the pass as well, and the redundancy is this
+		// reservation's whole reason: that set is a *snapshot* taken before the pass
+		// went out, so an obligation registered while it was out — a held claim
+		// dropped on a confirming read, which is exactly how these become ownerless
+		// — is invisible to it and visible here. Neither can be mutated away alone
+		// against a test today; both can, which is what the coverage is of.
+		return false
+	}
 	if o.sweepDisposing[identifier] {
 		// Unreachable while one pass runs at a time (sweepInFlight), and left in
 		// because the alternative to stating it is two workers sharing one directory.
@@ -431,7 +471,7 @@ func (o *Orchestrator) retrySweep(ctx context.Context) {
 	if o.sweepInFlight || o.draining {
 		return
 	}
-	if o.scanOwed {
+	if o.scanOwed || o.cycleScanFailed {
 		// The ownership set is what keeps this from deleting a live orphan's branch,
 		// and it is produced by the classification pass. While the candidate scan is
 		// still owed there has been no such pass, so every workspace would look
@@ -516,20 +556,30 @@ func (o *Orchestrator) retrySweep(ctx context.Context) {
 
 // ownedIssues is the set a sweep must not touch. Loop-owned, so it is snapshotted
 // before a pass is handed to a worker.
+//
+// Three owners, not two. An ended workspace cycle whose disposal is still owed
+// owns its issue the same way — and it is the only one of the three that can
+// exist with no record and no held claim behind it (#252, dropHeld), which is
+// exactly the shape a set built from those two would miss.
 func (o *Orchestrator) ownedIssues() map[string]bool {
-	owned := make(map[string]bool, len(o.records)+len(o.held))
+	owned := make(map[string]bool, len(o.records)+len(o.held)+len(o.endedCycles))
 	for id := range o.records {
 		owned[id] = true
 	}
 	for id := range o.held {
 		owned[id] = true
 	}
+	for _, c := range o.endedCycles {
+		owned[c.issue] = true
+	}
 	return owned
 }
 
-// sweepOneWorkspace disposes one workspace if its issue is terminal.
-// sweepOneWorkspace disposes one workspace if its issue is terminal, and reports
-// whether the answer may still change.
+// sweepOneWorkspace disposes one workspace whose issue no longer justifies it,
+// and reports whether the answer may still change.
+//
+// "No longer justifies it" is terminality on every substrate, plus one more fact
+// where a workspace outlives its claim — see the open-issue case below.
 //
 // `deferred` is the difference between "nothing to do here" and "not yet": a run
 // that may still be live ends, and step 5 says the workspace is "swept once that
@@ -558,7 +608,27 @@ func (o *Orchestrator) sweepOneWorkspace(ctx context.Context, ref core.Workspace
 		// precisely so somebody can look at it. Not deferred: an issue that is open
 		// is a settled answer, and it will come back through the ordinary pass if it
 		// closes.
-		return false
+		//
+		// **Unless the workspace outlives its claim and the issue has left the label
+		// partition.** On that substrate this is not a pause in the cycle, it is the
+		// end of one: a reapproval addresses a different sandbox, so nothing will
+		// ever attach to this one again (#252, remotews.BeginClaimBase).
+		//
+		// It is here rather than only on the loop's own obligation because this is
+		// the single route that obligation cannot survive a crash on. Every other one
+		// leaves the tracker claim standing, so §9.10 step 1 enumerates it and the
+		// verdict is re-derived; this one has the claim *unassigned* in the same read
+		// that ended the cycle, so a restart can rediscover it nowhere else. Re-derived
+		// from the tracker rather than written down, which is §9.10's own posture.
+		//
+		// Local providers are unaffected, and not by omission: §9.10 gate 4 *keeps* a
+		// local worktree when its issue leaves the partition, and the predicate is
+		// false for a provider with no end-of-cycle policy.
+		if !cyclesOutliveClaims(cur.Runtime.Workspaces) || o.hasRequiredLabels(cur.Definition, *fresh) {
+			return false
+		}
+		o.log.Info("sweeping a workspace whose approval was withdrawn: its cycle has ended and nothing "+
+			"will attach to it again", "issue", ref.Identifier, "workspace", ref.Key)
 	}
 
 	// Reserved here. Everything above *decided*; everything below **acts** —
@@ -637,9 +707,15 @@ func (o *Orchestrator) sweepOneWorkspace(ctx context.Context, ref core.Workspace
 		// accounts for it and no pin will ever appear.
 		ws = core.Workspace{Key: ref.Key, WorkspacePaths: core.WorkspacePaths{Path: ref.Path}}
 	}
-	if err := cur.Runtime.Workspaces.Dispose(ctx, ws, false); err != nil {
+	var disposeErr error
+	if lifecycle, ok := cur.Runtime.Workspaces.(workspaceLifecycleCompleter); ok {
+		disposeErr = lifecycle.CompleteEndedCycle(ctx, ws)
+	} else {
+		disposeErr = cur.Runtime.Workspaces.Dispose(ctx, ws, false)
+	}
+	if disposeErr != nil {
 		o.log.Warn("disposing a terminal issue's workspace; leaving it in place and trying again",
-			"issue", ref.Identifier, "workspace", ref.Key, "error", err)
+			"issue", ref.Identifier, "workspace", ref.Key, "error", disposeErr)
 		return true
 	}
 	o.log.Info("swept the workspace of a terminal issue", "issue", ref.Identifier, "workspace", ref.Key)
@@ -864,7 +940,7 @@ func (o *Orchestrator) recoveryFacts(ctx context.Context, issue core.Issue, cur 
 	}
 
 	// Resolve the provider's workspace only after the atomic authority has
-	// authorized this epoch. Its returned pair is independently checked against
+	// authorized this epoch. Its returned tuple is independently checked against
 	// the authority before the verifier is reachable.
 	ws, ok, err := cur.Runtime.Workspaces.ResolveWorkspace(ctx, issue)
 	if err != nil {
@@ -872,12 +948,15 @@ func (o *Orchestrator) recoveryFacts(ctx context.Context, issue core.Issue, cur 
 		facts.verdict = epochFaultRecovery(anchor, "pinned claim epoch cannot resolve its workspace")
 		return facts, nil
 	}
-	if !ok || ws.ClaimEpoch != claimBase.Epoch || ws.BaseSHA != claimBase.BaseSHA || ws.ClaimEpoch <= 0 || ws.BaseSHA == "" {
+	if !ok || !claimBaseAuthorizesWorkspace(claimBase, ws) {
 		facts.preclassified = true
-		facts.verdict = epochFaultRecovery(anchor, "resolved workspace does not carry the pinned claim epoch/base")
+		facts.verdict = epochFaultRecovery(anchor, "resolved workspace does not carry the pinned claim epoch/base/target")
 		return facts, nil
 	}
 	facts.workspace = ws
+	// The first probe is observational. An identified unanswered Start remains
+	// possibly-live here; exact replay is a launch and cannot precede the §9.7
+	// verdict below.
 	facts.marker, err = o.resolveMarkerValue(issue, ws, rawMarker, cur)
 	if err != nil {
 		return recoveryFacts{}, fmt.Errorf("run marker: %w", err)
@@ -899,14 +978,32 @@ func (o *Orchestrator) recoveryFacts(ctx context.Context, issue core.Issue, cur 
 	// exactly the rows that never look (it is the blocked answer only where the
 	// row *does* look), so asking the classifier what it needs is not an option —
 	// the question is answered from the same events it will classify from.
-	if !recoveryNeedsEvidence(facts.candidate, events, cur.Runtime.ClaimPrincipal) {
-		return facts, nil
+	if recoveryNeedsEvidence(facts.candidate, events, cur.Runtime.ClaimPrincipal) {
+		res, err := o.recoveryEvidence(ctx, issue, facts.workspace, cur)
+		if err != nil {
+			return recoveryFacts{}, fmt.Errorf("publish evidence: %w", err)
+		}
+		facts.verify = res
 	}
-	res, err := o.recoveryEvidence(ctx, issue, facts.workspace, cur)
-	if err != nil {
-		return recoveryFacts{}, fmt.Errorf("publish evidence: %w", err)
+
+	// Replay only once the read-only facts select the orphan/backoff route. A
+	// published verdict finishes the existing work, and a verifier error has no
+	// verdict at all; neither may start a process. The approval event id travels
+	// with the call so the remote strategy can reject a superseded workspace
+	// cycle even when the assignment itself never moved.
+	approval, replay := recoveryStartReplayApproval(
+		facts.candidate,
+		events,
+		facts.verify.Verdict,
+		cur.Runtime.ClaimPrincipal,
+		cur.Definition.Config.Tracker.RequiredLabels,
+	)
+	if replay && facts.marker == recoveryMarkerPossiblyLive && cur.Runtime.ResolveRun != nil {
+		facts.marker, err = o.resolveAuthorizedMarkerValue(issue, ws, rawMarker, cur, approval)
+		if err != nil {
+			return recoveryFacts{}, fmt.Errorf("run marker: %w", err)
+		}
 	}
-	facts.verify = res
 	return facts, nil
 }
 
@@ -943,6 +1040,33 @@ func recoveryNeedsEvidence(candidate recoveryCandidate, events []core.ClaimEvent
 	return projection.lastRemoved == core.StateLabelClaimed || projection.lastRemoved == core.StateLabelRunning
 }
 
+// recoveryStartReplayApproval is the final authority check for an operation
+// that can turn an unanswered backend request into a newly running agent. The
+// pure classifier must first select backoff from a completed §9.7 verdict, and
+// the projection must still describe the active attempt rather than a human
+// re-queue. The returned required-label event identifies the current workspace
+// cycle; remove-and-reapply changes it even when the assignment anchor does not.
+func recoveryStartReplayApproval(
+	candidate recoveryCandidate,
+	events []core.ClaimEvent,
+	evidence Verdict,
+	principal string,
+	requiredLabels []string,
+) (int64, bool) {
+	if classifyRecoveryFacts(candidate, events, evidence, principal).action != recoveryActionBackoff {
+		return 0, false
+	}
+	anchor := claimCycleAnchor(events, principal)
+	projection := replayRecoveryProjection(events, anchor)
+	if !projection.standing || !projection.effectiveKnown {
+		return 0, false
+	}
+	if projection.effective != core.StateLabelClaimed && projection.effective != core.StateLabelRunning {
+		return 0, false
+	}
+	return approvalCycleAnchor(events, requiredLabels)
+}
+
 // recoveryEvidence asks the §9.7 checker the same question it answers at run
 // time, against the workspace this issue's branch lives in.
 //
@@ -955,10 +1079,10 @@ func (o *Orchestrator) recoveryEvidence(ctx context.Context, issue core.Issue, w
 	// deliberately not called here: recovery does no git of its own, and a Prepare
 	// would run this attempt's hooks before any verdict said an attempt was owed.
 	if ws.Path == "" {
-		// The claim-base gate must authorize an exact pinned pair before this
+		// The claim-base gate must authorize an exact pinned tuple before this
 		// function. Treat a zero workspace as a broken caller invariant, never as
 		// negative publish evidence that an older PR might complete around.
-		return VerifyResult{}, fmt.Errorf("claim %s reached verification without an authorized workspace epoch/base pair", issue.Identifier)
+		return VerifyResult{}, fmt.Errorf("claim %s reached verification without an authorized workspace epoch/base/target tuple", issue.Identifier)
 	}
 	res, err := cur.Runtime.Verifier.Verify(ctx, issue, ws)
 	if err != nil {
@@ -1008,6 +1132,33 @@ func (o *Orchestrator) resolveMarker(issue core.Issue, ws core.Workspace, cur sn
 // an identified entry must not be probed and cleared before the contradiction
 // is classified.
 func (o *Orchestrator) resolveMarkerValue(issue core.Issue, ws core.Workspace, marker core.RunMarker, cur snapshot) (recoveryMarkerState, error) {
+	return o.resolveMarkerValueWith(issue, ws, marker, cur, o.cfg.RunGone)
+}
+
+// resolveAuthorizedMarkerValue selects the mutating resolver only after
+// recoveryFacts has passed the tracker, pinned-epoch, §9.7 orphan/backoff and
+// current-approval checks. All other marker reads use resolveMarkerValue and
+// therefore cannot turn an unanswered request into a launch.
+func (o *Orchestrator) resolveAuthorizedMarkerValue(
+	issue core.Issue,
+	ws core.Workspace,
+	marker core.RunMarker,
+	cur snapshot,
+	approval int64,
+) (recoveryMarkerState, error) {
+	probe := func(evidence core.RunEvidence) (bool, error) {
+		return cur.Runtime.ResolveRun(issue, evidence, approval)
+	}
+	return o.resolveMarkerValueWith(issue, ws, marker, cur, probe)
+}
+
+func (o *Orchestrator) resolveMarkerValueWith(
+	issue core.Issue,
+	ws core.Workspace,
+	marker core.RunMarker,
+	cur snapshot,
+	probe func(core.RunEvidence) (bool, error),
+) (recoveryMarkerState, error) {
 	// Named in every diagnostic below, alongside the issue. A possibly-live
 	// workspace is a thing an operator has to inspect — `ps` against the recorded
 	// group, `git -C` against the worktree — and neither is addressable from an
@@ -1029,13 +1180,13 @@ func (o *Orchestrator) resolveMarkerValue(issue core.Issue, ws core.Workspace, m
 			"issue", issue.Identifier, "workspace", where)
 		return recoveryMarkerUnknownLaunch, nil
 	case core.RunMarkerIdentified:
-		if o.cfg.RunGone == nil {
+		if probe == nil {
 			o.log.Warn("a run marker identifies a previous run and this daemon has no prober; treating the workspace as possibly live",
 				"issue", issue.Identifier, "workspace", where,
 				"scheme", marker.Evidence.Scheme, "run", marker.Evidence.ID)
 			return recoveryMarkerPossiblyLive, nil
 		}
-		gone, err := o.cfg.RunGone(marker.Evidence)
+		gone, err := probe(marker.Evidence)
 		switch {
 		case err != nil:
 			o.log.Warn("probing a previous run; treating the workspace as possibly live",
@@ -1164,7 +1315,7 @@ func (o *Orchestrator) applyRecovery(ctx context.Context, issue core.Issue, fact
 		r := o.adoptRecovered(issue, facts, v, cur, StateDone)
 		log.Info("finishing an interrupted done; retaining the claim while the PR awaits review")
 		o.projectRecovery(ctx, r, facts, v)
-		o.dispose(ctx, r, false)
+		o.disposePublished(ctx, r)
 		o.driveHold(ctx, r)
 
 	case recoveryActionReleaseKeep:
@@ -1172,6 +1323,7 @@ func (o *Orchestrator) applyRecovery(ctx context.Context, issue core.Issue, fact
 		o.projectRecovery(ctx, r, facts, v)
 		log.Info("releasing our own assignment; keeping the workspace")
 		o.abandonPendingClaimBase(ctx, r)
+		o.completeRevocationOnly(ctx, r)
 		o.release(ctx, r, "recovery: "+v.action.String())
 
 	case recoveryActionReleaseDispose:
@@ -1179,7 +1331,7 @@ func (o *Orchestrator) applyRecovery(ctx context.Context, issue core.Issue, fact
 		o.projectRecovery(ctx, r, facts, v)
 		log.Info("releasing our own assignment; disposing the workspace")
 		o.abandonPendingClaimBase(ctx, r)
-		o.dispose(ctx, r, false)
+		o.disposeRevoked(ctx, r, false)
 		o.release(ctx, r, "recovery: "+v.action.String())
 
 	default:
@@ -1421,7 +1573,7 @@ func (o *Orchestrator) retryRecovery(ctx context.Context) {
 // it returns something. An empty successful scan is an answer ("this principal
 // holds nothing"); an error is not.
 func (o *Orchestrator) retryRecoveryScan(ctx context.Context, cur snapshot) {
-	if !o.scanOwed || o.scanInFlight || o.draining {
+	if !o.scanOwed || o.scanInFlight || o.draining || o.cycleScanInFlight || o.cycleScanFailed {
 		return
 	}
 	o.scanInFlight = true
@@ -1461,12 +1613,35 @@ func (o *Orchestrator) onRecoveryScan(ctx context.Context, s signal) {
 	// The scan spoke, so it is not owed again. Whatever it returned is now held by
 	// a record — classified or not — and the ordinary per-record retry takes over.
 	o.scanOwed = false
-	adopted := 0
+	adopted, deferred := 0, 0
 	for _, issue := range s.candidates {
 		if _, tracked := o.records[issue.Identifier]; tracked {
 			continue
 		}
 		if _, retained := o.held[issue.Identifier]; retained {
+			continue
+		}
+		if o.endedCycleOwed(issue.Identifier) {
+			// Reassigned to this principal while its previous workspace cycle is
+			// still being released. Its exact backend address is independent of the
+			// replacement, but the disposal still owns the issue until confirmation;
+			// adopting would start a second tenure across that ownership boundary.
+			//
+			// Skipping is only safe because something comes back for it, and nothing
+			// else would: §8.3 excludes an assigned issue from the ordinary Fetch, so
+			// an assigned candidate this pass declined is one no read in the daemon
+			// looks at again. Marked on the obligation rather than re-owing the scan
+			// here — clearEndedCycle owes it when the disposal confirms, which is the
+			// event that unblocks it. Re-owing it now would spend a
+			// ClaimedByPrincipal read per tick until then, and the tail of this
+			// function re-enters the scan directly, so it would spend them without
+			// even waiting for a tick.
+			for _, c := range o.endedCycles {
+				if c.issue == issue.Identifier {
+					c.deferredCandidate = true
+				}
+			}
+			deferred++
 			continue
 		}
 		// Held out of dispatch first, classified second. The record has to exist
@@ -1476,7 +1651,8 @@ func (o *Orchestrator) onRecoveryScan(ctx context.Context, s signal) {
 		o.adoptUnclassified(issue, cur)
 		adopted++
 	}
-	o.log.Info("recovery scan succeeded on retry", "candidates", len(s.candidates), "newly_held", adopted)
+	o.log.Info("recovery scan succeeded on retry",
+		"candidates", len(s.candidates), "newly_held", adopted, "deferred", deferred)
 	o.retryRecovery(ctx)
 }
 

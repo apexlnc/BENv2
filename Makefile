@@ -86,7 +86,7 @@ lint:
 # green/red is the signal.
 workflow-check:
 	@$(GO) run ./cmd/ben config effective WORKFLOW.md >/dev/null
-	@BEN_SMOKE_REPO=acme/canary BEN_SMOKE_WORKSPACE=/tmp/ben-smoke-workspaces \
+	@BEN_SMOKE_REPO=acme/canary BEN_SMOKE_WORKSPACE=/tmp/ben-smoke-workspaces ANTHROPIC_API_KEY=inert-smoke-key \
 		$(GO) run ./cmd/ben config effective scripts/smoke-workflow.md >/dev/null
 	@BEN_BENCH_REPO=acme/canary BEN_BENCH_WORKSPACE=/tmp/ben-bench-workspaces BEN_BENCH_MODEL=test-model \
 		$(GO) run ./cmd/ben config effective scripts/benchmark/claude-code-default.md >/dev/null
@@ -127,11 +127,12 @@ check: fmt-check vet lint race workflow-check worktree-check
 	@echo "check: all green"
 
 # SPEC §12.4's real-integration profile: one scripted issue end to end on a
-# canary repository, with a real agent harness and a real GitHub.
+# canary repository, with a real agent harness and a real GitHub. The script
+# supplies the delegated systemd scope local execution now requires.
 #
-# Deliberately not part of `check`, and not a CI job. It needs two credentials,
-# spends agent tokens and writes to a repository, none of which belongs in a
-# target that runs on every push — while `check` must stay something anyone can
+# Deliberately not part of `check`, and not a CI job. It needs forge and harness
+# credentials, spends agent tokens and writes to a repository, none of which
+# belongs in a target that runs on every push — while `check` must stay something anyone can
 # run offline. What it catches is the class `check` structurally cannot: harness
 # and API drift where CI must model or replay the outside world.
 #

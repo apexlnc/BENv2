@@ -40,7 +40,7 @@ func TestPrepareWithLocalFactsCapturesFreshBranchBeforeCommitHooks(t *testing.T)
 			}
 			outgoing := f.head(t)
 			runGit(t, first.baseDir, "update-ref", "refs/ben/base/7", outgoing)
-			p, err := New(Options{
+			p, err := providerFromOptions(t, Options{
 				Root: first.root, WorkflowKey: "wf", Repository: repo(f.origin),
 				Hooks: tt.hooks, Locks: first.LockDomain(), Logger: quietLogger(),
 			})
@@ -85,7 +85,7 @@ func TestPrepareWithLocalFactsNeedsNoPostHookOriginProbe(t *testing.T) {
 	wantHead := agentCommit(t, old.Path, "prior-work.txt")
 	offline := f.origin + ".offline"
 
-	p2, err := New(Options{
+	p2, err := providerFromOptions(t, Options{
 		Root: p.root, WorkflowKey: "wf", Repository: repo(f.origin),
 		Hooks:  Hooks{BeforeRun: fmt.Sprintf("mv %q %q", f.origin, offline)},
 		Locks:  p.LockDomain(),

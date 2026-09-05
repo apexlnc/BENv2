@@ -164,7 +164,7 @@ Work on {{ issue.title }}.
 	if err != nil {
 		t.Fatalf("RepositoryFrom: %v", err)
 	}
-	p, err := New(Options{
+	p, err := providerFromOptions(t, Options{
 		Root:        def.Config.Workspace.Root,
 		WorkflowKey: def.Key,
 		Repository:  repo,

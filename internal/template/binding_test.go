@@ -17,7 +17,7 @@ import (
 // The closed set as SPEC §5.6 writes it. Held here as a literal so the
 // descriptor is pinned to the spec by something other than itself.
 var (
-	specRoots      = []string{"attempt", "issue", "run", "workspace"}
+	specRoots      = []string{"attempt", "issue", "run", "target_branch", "workspace"}
 	specIssueProps = []string{
 		"assignees", "blockers", "body", "created_at", "identifier",
 		"labels", "state", "title", "updated_at", "url",

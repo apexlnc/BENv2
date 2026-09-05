@@ -7,15 +7,18 @@ import (
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 )
 
-// The closed v1 kind sets (SPEC §2.2, §7.7, §8.4), asserted exactly. A kind
-// added to a table without a decision lands here first, and the sets are what
-// the loader's refusal message quotes.
-func TestRegisteredKindsAreTheClosedV1Sets(t *testing.T) {
+// The closed registered kind sets, asserted exactly. A kind added to a table
+// without a decision lands here first, and the sets are what the loader's
+// refusal message quotes.
+func TestRegisteredKindsAreTheClosedSets(t *testing.T) {
 	if got, want := TrackerNames(), []string{"github"}; !slices.Equal(got, want) {
 		t.Errorf("TrackerNames() = %v, want %v", got, want)
 	}
 	if got, want := RunnerNames(), []string{"claude-code", "codex-exec"}; !slices.Equal(got, want) {
 		t.Errorf("RunnerNames() = %v, want %v", got, want)
+	}
+	if got, want := SourceNames(), []string{"octo_sts", "projected_oidc", "static"}; !slices.Equal(got, want) {
+		t.Errorf("SourceNames() = %v, want %v", got, want)
 	}
 }
 
@@ -47,6 +50,15 @@ func TestEveryListedNameResolvesToARefusingKind(t *testing.T) {
 			t.Errorf("runner kind %q accepted an empty agent.provider block", name)
 		}
 	}
+	for _, name := range SourceNames() {
+		kind, ok := Source(name)
+		if !ok || kind == nil {
+			t.Fatalf("Source(%q) = %v, %v — listed but not resolvable", name, kind, ok)
+		}
+		if _, err := kind.Describe(map[string]any{"kind": name}); err == nil {
+			t.Errorf("source kind %q accepted an empty block", name)
+		}
+	}
 }
 
 // An unsupported name yields a *nil* kind, not a zero value with the bool as the
@@ -58,6 +70,9 @@ func TestUnknownKindResolvesToNil(t *testing.T) {
 		}
 		if kind, ok := Runner(name); ok || kind != nil {
 			t.Errorf("Runner(%q) = %v, %v; want nil, false", name, kind, ok)
+		}
+		if kind, ok := Source(name); ok || kind != nil {
+			t.Errorf("Source(%q) = %v, %v; want nil, false", name, kind, ok)
 		}
 	}
 }
@@ -78,5 +93,11 @@ func TestNamesAreFreshSlices(t *testing.T) {
 	trackers[0] = "mutated"
 	if again := TrackerNames(); slices.Contains(again, "mutated") {
 		t.Errorf("TrackerNames() returned the table's own slice: %v", again)
+	}
+
+	sources := SourceNames()
+	sources[0] = "mutated"
+	if again := SourceNames(); slices.Contains(again, "mutated") {
+		t.Errorf("SourceNames() returned the table's own slice: %v", again)
 	}
 }

@@ -56,7 +56,7 @@ func TestAClaimOfSuccessNeverPublishesOnEvidenceShortOfComplete(t *testing.T) {
 			before: func(tr *fake.Tracker) {
 				// An open pull request sitting on that very branch: the shape
 				// that would otherwise look exactly like a published run.
-				tr.SetPR("ben/issue-7", core.PR{Number: 13, URL: "https://example.test/pull/13", State: "open", Branch: "ben/issue-7"})
+				tr.SetPR("ben/issue-7", core.PR{Number: 13, URL: "https://example.test/pull/13", State: "open", Branch: "ben/issue-7", BaseBranch: "main"})
 			},
 			wantDetail: "does not descend from its claim-time base",
 		},
@@ -83,7 +83,7 @@ func TestAClaimOfSuccessNeverPublishesOnEvidenceShortOfComplete(t *testing.T) {
 				// §9.7 leg 3 names an *open* pull request. A closed one is a
 				// rejected earlier attempt, not evidence — and this is where "is
 				// there a PR?" and "is there an open PR?" part company.
-				tr.SetPR("ben/issue-7", core.PR{Number: 11, URL: "https://example.test/pull/11", State: "closed", Branch: "ben/issue-7"})
+				tr.SetPR("ben/issue-7", core.PR{Number: 11, URL: "https://example.test/pull/11", State: "closed", Branch: "ben/issue-7", BaseBranch: "main"})
 			},
 			wantDetail: "max_turns exhausted",
 			legThree:   true,
@@ -168,7 +168,7 @@ func TestRetryPreservesTheWorkspaceAndItsClaimTimeBase(t *testing.T) {
 			return fake.Succeed("session-B")
 		},
 		before: func(h *scenario) {
-			h.Tracker.SetPR("ben/issue-7", core.PR{Number: 21, URL: "https://example.test/pull/21", State: "open", Branch: "ben/issue-7"})
+			h.Tracker.SetPR("ben/issue-7", core.PR{Number: 21, URL: "https://example.test/pull/21", State: "open", Branch: "ben/issue-7", BaseBranch: "main"})
 		},
 	})
 
@@ -235,7 +235,7 @@ func TestAnUnconfirmedStopRetainsTheClaimAndTheWorkspace(t *testing.T) {
 		before: func(h *scenario) {
 			// The run is held open for the whole scenario, and that is load-bearing
 			// alongside the unconfirmed stop rather than incidental. Stop's answer
-			// is the knob below; Probe derives its own from the process group, so a
+			// is the knob below; Probe derives its own from the execution domain, so a
 			// run that *ends* here would have a group Probe rightly calls gone and
 			// a Stop claiming otherwise — a world the harness cannot produce, and
 			// the family of fixture defect #100 and #103 came from. A live process
@@ -276,7 +276,7 @@ func TestAnUnconfirmedStopRetainsTheClaimAndTheWorkspace(t *testing.T) {
 	// had the applied verdict in hand and still let nothing go.
 	h.ticks(2)
 	if n := h.Tracker.ReleaseCount("7"); n != 0 {
-		t.Errorf("released %d times while the process group was unconfirmed; §9.8 retains the claim until a stop confirms", n)
+		t.Errorf("released %d times while the execution domain was unconfirmed; §9.8 retains the claim until a stop confirms", n)
 	}
 	if got := h.Workspaces.Disposals("7"); len(got) != 0 {
 		t.Errorf("disposed %+v; a workspace a live process may still hold is not free", got)
@@ -431,7 +431,7 @@ func TestABudgetBreachStopsTheRunAndParks(t *testing.T) {
 func TestAPublishedClaimIsReleasedWhenTheIssueClosesWithoutARestart(t *testing.T) {
 	h := start(t, scenarioConfig{
 		before: func(h *scenario) {
-			h.Tracker.SetPR("ben/issue-7", core.PR{Number: 31, URL: "https://example.test/pull/31", State: "open", Branch: "ben/issue-7"})
+			h.Tracker.SetPR("ben/issue-7", core.PR{Number: 31, URL: "https://example.test/pull/31", State: "open", Branch: "ben/issue-7", BaseBranch: "main"})
 		},
 	})
 

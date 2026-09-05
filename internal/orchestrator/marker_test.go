@@ -10,6 +10,7 @@ import (
 
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 	"github.com/srhg-ai-7cef3f93/ben/internal/fake"
+	"github.com/srhg-ai-7cef3f93/ben/internal/remote"
 )
 
 // The SPEC §9.10 run marker, which marker.go owns since #157: the file that says
@@ -21,7 +22,7 @@ import (
 // *newer* run's marker.
 //
 // Split out of recover_test.go by #160. The §9.10 fixtures these share with the
-// rest of the family — `harness.restart`, `newProber`, `groupGone`/`groupAlive`,
+// rest of the family — `harness.restart`, `newProber`, `domainQuiet`/`domainLive`,
 // `incompleteEvidence`, `harness.waitReleased` — stay in recover_test.go, which
 // owns them.
 
@@ -41,7 +42,7 @@ func TestAPossiblyLiveMarkerIsNeverReattached(t *testing.T) {
 		name  string
 		probe func(core.RunEvidence) (bool, error)
 	}{
-		{name: "the group is still there", probe: groupAlive},
+		{name: "the domain remains live", probe: domainLive},
 		{
 			name:  "the probe errored, which is not an answer",
 			probe: func(core.RunEvidence) (bool, error) { return false, probeFailed },
@@ -50,7 +51,7 @@ func TestAPossiblyLiveMarkerIsNeverReattached(t *testing.T) {
 			// An error dominates whatever bool comes with it. A prober that returned
 			// `true, err` and was believed would free a workspace on a read that
 			// failed — the exact shape §9.10 forbids everywhere else.
-			name:  "the probe errored while also claiming the group is gone",
+			name:  "the probe errored while also claiming the domain is quiet",
 			probe: func(core.RunEvidence) (bool, error) { return true, probeFailed },
 		},
 		{
@@ -66,7 +67,7 @@ func TestAPossiblyLiveMarkerIsNeverReattached(t *testing.T) {
 				issues:  []core.Issue{fake.Issue("1", epoch)},
 				script:  startedOnly,
 				hang:    true,
-				runGone: groupGone,
+				runGone: domainQuiet,
 			})
 			h.WaitState("1", StateRunning)
 			preparesBefore := len(h.Workspaces.Prepares("1"))
@@ -75,8 +76,8 @@ func TestAPossiblyLiveMarkerIsNeverReattached(t *testing.T) {
 				t.Fatalf("marker = %+v (present=%v); this test needs an identified marker to probe", m, ok)
 			}
 
-			// The group outlived the daemon, which every attempt's own process group
-			// makes reachable under kill -9 (harness run.go, Setpgid).
+			// The domain outlived the daemon, which abrupt daemon loss makes
+			// reachable for every local or remote substrate.
 			probe := newProber(tc.probe)
 			if err := h.restart(harnessOpts{runGone: probe.probe, verifier: incompleteEvidence}); err != nil {
 				t.Fatalf("Recover: %v", err)
@@ -107,25 +108,179 @@ func TestAPossiblyLiveMarkerIsNeverReattached(t *testing.T) {
 					"workspace precondition", got)
 			}
 
-			// And it converges once the group is confirmed gone, with no human — the
+			// And it converges once the domain is confirmed quiet, with no human — the
 			// reason option 1 was chosen over accept-and-park.
-			probe.set(groupGone)
+			probe.set(domainQuiet)
 			h.Tick()
 			h.WaitState("1", StateBackoff)
 		})
 	}
 }
 
+// Exact replay is a launch, even when it reuses a durable idempotency key. A
+// restart may therefore reach it only after §9.7 says the active projection is
+// an orphan that belongs in backoff. Complete work, an unreadable verdict and a
+// queue-label revocation all leave the unanswered request unresolved instead
+// of starting stale or already-finished work during recovery.
+func TestRestartReplaysAnUnansweredStartOnlyAfterEvidenceAuthorizesBackoff(t *testing.T) {
+	verifyFailed := errors.New("verifier unavailable")
+	for _, tc := range []struct {
+		name       string
+		revoke     bool
+		verdict    Verdict
+		verifyErr  error
+		wantVerify bool
+		wantReplay bool
+	}{
+		{name: "incomplete evidence selects backoff", verdict: VerdictIncomplete, wantVerify: true, wantReplay: true},
+		{name: "published evidence completes the existing work", verdict: VerdictPublished, wantVerify: true},
+		{name: "verifier error has no verdict", verifyErr: verifyFailed, wantVerify: true},
+		{name: "approval revoked while down", revoke: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := start(t, harnessOpts{
+				issues:  []core.Issue{fake.Issue("1", epoch)},
+				script:  startedOnly,
+				hang:    true,
+				runGone: domainQuiet,
+			})
+			h.WaitState("1", StateRunning)
+			startsBefore := h.Runner.StartCount()
+
+			if tc.revoke {
+				// The controller's revocation removes the human approval label but
+				// leaves BEN's assignment for recovery to unwind.
+				h.Tracker.Mutate("1", func(issue *core.Issue) {
+					kept := issue.Labels[:0]
+					for _, label := range issue.Labels {
+						if label != "ben-queue" {
+							kept = append(kept, label)
+						}
+					}
+					issue.Labels = kept
+				})
+			}
+
+			var verified atomic.Bool
+			verifier := verifierFunc(func(context.Context, core.Issue, core.Workspace) (VerifyResult, error) {
+				verified.Store(true)
+				result := VerifyResult{Verdict: tc.verdict}
+				if tc.verdict == VerdictPublished {
+					result.PRURL = "https://example.test/pull/1"
+				}
+				return result, tc.verifyErr
+			})
+			var replays atomic.Int32
+			var replayedBeforeEvidence atomic.Bool
+			var missingApproval atomic.Bool
+			if err := h.restart(harnessOpts{
+				runGone: func(core.RunEvidence) (bool, error) {
+					return false, remote.ErrProcessUnresolved
+				},
+				resolveRun: func(_ core.Issue, _ core.RunEvidence, approval int64) (bool, error) {
+					if !verified.Load() {
+						replayedBeforeEvidence.Store(true)
+					}
+					if approval <= 0 {
+						missingApproval.Store(true)
+					}
+					replays.Add(1)
+					return false, nil
+				},
+				verifier: verifier,
+			}); err != nil {
+				t.Fatalf("Recover: %v", err)
+			}
+			if got := verified.Load(); got != tc.wantVerify {
+				t.Fatalf("§9.7 verifier called = %v, want %v", got, tc.wantVerify)
+			}
+			if replayedBeforeEvidence.Load() {
+				t.Fatal("exact Start replay preceded the §9.7 verdict")
+			}
+			if missingApproval.Load() {
+				t.Fatal("exact Start replay carried no standing approval-cycle anchor")
+			}
+			if got := replays.Load(); (got > 0) != tc.wantReplay {
+				t.Fatalf("exact Start replays = %d, want replay=%v", got, tc.wantReplay)
+			}
+			if got := h.Runner.StartCount(); got != startsBefore {
+				t.Fatalf("ordinary runner starts = %d, want none during recovery", got-startsBefore)
+			}
+		})
+	}
+}
+
+// The assignment epoch is not the workspace-cycle identity. A human can remove
+// and re-apply the required label while leaving BEN assigned, so recovery must
+// carry the new approval event to the remote resolver; that resolver can then
+// reject the old cycle before its exact Start function is reachable.
+func TestSameAssignmentReapprovalCannotReplayTheSupersededCycle(t *testing.T) {
+	h := start(t, harnessOpts{
+		issues:  []core.Issue{fake.Issue("1", epoch)},
+		script:  startedOnly,
+		hang:    true,
+		runGone: domainQuiet,
+	})
+	h.WaitState("1", StateRunning)
+
+	history, err := h.Tracker.ClaimHistory(context.Background(), core.Issue{Identifier: "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldApproval, ok := approvalCycleAnchor(history, h.def.Config.Tracker.RequiredLabels)
+	if !ok {
+		t.Fatalf("original history has no approval anchor: %+v", history)
+	}
+	// The final tracker state still carries ben-queue and the assignment does not
+	// move; only its standing application event changes.
+	h.Tracker.AppendHistory("1",
+		core.ClaimEvent{Kind: core.ClaimEventUnlabeled, Actor: "a-labeler", Subject: "ben-queue"},
+		core.ClaimEvent{Kind: core.ClaimEventLabeled, Actor: "a-labeler", Subject: "ben-queue"},
+	)
+	history, err = h.Tracker.ClaimHistory(context.Background(), core.Issue{Identifier: "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newApproval, ok := approvalCycleAnchor(history, h.def.Config.Tracker.RequiredLabels)
+	if !ok || newApproval == oldApproval {
+		t.Fatalf("reapproval anchor = %d (ok=%v), want one after %d", newApproval, ok, oldApproval)
+	}
+
+	var resolvedApproval atomic.Int64
+	var exactStarts atomic.Int32
+	if err := h.restart(harnessOpts{
+		runGone: func(core.RunEvidence) (bool, error) {
+			return false, remote.ErrProcessUnresolved
+		},
+		resolveRun: func(_ core.Issue, _ core.RunEvidence, approval int64) (bool, error) {
+			resolvedApproval.Store(approval)
+			if approval == oldApproval {
+				exactStarts.Add(1)
+			}
+			return false, errors.New("the persisted workspace cycle belongs to the earlier approval")
+		},
+		verifier: incompleteEvidence,
+	}); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if got := resolvedApproval.Load(); got != newApproval {
+		t.Fatalf("resolver approval = %d, want current reapproval %d", got, newApproval)
+	}
+	if got := exactStarts.Load(); got != 0 {
+		t.Fatalf("superseded cycle reached exact Start %d times", got)
+	}
+}
+
 // The marker's lifetime is the fact it stands in for: written before the launch,
-// removed only when the group is confirmed gone. Both halves are load-bearing —
-// written after the launch, a crash in the window leaves a live group with no
+// removed only when the execution domain is confirmed quiet. Both halves are load-bearing —
+// written after the launch, a crash in the window leaves a live domain with no
 // marker; removed on anything less than confirmed, a live worktree reads as free.
 func TestTheRunMarkerIsWrittenBeforeTheLaunchAndClearedOnlyWhenQuiet(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
@@ -141,7 +296,7 @@ func TestTheRunMarkerIsWrittenBeforeTheLaunchAndClearedOnlyWhenQuiet(t *testing.
 	if !ok || m.State != core.RunMarkerIdentified {
 		t.Fatalf("marker = %+v (present=%v), want identified once the run exists", m, ok)
 	}
-	if m.Evidence.Scheme != core.RunEvidenceLocal || m.Evidence.ID == "" || m.Evidence.Boot == "" {
+	if m.Evidence.Scheme != fake.RunEvidenceScheme || m.Evidence.ID == "" || m.Evidence.Boot == "" {
 		t.Errorf("evidence = %+v; a bare id cannot be asked about across a reboot", m.Evidence)
 	}
 }
@@ -149,7 +304,7 @@ func TestTheRunMarkerIsWrittenBeforeTheLaunchAndClearedOnlyWhenQuiet(t *testing.
 func TestTheRunMarkerIsClearedOnAConfirmedTermination(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues:  []core.Issue{fake.Issue("1", epoch)},
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateDone)
 
@@ -169,7 +324,7 @@ func TestAnUnconfirmedStopDoesNotClearTheMarker(t *testing.T) {
 		script:          startedOnly,
 		hang:            true,
 		stopUnconfirmed: true,
-		runGone:         groupGone,
+		runGone:         domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
@@ -183,7 +338,7 @@ func TestAnUnconfirmedStopDoesNotClearTheMarker(t *testing.T) {
 			"while a process may still be writing to it", got)
 	}
 	if m, ok := h.Workspaces.RunMarkerFor("1"); !ok || m.State != core.RunMarkerIdentified {
-		t.Errorf("marker = %+v (present=%v), want it standing until the group is confirmed gone", m, ok)
+		t.Errorf("marker = %+v (present=%v), want it standing until the domain is confirmed quiet", m, ok)
 	}
 }
 
@@ -194,13 +349,13 @@ func TestAnUnreadableMarkerRetainsRatherThanFreeing(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
 	h.Workspaces.SetFailMarkerRead(errors.New("runs/ is not readable"))
 	startsBefore := h.Runner.StartCount()
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -229,14 +384,14 @@ func TestConfirmedAbsenceClearsTheMarker(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 	if m, ok := h.Workspaces.RunMarkerFor("1"); !ok || m.State != core.RunMarkerIdentified {
 		t.Fatalf("marker = %+v (present=%v); this test needs one to clear", m, ok)
 	}
 
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	h.WaitState("1", StateBackoff)
@@ -253,13 +408,13 @@ func TestAMarkerThatCannotBeClearedRetainsTheCandidate(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
 	h.Workspaces.SetFailMarker(errors.New("state directory is read-only"))
 	startsBefore := h.Runner.StartCount()
-	if err := h.restart(harnessOpts{runGone: groupGone, verifier: incompleteEvidence}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, verifier: incompleteEvidence}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -283,7 +438,7 @@ func TestAFailedLaunchClearsItsOwnMarker(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues:    []core.Issue{fake.Issue("1", epoch)},
 		failStart: errors.New("exec: no such file"),
-		runGone:   groupGone,
+		runGone:   domainQuiet,
 	})
 	// `failed` releases the claim, so the record is dropped once the release lands.
 	h.WaitGone("1")
@@ -307,7 +462,7 @@ func TestAMarkerClearThatFailedIsRetriedOnLaterTicks(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
@@ -355,7 +510,7 @@ func TestAFailedLaunchClearsItsMarkerEvenWhenAnExitOvertakesIt(t *testing.T) {
 		failStart: errors.New("exec: no such file"),
 		// The launch is held open, so the decision below lands while it is still out.
 		startGate: func() { <-release },
-		runGone:   groupGone,
+		runGone:   domainQuiet,
 	})
 	waitFor(t, "the launch to be in flight", func() bool { return h.Runner.StartCount() == 0 && len(h.Workspaces.MarkerWrites) > 0 })
 
@@ -386,7 +541,7 @@ func TestAPendingMarkerClearGoesBackToItsOwnProvider(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 
@@ -441,7 +596,7 @@ func TestAPendingClearNeverErasesANewerRunsMarker(t *testing.T) {
 			return startedOnly(core.RunSpec{}, attempt)
 		},
 		prepareGate: func() { <-ready },
-		runGone:     groupGone,
+		runGone:     domainQuiet,
 	})
 
 	// Only the *removal* fails: a launch must still be able to write its own marker,
@@ -521,7 +676,7 @@ func TestAPendingClearCannotDeleteAMarkerWhileStartIsInFlight(t *testing.T) {
 			once.Do(func() { close(launched) })
 			<-release
 		},
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 
 	// Only the removal fails, so attempt 1 leaves a clear pending while attempt 2
@@ -584,7 +739,7 @@ func TestAMarkerClearDoesNotBlockTheAuthorityGoroutine(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues:      []core.Issue{fake.Issue("1", epoch)},
 		prepareGate: func() { <-ready },
-		runGone:     groupGone,
+		runGone:     domainQuiet,
 	})
 	h.Workspaces.SetMarkerClearGate(func() {
 		once.Do(func() { close(clearing) })
@@ -648,7 +803,7 @@ func TestALaunchWaitsOutAClearItCouldOnlyAbandonTooLate(t *testing.T) {
 			return startedOnly(core.RunSpec{}, attempt)
 		},
 		prepareGate: func() { <-ready },
-		runGone:     groupGone,
+		runGone:     domainQuiet,
 	})
 	h.Workspaces.SetMarkerClearGate(func() {
 		once.Do(func() { close(clearing) })
@@ -769,7 +924,7 @@ func TestAFailedMarkerRemovalRetriesOnTheTickNotOnTheInstant(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues:      []core.Issue{fake.Issue("1", epoch)},
 		prepareGate: func() { <-ready },
-		runGone:     groupGone,
+		runGone:     domainQuiet,
 	})
 	// A launch that never happens leaves a marker describing nothing, and clearing it
 	// is what fails — so the removal stays owed while the record itself terminalizes.

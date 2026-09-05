@@ -5,14 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
 
+	"github.com/srhg-ai-7cef3f93/ben/internal/airlock"
 	"github.com/srhg-ai-7cef3f93/ben/internal/config"
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 	"github.com/srhg-ai-7cef3f93/ben/internal/orchestrator"
 	"github.com/srhg-ai-7cef3f93/ben/internal/registry"
+	"github.com/srhg-ai-7cef3f93/ben/internal/state"
 	"github.com/srhg-ai-7cef3f93/ben/internal/workspace"
 )
 
@@ -75,6 +80,51 @@ type builder struct {
 	// transcriptDir is where the runner retains raw harness streams
 	// (SPEC §7.2, §10.3). Empty disables retention.
 	transcriptDir string
+	// workspaceScratchRoot is the daemon-owned state tree used for ephemeral
+	// remote Git repositories. It is never placed in a RunSpec, unlike every
+	// workspace path and the agent's TMPDIR (#231).
+	workspaceScratchRoot string
+	// agentTempRoot is the actual default TMPDIR inherited through the core
+	// allowlist. The provider proves its scratch root does not overlap it.
+	agentTempRoot string
+	// agentHomeRoot is the exact HOME inherited through the same allowlist.
+	// Runner kinds receive it as an explicit input when a runtime adds implicit
+	// home-relative write grants of its own.
+	agentHomeRoot string
+	// workspaceReady substitutes only the local provider's network readiness
+	// probe. Production always installs Provider.Ready; tests inject the same
+	// ordered boundary because their fake tracker deliberately names no network
+	// endpoint that exists.
+	workspaceReady func(context.Context, *workspace.Provider) error
+	// substrateDir is where a v2 backend keeps the durable addresses a restart
+	// needs (#194, state.Dir.Substrate). Unused under the local substrate, as are
+	// the three beside it: the run journals and their event inbox, the
+	// workspace-cycle records, and the daemon-side evidence stores (#205).
+	substrateDir string
+	journalDir   string
+	cycleDir     string
+	mirrorDir    string
+	// reviewDir is where the #204 review controller keeps its durable execution
+	// records. A sibling of the substrate tree rather than a subtree, because a
+	// review runs on either substrate (state.Dir.Reviews).
+	reviewDir string
+	// reconciled records that startup reconciliation has run for this process, so
+	// a reload does not repeat a survey of every retained claim. It is a
+	// *startup* pass by definition (docs/AIRLOCK.md): what it establishes — what
+	// this daemon holds on the backend before ordinary dispatch resumes — cannot
+	// change by editing a file that is forbidden to move the substrate.
+	reconciled bool
+	// review is the #204 review controller, built once for the same reason
+	// reconciled exists: its declaration is process-lifetime, so a reload cannot
+	// have moved it and rebuilding would mint a second durable session over one
+	// state directory.
+	review      *reviewLeg
+	reviewBuilt bool
+	// substrateTransport substitutes the backend's HTTP round tripper, for the
+	// reason the three kind lookups above are injected: the real one reaches a
+	// cluster-internal endpoint over TLS, and nothing about this leg of the
+	// assembly is provable in CI otherwise. Nil in every production path.
+	substrateTransport http.RoundTripper
 
 	// mu guards the retained candidates. config.Watcher serializes reloads under
 	// one mutex, but the watch goroutine and a Revalidate caller both arrive
@@ -104,13 +154,28 @@ type builder struct {
 // endpoints one config actually moves between are a handful.
 const retainCandidateLimit = 8
 
-func newBuilder(log *slog.Logger, transcriptDir string) *builder {
+func newBuilder(log *slog.Logger, dir state.Dir) *builder {
+	workspaceScratchRoot := dir.Root()
+	if absolute, err := filepath.Abs(workspaceScratchRoot); err == nil {
+		workspaceScratchRoot = absolute
+	}
 	return &builder{
-		tracker:       registry.Tracker,
-		runner:        registry.Runner,
-		source:        registry.Source,
-		log:           log,
-		transcriptDir: transcriptDir,
+		tracker:              registry.Tracker,
+		runner:               registry.Runner,
+		source:               registry.Source,
+		log:                  log,
+		transcriptDir:        dir.Transcripts(),
+		workspaceScratchRoot: workspaceScratchRoot,
+		agentTempRoot:        filepath.Clean(os.TempDir()),
+		agentHomeRoot:        os.Getenv("HOME"),
+		workspaceReady: func(ctx context.Context, provider *workspace.Provider) error {
+			return provider.Ready(ctx)
+		},
+		substrateDir: dir.Substrate(),
+		journalDir:   dir.SubstrateJournals(),
+		cycleDir:     dir.SubstrateCycles(),
+		mirrorDir:    dir.SubstrateMirror(),
+		reviewDir:    dir.Reviews(),
 	}
 }
 
@@ -150,10 +215,22 @@ func (b *builder) build(ctx context.Context, def *config.WorkflowDefinition, pre
 		return nil, fmt.Errorf("%w: %w", ErrConstruct, err)
 	}
 
-	// Tracker ⇒ workspace ⇒ verifier. Stated as one flag rather than three
-	// conditions so the cascade cannot be half-applied.
+	// Before any local adapter is built. A workflow that declares a remote
+	// substrate is not one this daemon may serve from a local worktree, and
+	// constructing the local set first would spend a base fetch and a tracker
+	// probe on a configuration that will not use either.
+	substrate, err := b.readySubstrate(ctx, def, sources.Substrate)
+	if err != nil {
+		return nil, err
+	}
+
+	// Tracker ⇒ workspace ⇒ verifier. A local agent edit also rebuilds the
+	// workspace so its daemon scratch placement is revalidated against the new
+	// provider's complete writable-root declaration. Remote runs cannot address
+	// this host's scratch tree, so their workspace cycle is unchanged by an
+	// agent-only reload.
 	rebuildTracker := changed.Tracker || prev == nil
-	rebuildWorkspace := rebuildTracker || changed.Workspace
+	rebuildWorkspace := rebuildTracker || changed.Workspace || (changed.Agent && substrate == nil)
 	// Workspace ⇒ runner, as well as agent ⇒ runner. The runner is constructed with
 	// a §9.10 evidence sink closed over *this* workspace provider (buildRunner), so
 	// a runner carried forward across a workspace rebuild would keep recording every
@@ -178,7 +255,7 @@ func (b *builder) build(ctx context.Context, def *config.WorkflowDefinition, pre
 		bundle.Workspaces, bundle.Verifier = prev.Workspaces, prev.Verifier
 	}
 	if !rebuildRunner {
-		bundle.Runner = prev.Runner
+		bundle.Runner, bundle.ResolveRun = prev.Runner, prev.ResolveRun
 	}
 
 	if rebuildTracker {
@@ -186,23 +263,103 @@ func (b *builder) build(ctx context.Context, def *config.WorkflowDefinition, pre
 			return nil, err
 		}
 	}
+	// The one fork in this function, and it is total: a workflow runs entirely on
+	// one substrate or entirely on the other. There is no fallback edge between
+	// them — a remote configuration that cannot be assembled refuses rather than
+	// preparing a local worktree, which would be two trees, one claim, and a §9.7
+	// verdict read from the wrong one.
 	if rebuildWorkspace {
-		if err := b.buildWorkspace(ctx, def, prev, bundle); err != nil {
-			return nil, err
+		if substrate != nil {
+			if err := b.buildRemoteWorkspace(ctx, def, substrate, bundle); err != nil {
+				return nil, err
+			}
+		} else {
+			writeScope, err := runnerKind.LocalWrites(def.Config.AgentBinding(), core.LocalRuntimePaths{
+				DaemonHomeDir: b.agentHomeRoot,
+			})
+			if err != nil {
+				// Structural just accepted the same binding through the same parse
+				// path. Keep a context-dependent scope refusal or a disagreement
+				// fail-closed rather than silently dropping write roots.
+				return nil, fmt.Errorf("%w: agent.kind %q local write scope: %w",
+					ErrConstruct, def.Config.Agent.Kind, err)
+			}
+			if err := b.buildWorkspace(ctx, def, prev, bundle, writeScope); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if rebuildRunner {
-		if err := b.buildRunner(ctx, def, runnerKind, sources.Publish, bundle); err != nil {
+		if substrate != nil {
+			if err := b.buildRemoteRunner(ctx, def, runnerKind, substrate, bundle); err != nil {
+				return nil, err
+			}
+		} else if err := b.buildRunner(ctx, def, runnerKind, sources.Publish, bundle); err != nil {
 			return nil, err
 		}
+	}
+	if substrate != nil {
+		// After the strategy exists and before this bundle can be published, which
+		// is what "before ordinary dispatch" means here: the config watcher stores
+		// revision 1 before Watch returns, and the loop cannot tick until it has.
+		if err := b.reconcile(ctx, substrate); err != nil {
+			return nil, err
+		}
+	}
+
+	// The review controller last, and once per process (#204). Last because it
+	// is built over the workspace strategy this function has just selected, and
+	// once because — like the substrate — its declaration is process-lifetime:
+	// outstanding review runs address the reviewer they were dispatched to, and
+	// a reload that moved the controller's identities under an in-flight round
+	// could route on artifacts a different login wrote. config refuses that
+	// reload (ErrReviewChanged), so this is the enforcement's other half rather
+	// than a second opinion of it.
+	if err := b.buildReviewOnce(ctx, def, sources.Review, substrate, bundle); err != nil {
+		return nil, err
 	}
 	return bundle, nil
 }
 
-// structuralKinds resolves both adapter families and runs both pure structural
-// checks — every family, not just the tracker. Both provider blocks are opaque
-// to the loader (SPEC §5.2.2, §5.2.5), so a check that asked only the tracker
-// would green-light a typo'd `agent.provider` (#55).
+// buildReviewOnce constructs the review leg for the first published revision and
+// retains it. Later revisions cannot have moved it (see build).
+func (b *builder) buildReviewOnce(
+	ctx context.Context, def *config.WorkflowDefinition, cred core.CredentialSource,
+	substrate *airlock.Substrate, bundle *orchestrator.Bundle,
+) error {
+	b.mu.Lock()
+	built := b.reviewBuilt
+	b.reviewBuilt = true
+	b.mu.Unlock()
+	if built {
+		return nil
+	}
+	leg, err := b.buildReview(ctx, def, cred, substrate, bundle)
+	if err != nil {
+		b.mu.Lock()
+		b.reviewBuilt = false
+		b.mu.Unlock()
+		return err
+	}
+	b.mu.Lock()
+	b.review = leg
+	b.mu.Unlock()
+	return nil
+}
+
+// Review returns the constructed controller, or nil when the workflow declares
+// none. Read by `ben run` after the first revision is published.
+func (b *builder) Review() *reviewLeg {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.review
+}
+
+// structuralKinds resolves both adapter families and runs every applicable pure
+// structural check — every family, not just the tracker, plus the runner's
+// remote-only check when the workflow selects that substrate. Both provider
+// blocks are opaque to the loader (SPEC §5.2.2, §5.2.5), so a check that asked
+// only the tracker would green-light a typo'd `agent.provider` (#55).
 //
 // The one implementation, called from two places on purpose. `ben run` needs it
 // as the first stage of the build; `ben config effective` needs it and nothing
@@ -234,8 +391,19 @@ func structuralKinds(
 	if err := trackerKind.Structural(trackerConfig(def)); err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", ErrStructural, err)
 	}
-	if err := runnerKind.Structural(def.Config.AgentBinding()); err != nil {
+	binding := def.Config.AgentBinding()
+	if err := runnerKind.Structural(binding); err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", ErrStructural, err)
+	}
+	if def.Config.Substrate.Remote() {
+		remoteKind, ok := runnerKind.(core.RemoteRunnerKind)
+		if !ok {
+			return nil, nil, fmt.Errorf("%w: %w: agent.kind %q",
+				ErrStructural, ErrNoRemoteRunner, def.Config.Agent.Kind)
+		}
+		if err := remoteKind.RemoteStructural(binding); err != nil {
+			return nil, nil, fmt.Errorf("%w: %w", ErrStructural, err)
+		}
 	}
 	return trackerKind, runnerKind, nil
 }
@@ -342,14 +510,24 @@ func (b *builder) retainLocked(tracker core.TrackerAdapter) {
 // the tree and not to the identity deliberately: a repository or principal change
 // still addresses the same base.git, and CheckBaseCache below takes that very
 // base mutex before any refusal about the change can happen.
-func (b *builder) buildWorkspace(ctx context.Context, def *config.WorkflowDefinition, prev *orchestrator.Bundle, bundle *orchestrator.Bundle) error {
+func (b *builder) buildWorkspace(
+	ctx context.Context,
+	def *config.WorkflowDefinition,
+	prev *orchestrator.Bundle,
+	bundle *orchestrator.Bundle,
+	agentWrites core.LocalWriteScope,
+) error {
 	provider, err := workspace.New(workspace.Options{
-		Root:        def.Config.Workspace.Root,
-		WorkflowKey: def.Key,
-		Repository:  bundle.Repository,
-		Hooks:       hooksFrom(def.Config.Hooks),
-		Locks:       carriedLocks(def, prev),
-		Logger:      b.log,
+		Root:          def.Config.Workspace.Root,
+		WorkflowKey:   def.Key,
+		ScratchRoot:   b.workspaceScratchRoot,
+		AgentTempRoot: b.agentTempRoot,
+		AgentWrites:   agentWrites,
+		Repository:    bundle.Repository,
+		BaseBranch:    def.Config.Workspace.BaseBranch,
+		Hooks:         hooksFrom(def.Config.Hooks),
+		Locks:         carriedLocks(def, prev),
+		Logger:        b.log,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: workspace provider: %w", ErrConstruct, err)
@@ -361,6 +539,13 @@ func (b *builder) buildWorkspace(ctx context.Context, def *config.WorkflowDefini
 	// fails every subsequent attempt as a launch error, one dispatched issue at
 	// a time. One local git read here turns that into one loud refusal.
 	if err := provider.CheckBaseCache(ctx); err != nil {
+		return fmt.Errorf("%w: workspace provider: %w", ErrNotReady, err)
+	}
+	ready := b.workspaceReady
+	if ready == nil {
+		ready = func(ctx context.Context, provider *workspace.Provider) error { return provider.Ready(ctx) }
+	}
+	if err := ready(ctx, provider); err != nil {
 		return fmt.Errorf("%w: workspace provider: %w", ErrNotReady, err)
 	}
 
@@ -431,11 +616,10 @@ func (b *builder) buildRunner(ctx context.Context, def *config.WorkflowDefinitio
 		Publish:        core.PublishBinding{Env: binding.Publish.Env, Source: publishSource(cred)},
 		AttemptTimeout: binding.AttemptTimeout,
 		TranscriptDir:  b.transcriptDir,
-		// Called once per attempt, after the process exists and before its handle
-		// reaches the orchestrator (core.RunEvidenceSink). An error here means the
-		// run is real and its evidence could not be recorded, which is the worst of
-		// §9.10's three marker states — so the adapter fails the attempt through its
-		// ordinary ladder rather than pretending nothing started.
+		// Called once per attempt after the trusted domain exists and before
+		// untrusted provider execution is released (core.RunEvidenceSink). On an
+		// error the adapter tears down that unreleased domain before returning a
+		// launch refusal, leaving no unowned process behind.
 		OnRun: func(spec core.RunSpec, evidence core.RunEvidence) error {
 			return recorder.RecordRun(spec.Workspace.Path, evidence)
 		},

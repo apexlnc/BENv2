@@ -29,6 +29,10 @@ var (
 	// what `Ready` catches so a dispatch never discovers it (SPEC §7.3).
 	ErrBinary = errors.New("claude-code: harness binary unusable")
 
+	// ErrExecutionDomain refuses local startup when the Linux containment and
+	// quiet-evidence provider cannot prove its complete capability matrix.
+	ErrExecutionDomain = errors.New("claude-code: local execution domain unavailable")
+
 	// ErrCredentialPinned refuses a credential the host's managed settings will
 	// not accept. Readiness, like ErrBinary, but a different fact: the harness
 	// *has* a credential and reports itself logged in, and will refuse every
@@ -136,4 +140,20 @@ var (
 	// orchestrator records as launch_error — non-retryable, since a rerun with
 	// the same inputs fails identically).
 	ErrEnvNamespace = errors.New("claude-code: BEN_ is reserved to the orchestrator")
+
+	// ErrContinuationToken refuses a resume token that argv cannot carry safely
+	// (SPEC §7.1, §9.6): the token is minted from the child's own JSON stream, and
+	// one beginning with `-` is a flag the agent selected for its own next
+	// invocation rather than a session id. The stream layer refuses such a token
+	// where it mints it (validSessionID); this is the second, independent anchor,
+	// so the argv construction is safe whatever reached it — a state file written
+	// by an older binary included.
+	ErrContinuationToken = errors.New("claude-code: continuation token unusable as an argv element")
+
+	// ErrRemoteGitHubCredential refuses a standard reusable GitHub credential
+	// variable in a remote invocation. Such a variable is ordinary provider
+	// environment for a local run, but #194 forbids serializing its authority to
+	// an execution substrate; remote publication identity belongs to the worker
+	// profile.
+	ErrRemoteGitHubCredential = errors.New("claude-code: reusable GitHub credential forbidden on a remote substrate")
 )

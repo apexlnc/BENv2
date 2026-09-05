@@ -1,6 +1,6 @@
 // Package harness is the machinery every process-per-attempt agent adapter
 // needs and none of them should own privately (SPEC §7.1–§7.6): the child
-// process lifecycle, liveness windows, the signal ladder, transcript retention,
+// process lifecycle, liveness windows, bounded domain teardown, transcript retention,
 // child-environment composition, and the provider-block parsing helpers.
 //
 // SPEC §7.7 fixes v1 at two harnesses — claude-code and codex-exec — and their
@@ -26,14 +26,13 @@
 //     from an allowlist plus what the provider block names. The daemon's
 //     environment is never inherited wholesale — not even by the readiness
 //     probes — and the orchestrator contributes only `BEN_`-prefixed variables.
-//   - Stop must be honest (SPEC §7.5, §9.8). SIGTERM to the process group,
-//     grace, SIGKILL, driven by the *group's* disappearance rather than the
-//     leader's; if anything survives, the termination is reported unconfirmed
-//     so the orchestrator keeps the claim.
+//   - Domain quiet must be honest (SPEC §7.5, §9.8). A process-lifetime local
+//     provider owns atomic containment, durable evidence, read-only Probe,
+//     bounded Stop, recovery and cgroup cleanup; this stream layer interprets
+//     none of those OS facts.
 package harness
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"maps"
@@ -50,11 +49,43 @@ import (
 )
 
 // Sizes, as opposed to windows: the lifecycle timings live in Timings.
+//
+// Three of them bound what this package will *hold* of an untrusted child's
+// output (#235), and the discipline is the same for each: a bound on what is
+// retained, never on what is read, with the truncation recorded rather than
+// silent. Everything a child writes is authored by the thing being judged
+// (SPEC §3.5), so an unbounded capture anywhere is a daemon OOM at the agent's
+// discretion — and a daemon OOM loses every in-flight claim.
 const (
-	// maxScanLine is the line-scanner ceiling (SPEC §7.5 recommends 10 MiB):
+	// MaxScanLine is the line-scanner ceiling (SPEC §7.5 recommends 10 MiB):
 	// one assistant message with a large tool result is far past the 64 KiB
 	// bufio default, and a truncated line would look like a dead stream.
-	maxScanLine = 10 << 20
+	//
+	// A line past it ends the run with failed(output_overflow), claimed by the
+	// reader that hit it (handle.overflow). Exported so the conformance suite
+	// can drive a line past it rather than under it.
+	MaxScanLine = 10 << 20
+	// MaxEventText bounds core.Event.Text, the one event field a consumer
+	// retains (SPEC §9.6). It is applied where the field is minted — each
+	// adapter's translate — and again in handle.emit, so no adapter can forget
+	// (see BoundText). The notice stating the cut is inside the bound.
+	//
+	// 64 KiB is four times the tail the orchestrator keeps of it
+	// (orchestrator summaryBudget), so nothing downstream loses a byte it
+	// would have used, and it caps what the two queues between adapter and
+	// orchestrator hold at a few MiB per run instead of whatever the agent
+	// chose to say in one message.
+	MaxEventText = 64 << 10
+	// MaxProbeOutput bounds what a readiness probe retains of its child's
+	// output (Probe, ProbeCombined). A harness that writes more is refused
+	// (ErrProbeOutput): readiness classifies from the body, and a body this
+	// long is not an answer either probe reads — it is a binary that is not
+	// behaving as the harness, which is what Ready exists to refuse.
+	MaxProbeOutput = 64 << 10
+	// ProbeExcerpt is how much of a probe's answer a refusal may quote. A
+	// startup error is read by an operator, and MaxProbeOutput of it is not
+	// an explanation (see Excerpt).
+	ProbeExcerpt = 200
 	// stderrTail bounds the retained stderr used to explain a launch failure.
 	stderrTail = 8 << 10
 	// eventBuffer keeps a slow consumer from backpressuring the harness read
@@ -538,6 +569,43 @@ func CheckSpec(spec core.RunSpec, errs SpecErrors) error {
 	return nil
 }
 
+// CheckContinuationArgv refuses a resume token argv cannot carry safely: one
+// beginning with `-`, which execve hands the harness as a *flag* rather than as
+// the session or thread id it is meant to be (SPEC §7.1, §9.6).
+//
+// This is the second of two independent anchors, and the shared half is only the
+// reasoning — each adapter passes its own sentinel and keeps its own,
+// adapter-shaped mint-time check (claudecode.validSessionID,
+// codexexec.validThreadID). The split is the point, and AGENTS.md's conventions
+// name it: the token is minted from the child's attacker-controlled JSON stream,
+// so the stream layer is where its *shape* is decided, and this is what has to
+// hold for a token that reached argv by some other route — a state file written
+// by a build whose stream layer did not check, or a future stream field nobody
+// has revisited. Two anchors sharing one predicate would be one anchor.
+//
+// A `--` separator is not available as an alternative on either surface:
+// `claude --resume <token>` has no positional terminator at all, and
+// `codex exec [OPTIONS] resume <THREAD_ID>` takes the id as the subcommand's own
+// operand. The value check is the control.
+//
+// Deliberately narrow. Only a leading `-` gives an argv element a meaning it did
+// not have — an element is passed to the child whole, so an embedded `=`, space
+// or quote is data unless something re-splits it, and refusing those here would
+// be this function guessing at the shape of a token the adapter above it has
+// already stated (SPEC §7.1's adapter-opaque token).
+//
+// The refused token is not echoed. It arrived on a channel whose retained copy is
+// redacted (SPEC §10.3), and an error string is not: an agent that wrote a value
+// it should not have into its own session id would otherwise have found a second,
+// unredacted route into the state directory.
+func CheckContinuationArgv(token string, sentinel error) error {
+	if strings.HasPrefix(token, "-") {
+		return fmt.Errorf("%w: it begins with a dash, which the harness reads as a flag rather "+
+			"than a session id (%d bytes, not reproduced here)", sentinel, len(token))
+	}
+	return nil
+}
+
 // CheckProviderEnv is the config half of the BEN_ reservation (SPEC §7.6).
 //
 // It is the half that matters more: a collision authored here is written once
@@ -662,6 +730,14 @@ func ResolveBinary(name string, sentinel error) (string, error) {
 //     still running, and a daemon that probes on every reload would accumulate
 //     them. The probe therefore gets its own process group and the group is
 //     killed on the way out, so readiness costs no orphans.
+//
+// And one from the child's output: it is retained only up to MaxProbeOutput,
+// with everything past that counted and discarded — discarded rather than left
+// in the pipe, because a probe that stopped reading would block the child on a
+// full pipe and then be waiting on exactly the process it is about to kill. A
+// probe that overflows the bound is refused (ErrProbeOutput) with the bytes it
+// did retain, so a caller that classifies from the body (SPEC §7.1) can say
+// what it saw without ever having held all of it (#235).
 func Probe(ctx context.Context, t Timings, path string, env []string, args ...string) ([]byte, error) {
 	return probe(ctx, t, path, env, false, args)
 }
@@ -681,10 +757,12 @@ func probe(ctx context.Context, t Timings, path string, env []string, combined b
 	probe.WaitDelay = t.withDefaults().ProbeWait
 	probe.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	var out bytes.Buffer
-	probe.Stdout = &out
+	// One writer for both streams when combined: exec serializes Writes to a
+	// comparable writer shared by Stdout and Stderr, which a pointer is.
+	out := &boundedBuffer{limit: MaxProbeOutput}
+	probe.Stdout = out
 	if combined {
-		probe.Stderr = &out
+		probe.Stderr = out
 	}
 	if err := probe.Start(); err != nil {
 		return nil, err
@@ -694,5 +772,12 @@ func probe(ctx context.Context, t Timings, path string, env []string, combined b
 	defer syscall.Kill(-pgid, syscall.SIGKILL)
 
 	err := probe.Wait()
-	return out.Bytes(), err
+	if out.total > out.limit {
+		if err != nil {
+			return out.buf, fmt.Errorf("%w: %d bytes written, %d retained; the probe also failed: %v",
+				ErrProbeOutput, out.total, len(out.buf), err)
+		}
+		return out.buf, fmt.Errorf("%w: %d bytes written, %d retained", ErrProbeOutput, out.total, len(out.buf))
+	}
+	return out.buf, err
 }

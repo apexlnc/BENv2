@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
@@ -50,8 +51,8 @@ func TestCommandArgv(t *testing.T) {
 		},
 		{
 			name: "resume carries the opaque continuation token",
-			spec: core.RunSpec{Continuation: "sess-123"},
-			want: append(slices.Clone(head), "--resume", "sess-123"),
+			spec: core.RunSpec{Continuation: fixtureSession},
+			want: append(slices.Clone(head), "--resume", fixtureSession),
 		},
 		{
 			name:  "model and settings",
@@ -85,9 +86,59 @@ func TestCommandArgv(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := testProvider(t, tc.extra).command(tc.spec)
+			got, err := testProvider(t, tc.extra).command(tc.spec)
+			if err != nil {
+				t.Fatalf("command(): %v", err)
+			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("command() = %v\nwant %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The second of the two anchors on the resume token (#233, SPEC §7.1, §9.6).
+// It holds whatever reached the RunSpec, not only what this adapter's stream
+// layer minted — a state file written by a build without validSessionID is the
+// case it exists for — and it is deliberately narrower than that check, because
+// what an argv element means is decided by its first character alone
+// (harness.CheckContinuationArgv).
+func TestCommandRefusesAContinuationTokenArgvCannotCarry(t *testing.T) {
+	parallel(t)
+	for _, tc := range []struct {
+		name    string
+		token   string
+		refused bool
+	}{
+		{name: "a session id", token: fixtureSession},
+		{
+			// Independent anchors: this one is not validSessionID, and a token
+			// argv can carry safely is not this layer's to second-guess.
+			name:  "an opaque token the stream layer would have refused",
+			token: "sess-123",
+		},
+		{name: "a bare flag", token: "-p", refused: true},
+		{name: "a long flag carrying its own value", token: "--settings=/tmp/evil.json", refused: true},
+		{
+			// The flag that would undo the posture the operator configured.
+			name:    "the permission mode the block already stated",
+			token:   "--permission-mode=bypassPermissions",
+			refused: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			argv, err := testProvider(t, nil).command(core.RunSpec{Continuation: tc.token})
+			if got := errors.Is(err, ErrContinuationToken); got != tc.refused {
+				t.Fatalf("command(%q) error = %v, want refusal=%v", tc.token, err, tc.refused)
+			}
+			if tc.refused {
+				if argv != nil {
+					t.Errorf("command(%q) returned an argv alongside its refusal: %v", tc.token, argv)
+				}
+				return
+			}
+			if !slices.Contains(argv, tc.token) {
+				t.Errorf("command(%q) = %v, want the token carried", tc.token, argv)
 			}
 		})
 	}
@@ -108,10 +159,13 @@ func TestCommandArgvCarriesNoSecretsOrPrompt(t *testing.T) {
 		Workspace:    core.WorkspacePaths{Path: "/w"},
 		Prompt:       "PROMPT-BODY do the thing",
 		Env:          map[string]string{"EXTRA_TOKEN": "extra-SECRET"},
-		Continuation: "sess-1",
+		Continuation: fixtureSession,
 	}
 
-	argv := p.command(spec)
+	argv, err := p.command(spec)
+	if err != nil {
+		t.Fatalf("command(): %v", err)
+	}
 	joined := strings.Join(argv, "\x00")
 	for _, secret := range secretValues(p, spec) {
 		if strings.Contains(joined, secret) {

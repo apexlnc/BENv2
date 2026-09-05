@@ -182,14 +182,9 @@ func agentChildVars(kind core.RunnerKind, provider map[string]any, publish Publi
 	out := map[string]string{}
 
 	// Sorted so the cited path is stable when several leaves share a variable.
-	for _, path := range slices.Sorted(maps.Keys(prov)) {
-		if !underProviderBlock(path, "agent.provider") {
-			continue
-		}
-		for _, name := range prov[path].envVars() {
-			if _, seen := out[name]; !seen {
-				out[name] = path
-			}
+	for _, source := range providerEnvSources(prov, "agent.provider") {
+		if _, seen := out[source.Variable]; !seen {
+			out[source.Variable] = source.Field
 		}
 	}
 	// Before the allowlist, so a variable that is both reports the field an
@@ -215,6 +210,24 @@ func agentChildVars(kind core.RunnerKind, provider map[string]any, publish Publi
 		}
 		if _, seen := out[name]; !seen {
 			out[name] = ""
+		}
+	}
+	return out
+}
+
+// providerEnvSources projects the loader-owned provenance for every
+// environment-resolved leaf under one opaque provider block into the non-secret
+// binding shape adapters may inspect. Paths are sorted, and each origin's
+// variables retain their first-occurrence order, so reload comparisons and
+// refusals are deterministic.
+func providerEnvSources(prov Provenance, prefix string) []core.ProviderEnvSource {
+	var out []core.ProviderEnvSource
+	for _, path := range slices.Sorted(maps.Keys(prov)) {
+		if !underProviderBlock(path, prefix) {
+			continue
+		}
+		for _, name := range prov[path].envVars() {
+			out = append(out, core.ProviderEnvSource{Variable: name, Field: path})
 		}
 	}
 	return out

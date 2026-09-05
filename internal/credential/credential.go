@@ -3,10 +3,12 @@
 // publish credential is obtained from a credential source at the moment it is
 // needed".
 //
-// Two kinds ship. `octo_sts` exchanges a workload identity for a short-lived
-// GitHub credential and states a deadline; `static` names a daemon-environment
-// variable, is explicitly unbounded, and is what every legacy spelling compiles
-// into so that there is exactly one runtime treatment (SPEC §8, amendment 9).
+// Three kinds ship. `octo_sts` exchanges a workload identity for a short-lived
+// GitHub credential and states a deadline; `projected_oidc` presents a bounded
+// workload token directly after checking the identity its claims address; and
+// `static` names a daemon-environment variable, is explicitly unbounded, and is
+// what every legacy spelling compiles into so that there is exactly one runtime
+// treatment (SPEC §8, amendment 9).
 //
 // Every kind's Describe is PURE — no network, no filesystem, no instance — which
 // is what lets `make workflow-check` validate a workload-identity configuration
@@ -46,8 +48,17 @@ var (
 	// ErrSourceURL refuses a URL that is unparseable, names no host, or carries
 	// a component that addresses nothing (userinfo, a query, a fragment).
 	ErrSourceURL = errors.New("credential source: url is not a usable endpoint")
-	// ErrSourceURLScheme refuses a scheme other than http or https.
-	ErrSourceURLScheme = errors.New("credential source: url scheme must be http or https")
+	// ErrSourceURLScheme refuses a scheme other than https.
+	//
+	// Refused rather than warned about, and refused at *load* — the same posture
+	// `projected_oidc`'s issuer and `internal/airlock`'s base URL take, for the
+	// same reason. An exchange presents a projected workload-identity JWT in an
+	// `Authorization: Bearer` header, and that JWT federates to GitHub write
+	// access: an on-path observer who captures one can replay it to the real
+	// issuer for the whole of its life. There is no deployment in which sending
+	// it in the clear is a considered choice, and a warning is a refusal nobody
+	// reads.
+	ErrSourceURLScheme = errors.New("credential source: url scheme must be https")
 	// ErrSourceKindUnknown refuses a `kind` with no registered implementation.
 	ErrSourceKindUnknown = errors.New("credential source: unknown kind")
 )

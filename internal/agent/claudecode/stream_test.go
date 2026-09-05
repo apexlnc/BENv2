@@ -2,11 +2,19 @@ package claudecode
 
 import (
 	"bufio"
+	"github.com/srhg-ai-7cef3f93/ben/internal/agent/harness"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
 )
+
+// The session id in testdata/stream-success.jsonl, and the shape 2.1.221 mints
+// every time: a UUID, which is what makes validSessionID exact rather than a
+// guess at a character class.
+const fixtureSession = "11111111-2222-3333-4444-555555555555"
 
 // The fixture is a real 2.1.221 run (see testdata/README.md): the translator is
 // tested against what the harness emits, not against what we remember it
@@ -43,10 +51,9 @@ func TestTranslateRecordedSuccessRun(t *testing.T) {
 		}
 	}
 
-	const session = "11111111-2222-3333-4444-555555555555"
-	if got[0].SessionID != session || got[0].Continuation != session {
+	if got[0].SessionID != fixtureSession || got[0].Continuation != fixtureSession {
 		t.Errorf("started = {session %q, continuation %q}, want both %q",
-			got[0].SessionID, got[0].Continuation, session)
+			got[0].SessionID, got[0].Continuation, fixtureSession)
 	}
 	if got[1].Text != "hi" {
 		t.Errorf("progress text = %q, want %q", got[1].Text, "hi")
@@ -68,11 +75,11 @@ func TestTranslateLines(t *testing.T) {
 	}{
 		{
 			name: "init mints the continuation token",
-			line: `{"type":"system","subtype":"init","session_id":"s1"}`,
+			line: `{"type":"system","subtype":"init","session_id":"` + fixtureSession + `"}`,
 			want: []core.EventType{core.EventStarted},
 			check: func(t *testing.T, evs []core.Event) {
-				if evs[0].Continuation != "s1" {
-					t.Errorf("continuation = %q, want s1", evs[0].Continuation)
+				if evs[0].Continuation != fixtureSession {
+					t.Errorf("continuation = %q, want %q", evs[0].Continuation, fixtureSession)
 				}
 			},
 		},
@@ -82,7 +89,7 @@ func TestTranslateLines(t *testing.T) {
 		},
 		{
 			name: "other system subtypes carry no normalized meaning",
-			line: `{"type":"system","subtype":"thinking_tokens","session_id":"s1","estimated_tokens":3}`,
+			line: `{"type":"system","subtype":"thinking_tokens","session_id":"` + fixtureSession + `","estimated_tokens":3}`,
 		},
 		{
 			name: "thinking blocks are not forwarded as progress",
@@ -111,6 +118,23 @@ func TestTranslateLines(t *testing.T) {
 		{
 			name: "whitespace-only text is not progress",
 			line: `{"type":"assistant","message":{"content":[{"type":"text","text":"   "}]}}`,
+		},
+		{
+			// Bounded where it is minted (#235): the transcript has the whole
+			// message, the event carries at most harness.MaxEventText of it,
+			// with the cut stated.
+			name: "oversized prose is bounded at the boundary",
+			line: `{"type":"assistant","message":{"content":[{"type":"text","text":"` +
+				strings.Repeat("x", harness.MaxEventText+1) + `"}]}}`,
+			want: []core.EventType{core.EventProgress},
+			check: func(t *testing.T, evs []core.Event) {
+				if n := len(evs[0].Text); n > harness.MaxEventText {
+					t.Errorf("text is %d bytes, want at most %d", n, harness.MaxEventText)
+				}
+				if !strings.HasPrefix(evs[0].Text, "xxxx") || !strings.Contains(evs[0].Text, "truncated") {
+					t.Errorf("text does not carry the message's own prefix and a truncation notice: %q…", evs[0].Text[:16])
+				}
+			},
 		},
 		{
 			name: "successful result yields usage then succeeded",
@@ -152,6 +176,83 @@ func TestTranslateLines(t *testing.T) {
 			}
 			if tc.check != nil {
 				tc.check(t, got)
+			}
+		})
+	}
+}
+
+// The resume token is minted here, from the child's own JSON stream, and two
+// dispatches later it is an argv element the harness reads back (`--resume
+// <token>`, see command). This is the first of the two independent anchors on
+// it, and the exact one: 2.1.221 mints UUIDs, so the check is that shape rather
+// than a guess at what an opaque token may contain.
+//
+// A refused id mints no started event at all — the same outcome as an init line
+// carrying none, which the table above already covers — so the line is still
+// activity, the attempt runs, and the orchestrator is left with no token to
+// resume from (SPEC §7.1, §9.6).
+func TestInitRefusesASessionIDArgvCannotCarry(t *testing.T) {
+	parallel(t)
+	for _, tc := range []struct {
+		name    string
+		id      string
+		started bool
+	}{
+		{name: "the shape 2.1.221 mints", id: fixtureSession, started: true},
+		{
+			// Same id, and hex has two spellings: refusing one of them would
+			// cost a resumable chain for nothing.
+			name:    "uppercase hex is the same uuid",
+			id:      "AABBCCDD-1122-3344-5566-778899AABBCC",
+			started: true,
+		},
+		{
+			// The one this ticket is about: `--resume` takes the next element
+			// whatever it is, so this is a flag the agent chose for its own
+			// next invocation (#233).
+			name: "a bare flag",
+			id:   "-p",
+		},
+		{name: "a long flag carrying its own value", id: "--settings=/tmp/evil.json"},
+		{name: "a dash where the first hex digit belongs", id: "-1111111-2222-3333-4444-555555555555"},
+		{name: "an interior equals", id: "11111111-2222-3333-4444-55555555=555"},
+		{name: "an interior space", id: "11111111-2222-3333-4444-5555555 5555"},
+		{name: "a newline, which would be a second line to anything re-parsing it", id: "11111111-2222-3333-4444-5555555\n5555"},
+		{name: "empty", id: ""},
+		{name: "one byte too long", id: fixtureSession + "5"},
+		{name: "one byte too short", id: fixtureSession[:len(fixtureSession)-1]},
+		{name: "far too long", id: fixtureSession + strings.Repeat("0", 4096)},
+		{
+			// 36 bytes and every character legal, but the groups are not where
+			// a UUID's are: length alone is not the check.
+			name: "hyphens in the wrong places",
+			id:   "111111112-222-3333-4444-555555555555",
+		},
+		{name: "a non-hex letter", id: "g1111111-2222-3333-4444-555555555555"},
+		{
+			// The indices in validSessionID are byte offsets, so a multibyte
+			// rune fails one of the two tests — here, the length.
+			name: "a multibyte rune",
+			id:   fixtureSession[:len(fixtureSession)-1] + "é",
+		},
+		{
+			// The token the pre-#233 tests used. Opaque, harmless as an argv
+			// element, and still refused: this adapter knows the shape, so it
+			// holds the stream to it rather than to what argv happens to survive.
+			name: "an opaque token that is not a session id",
+			id:   "sess-123",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := translate([]byte(`{"type":"system","subtype":"init","session_id":` + strconv.Quote(tc.id) + `}`))
+			switch {
+			case tc.started && (len(got) != 1 || got[0].Type != core.EventStarted):
+				t.Fatalf("translate = %v, want one started event", types(got))
+			case tc.started && (got[0].Continuation != tc.id || got[0].SessionID != tc.id):
+				t.Errorf("started = {session %q, continuation %q}, want both %q",
+					got[0].SessionID, got[0].Continuation, tc.id)
+			case !tc.started && len(got) != 0:
+				t.Errorf("translate = %v, want no events: a refused id is not a start", types(got))
 			}
 		})
 	}
@@ -238,6 +339,8 @@ func TestReasonsStayInsideTheTaxonomy(t *testing.T) {
 		core.FailureCrashed, core.FailureStalled, core.FailureTimeout,
 		core.FailureRateLimited, core.FailureAuth, core.FailureKilled,
 		core.FailureBudgetExceeded,
+		// The harness's verdict on a line past the scanner ceiling (#235).
+		core.FailureOutputOverflow,
 	}
 	retryable := map[core.FailureReason]bool{
 		core.FailureCrashed: true, core.FailureStalled: true,

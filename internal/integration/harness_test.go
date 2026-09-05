@@ -155,7 +155,7 @@ type scenarioConfig struct {
 	// question nobody is asking.
 	//
 	// The scenario keeps it in a cell (scenario.Prober) so it can move while the
-	// loop is running — "the group has since died" is a fact a restart scenario
+	// loop is running — "the domain has since become quiet" is a fact a restart scenario
 	// has to be able to produce, and assigning Config.RunGone mid-run is a data
 	// race the authority goroutine would lose.
 	runGone func(core.RunEvidence) (bool, error)
@@ -472,7 +472,7 @@ func (h *scenario) stop() {
 //     leave stale waiters that a later Advance fires into nobody.
 //   - The workflow is re-read from the file, because a starting daemon reads it.
 //   - The agent is **not** stopped. A kill reaches the daemon and nothing else:
-//     every attempt runs in its own process group (SPEC §7.5), so whether the
+//     every attempt runs in its own execution domain (SPEC §7.5), so whether the
 //     previous run is still there is a question only the run prober answers. That
 //     is exactly what §9.10's workspace precondition is about, and it is why a
 //     scenario saying "the agent died too" says so through scenarioConfig.runGone
@@ -496,7 +496,7 @@ func (h *scenario) restart() error {
 //
 // The cell is the point. orchestrator.Config is read by the authority goroutine,
 // so assigning its RunGone field mid-run is a data race the detector rightly
-// rejects — while "the group has since died" is precisely the fact a restart
+// rejects — while "the domain has since become quiet" is precisely the fact a restart
 // scenario has to be able to produce (orchestrator recover_test's switchableProber
 // says the same about its own).
 type prober struct {
@@ -523,13 +523,13 @@ func (p *prober) probe(e core.RunEvidence) (bool, error) {
 	return fn(e)
 }
 
-// groupGone is the probe for a restart whose previous run really did die, which
+// domainQuiet is the probe for a restart whose previous run really did die, which
 // is the common case after a crash and the one §9.10 converges from with no
-// human. groupAlive is the opposite: the process group outlived the daemon, which
+// human. domainLive is the opposite: the execution domain outlived the daemon, which
 // a kill makes reachable because every attempt runs in its own group.
 var (
-	groupGone  = func(core.RunEvidence) (bool, error) { return true, nil }
-	groupAlive = func(core.RunEvidence) (bool, error) { return false, nil }
+	domainQuiet = func(core.RunEvidence) (bool, error) { return true, nil }
+	domainLive  = func(core.RunEvidence) (bool, error) { return false, nil }
 )
 
 func writeWorkflow(t *testing.T, content string) string {

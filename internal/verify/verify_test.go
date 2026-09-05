@@ -3,6 +3,7 @@ package verify
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/srhg-ai-7cef3f93/ben/internal/core"
@@ -41,11 +42,17 @@ const (
 )
 
 func ws() core.Workspace {
-	return core.Workspace{WorkspacePaths: core.WorkspacePaths{Path: "/tmp/ben/7"}, Key: "7", Branch: "ben/7", BaseSHA: base}
+	return core.Workspace{
+		WorkspacePaths: core.WorkspacePaths{Path: "/tmp/ben/7"},
+		Key:            "7", Branch: "ben/7", BaseSHA: base, TargetBranch: targetBranch,
+	}
 }
 
 func openPR() *core.PR {
-	return &core.PR{Number: 12, URL: "https://example.test/pull/12", State: "open", Branch: "ben/7"}
+	return &core.PR{
+		Number: 12, URL: "https://example.test/pull/12", State: "open",
+		Branch: "ben/7", BaseBranch: targetBranch,
+	}
 }
 
 // published is the facts shape where both git legs hold, so the tracker leg
@@ -232,6 +239,55 @@ func TestVerifyRefusesAPRForAnotherBranch(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestVerifyBindsThePullRequestToTheClaimTarget(t *testing.T) {
+	t.Run("wrong target is contradictory evidence", func(t *testing.T) {
+		pr := openPR()
+		pr.BaseBranch = "unprotected"
+		got, err := newChecker(t, &fakeWorkspaces{facts: published()}, &fakeTracker{pr: pr}).
+			Verify(context.Background(), core.Issue{Identifier: "7"}, ws())
+		if err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if got.Verdict != VerdictContradicted || !strings.Contains(got.Detail, "targets unprotected, not main") {
+			t.Fatalf("Verify = %+v, want wrong-target contradiction", got)
+		}
+	})
+
+	t.Run("missing target fact is a broken tracker contract", func(t *testing.T) {
+		pr := openPR()
+		pr.BaseBranch = ""
+		got, err := newChecker(t, &fakeWorkspaces{facts: published()}, &fakeTracker{pr: pr}).
+			Verify(context.Background(), core.Issue{Identifier: "7"}, ws())
+		if !errors.Is(err, ErrPRTargetMissing) || got != (Result{}) {
+			t.Fatalf("Verify = %+v, %v; want zero result and ErrPRTargetMissing", got, err)
+		}
+	})
+
+	t.Run("missing workspace target is non-authorizing", func(t *testing.T) {
+		workspace := ws()
+		workspace.TargetBranch = ""
+		workspaces := &fakeWorkspaces{facts: published()}
+		tracker := &fakeTracker{pr: openPR()}
+		got, err := newChecker(t, workspaces, tracker).
+			Verify(context.Background(), core.Issue{Identifier: "7"}, workspace)
+		if !errors.Is(err, ErrTargetBranchMissing) || got != (Result{}) {
+			t.Fatalf("Verify = %+v, %v; want zero result and ErrTargetBranchMissing", got, err)
+		}
+		if workspaces.calls != 0 || tracker.calls != 0 {
+			t.Fatal("a targetless workspace reached an evidence source")
+		}
+	})
+
+	t.Run("ambiguity is never reduced to a candidate", func(t *testing.T) {
+		tracker := &fakeTracker{err: core.ErrPRAmbiguous}
+		got, err := newChecker(t, &fakeWorkspaces{facts: published()}, tracker).
+			Verify(context.Background(), core.Issue{Identifier: "7"}, ws())
+		if !errors.Is(err, core.ErrPRAmbiguous) || got != (Result{}) {
+			t.Fatalf("Verify = %+v, %v; want zero result and ErrPRAmbiguous", got, err)
+		}
+	})
 }
 
 // The provider skips the remote probe only when leg 1 has already failed, so

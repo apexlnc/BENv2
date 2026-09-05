@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -52,8 +53,8 @@ type Provider struct {
 	Settings        string
 	AllowedTools    []string
 	DisallowedTools []string
-	// AddDirs grants tool access outside the workspace (--add-dir). Empty is
-	// the norm: the workspace is the boundary.
+	// AddDirs grants tool access outside the workspace (--add-dir). Absolute
+	// paths only (checkAddDirs); empty is the norm: the workspace is the boundary.
 	AddDirs []string
 	// Env holds extra child environment entries. Not the publish credential:
 	// that has a top-level block of its own, and this surface may not spell the
@@ -245,6 +246,9 @@ func ParseProvider(cfg core.AgentConfig) (Provider, error) {
 	if p.AddDirs, err = b.Strings("add_dirs"); err != nil {
 		return Provider{}, err
 	}
+	if err := checkAddDirs(p.AddDirs); err != nil {
+		return Provider{}, err
+	}
 	if p.EnvPassthrough, err = b.Strings("env_passthrough"); err != nil {
 		return Provider{}, err
 	}
@@ -321,6 +325,19 @@ func ParseProvider(cfg core.AgentConfig) (Provider, error) {
 	}
 
 	return p, nil
+}
+
+// checkAddDirs refuses a write grant whose meaning depends on the harness cwd.
+// Assembly compares these paths with daemon-only state before any run starts,
+// so the adapter must state each one absolutely.
+func checkAddDirs(dirs []string) error {
+	for i, dir := range dirs {
+		if !filepath.IsAbs(dir) {
+			return harness.ValueRefusalIndex("add_dirs", i, dir,
+				fmt.Errorf("%w: add_dirs entry must be an absolute path so daemon-only state can be kept outside it", ErrProviderValue))
+		}
+	}
+	return nil
 }
 
 // checkSettingsPath keeps inline JSON out of `settings`. The flag accepts
@@ -401,13 +418,19 @@ func (p Provider) checkRuntime(ctx context.Context, path string, publish harness
 	probe := p.probeCommand(sandboxBinary, private, path)
 	out, err := probe(ctx, t, env, "--version")
 	if err != nil {
-		return fmt.Errorf("%w: %s --version failed: %v", ErrBinary, path, err)
+		// Wrapped, not formatted: a probe refused for flooding its output
+		// (harness.ErrProbeOutput) is a different fact about the binary from one
+		// that exited non-zero, and the caller should be able to tell them apart.
+		return fmt.Errorf("%w: %s --version failed: %w", ErrBinary, path, err)
 	}
 	// `2.1.221 (Claude Code)` — the marker, not the number: pinning a minimum
 	// version would refuse harness upgrades we have no evidence to refuse.
+	//
+	// Quoted as an excerpt (#235): the capture is bounded, and a refusal is not
+	// the place for even that much of it.
 	if !strings.Contains(string(out), "Claude Code") {
 		return fmt.Errorf("%w: %s --version does not identify as Claude Code: %q",
-			ErrBinary, path, strings.TrimSpace(string(out)))
+			ErrBinary, path, harness.Excerpt(strings.TrimSpace(string(out)), harness.ProbeExcerpt))
 	}
 	return p.checkAuth(ctx, path, env, t, probe)
 }

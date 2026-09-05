@@ -732,3 +732,20 @@ Recorded so the build doesn't re-litigate them; each is small and reversible:
     `ClaimHistory` remains one read per observed revision change, and settled releases remain
     owed writes. Neither cost is folded into this confirmation budget: changing either is a
     separate policy decision.
+18. **One claim-scoped base/target branch applies on both substrates** (#152; SPEC §5.2.4,
+    §5.6, §6.2, §9.7; accepted ticketprep packet
+    `sha256:772099818aff9bd25682abe88cbc6852c8cb828b650c91fc4019b7dd7b6974be`).
+    `workspace.base_branch` is one unqualified branch selector, not separate base and publish
+    settings. Omission resolves the repository default when a new assignment epoch first
+    prepares. The selected target is stored atomically with that epoch's verification base and
+    retained across retry, rollback, reload, restart, and default movement. Prompt
+    `target_branch` is trusted guidance; exact PR-base equality is authoritative evidence.
+
+    Local `FindPR` and the remote fact source share one cardinality rule: zero exact-head open
+    PRs is incomplete, one supplies its full facts, and a second is `core.ErrPRAmbiguous`
+    regardless of update order or target. The Airlock mirror, not workflow state or sandbox
+    state, selects and stores each remote claim's target; remote verification reads that claim
+    record. A targetless pre-amendment local, mirror, or remote-cycle record authorizes no
+    same-epoch prepare, restore, prompt, verification, hook, or launch. After the §9.10
+    empty-principal deployment drain, only a later assignment epoch may preserve valid outgoing
+    base/cycle facts and replace the record with a complete tuple.

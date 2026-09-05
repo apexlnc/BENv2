@@ -56,7 +56,7 @@ func TestARecoveredFailedCommentNamesTheReasonOrSaysItDidNot(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := start(t, harnessOpts{runGone: groupGone})
+			h := start(t, harnessOpts{runGone: domainQuiet})
 			issue := fake.Issue("1", epoch)
 			h.Tracker.Set(issue)
 			if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -70,7 +70,7 @@ func TestARecoveredFailedCommentNamesTheReasonOrSaysItDidNot(t *testing.T) {
 			}
 			pinClaimBaseForRecovery(t, h, "1")
 
-			if err := h.restart(harnessOpts{runGone: groupGone, failures: tc.reader}); err != nil {
+			if err := h.restart(harnessOpts{runGone: domainQuiet, failures: tc.reader}); err != nil {
 				t.Fatalf("Recover: %v", err)
 			}
 			// §9.10 forbids skipping this comment: a ben:failed label with no
@@ -96,7 +96,7 @@ func TestARecoveredFailedCommentNamesTheReasonOrSaysItDidNot(t *testing.T) {
 // comment is identical, so collapsing the two would publish "the reason did not
 // survive" on a host where it was sitting right there.
 func TestAnUnreadableTransitionLogRetainsRatherThanClaimingTheReasonIsGone(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	h.Tracker.Set(issue)
 	if _, err := h.Tracker.Claim(context.Background(), issue); err != nil {
@@ -109,7 +109,7 @@ func TestAnUnreadableTransitionLogRetainsRatherThanClaimingTheReasonIsGone(t *te
 
 	corrupt := errors.New("transition log is truncated")
 	failures := newFailures(stubFailures{err: corrupt})
-	if err := h.restart(harnessOpts{runGone: groupGone, failures: failures}); err != nil {
+	if err := h.restart(harnessOpts{runGone: domainQuiet, failures: failures}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -142,14 +142,14 @@ func TestAnUnreadableTransitionLogDoesNotBlockOtherVerdicts(t *testing.T) {
 		issues:  []core.Issue{fake.Issue("1", epoch)},
 		script:  startedOnly,
 		hang:    true,
-		runGone: groupGone,
+		runGone: domainQuiet,
 	})
 	h.WaitState("1", StateRunning)
 	// Merged and closed while the daemon was down: gate 1, which never reads the log.
 	h.Tracker.Mutate("1", func(i *core.Issue) { i.State = "closed" })
 
 	if err := h.restart(harnessOpts{
-		runGone:  groupGone,
+		runGone:  domainQuiet,
 		verifier: incompleteEvidence,
 		failures: stubFailures{err: errors.New("transition log is truncated")},
 	}); err != nil {
@@ -195,7 +195,7 @@ func TestAFailureReasonFromAPreviousClaimCycleIsNotThisOne(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := start(t, harnessOpts{runGone: groupGone})
+			h := start(t, harnessOpts{runGone: domainQuiet})
 			issue := fake.Issue("1", epoch)
 			h.Tracker.Set(issue)
 
@@ -221,7 +221,7 @@ func TestAFailureReasonFromAPreviousClaimCycleIsNotThisOne(t *testing.T) {
 				failedAt = cycleBegan
 			}
 			if err := h.restart(harnessOpts{
-				runGone:  groupGone,
+				runGone:  domainQuiet,
 				failures: datedFailure{at: failedAt, reason: core.FailureStalled},
 			}); err != nil {
 				t.Fatalf("Recover: %v", err)
@@ -259,7 +259,7 @@ func (d datedFailure) LastFailure(string) (core.RunFailure, bool, error) {
 // applying a rule that never ran; the honest answer is that nothing established
 // this failure as current.
 func TestAnUndatedClaimAnchorReportsTheReasonAsNotSurvived(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	issue := fake.Issue("1", epoch)
 	issue.Assignees = []string{fake.DefaultPrincipal}
 	h.Tracker.Set(issue)
@@ -274,7 +274,7 @@ func TestAnUndatedClaimAnchorReportsTheReasonAsNotSurvived(t *testing.T) {
 	pinClaimBaseForRecovery(t, h, "1")
 
 	if err := h.restart(harnessOpts{
-		runGone:  groupGone,
+		runGone:  domainQuiet,
 		failures: datedFailure{at: epoch, reason: core.FailureStalled},
 	}); err != nil {
 		t.Fatalf("Recover: %v", err)

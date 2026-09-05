@@ -7,6 +7,15 @@
 // reports a verdict, not an action: an unpublished-but-clean run and an
 // unpublished run out of turns produce the same evidence and route
 // differently (§9.6), and only the orchestrator knows which it is holding.
+//
+// There are two checkers over one closed verdict, and the difference between
+// them is where a fact may come from. Checker, in this file, serves a run BEN
+// hosted: its git legs are read off the daemon's own worktree and base
+// repository. RemoteChecker (remote.go) serves a run BEN did not host, where
+// nothing inside the run's own environment is evidence at all — so the legs keep
+// their meaning and change their sources. SelectPublication (select.go) binds an
+// attempt to the one that may judge it, and refuses rather than falling back:
+// pointing either at the other's attempt is a hole, not a degradation.
 package verify
 
 import (
@@ -30,6 +39,15 @@ var ErrPRNotOpen = errors.New("verify: tracker returned a pull request that is n
 // supply leg 3 for a branch that never got one. Same reasoning as
 // ErrPRNotOpen: the tracker broke its contract, so there is no reading to pick.
 var ErrPRBranchMismatch = errors.New("verify: tracker returned a pull request for a different branch")
+
+// ErrPRTargetMissing refuses a pull request whose target fact is absent. A
+// missing fact is not evidence that the configured target matched.
+var ErrPRTargetMissing = errors.New("verify: tracker returned a pull request without its target branch")
+
+// ErrTargetBranchMissing refuses a workspace whose durable claim record did
+// not supply a target. Providers reject legacy records earlier; this is the
+// verifier's fail-closed backstop.
+var ErrTargetBranchMissing = errors.New("verify: workspace carries no claim-scoped target branch")
 
 // ErrRemoteUnprobed refuses git facts whose remote legs were never read on a
 // branch that did advance past its base. The provider skips the probe only
@@ -126,6 +144,9 @@ func New(workspaces Workspaces, tracker Tracker) (*Checker, error) {
 // runs, and the tracker read only happens for a run whose commits are already
 // on origin.
 func (c *Checker) Verify(ctx context.Context, issue core.Issue, ws core.Workspace) (Result, error) {
+	if ws.TargetBranch == "" {
+		return Result{}, ErrTargetBranchMissing
+	}
 	facts, err := c.workspaces.PublishFacts(ctx, ws)
 	if err != nil {
 		return Result{}, fmt.Errorf("verify: reading git evidence for %s: %w", issue.Identifier, err)
@@ -182,6 +203,13 @@ func (c *Checker) Verify(ctx context.Context, issue core.Issue, ws core.Workspac
 	if pr.Branch != ws.Branch {
 		return Result{}, fmt.Errorf("%w: #%d is on %q, asked for %q",
 			ErrPRBranchMismatch, pr.Number, pr.Branch, ws.Branch)
+	}
+	if pr.BaseBranch == "" {
+		return Result{}, fmt.Errorf("%w: #%d on %s", ErrPRTargetMissing, pr.Number, ws.Branch)
+	}
+	if pr.BaseBranch != ws.TargetBranch {
+		return contradicted("pull request #%d targets %s, not %s",
+			pr.Number, pr.BaseBranch, ws.TargetBranch), nil
 	}
 	return Result{Verdict: VerdictPublished, PRURL: pr.URL}, nil
 }

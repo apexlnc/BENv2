@@ -46,12 +46,12 @@ func TestAKilledDaemonRecoversAndConverges(t *testing.T) {
 		// probe is what the restarted daemon's run prober answers about the run
 		// the dead one left behind.
 		probe func(core.RunEvidence) (bool, error)
-		// outlived says the process group survived the daemon, so recovery must
+		// outlived says the execution domain survived the daemon, so recovery must
 		// wait before it may reuse the workspace.
 		outlived bool
 	}{
-		{name: "the agent died with the daemon", probe: groupGone},
-		{name: "the agent outlived the daemon", probe: groupAlive, outlived: true},
+		{name: "the agent died with the daemon", probe: domainQuiet},
+		{name: "the agent outlived the daemon", probe: domainLive, outlived: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := start(t, scenarioConfig{
@@ -70,7 +70,7 @@ func TestAKilledDaemonRecoversAndConverges(t *testing.T) {
 							return []core.Event{{Type: core.EventStarted, SessionID: "s1", Continuation: "s1"}}
 						}
 						h.Tracker.SetPR("ben/issue-7", core.PR{
-							Number: 41, URL: resumedPR, State: "open", Branch: "ben/issue-7",
+							Number: 41, URL: resumedPR, State: "open", Branch: "ben/issue-7", BaseBranch: "main",
 						})
 						return fake.Succeed("s2")
 					})
@@ -84,9 +84,13 @@ func TestAKilledDaemonRecoversAndConverges(t *testing.T) {
 				m, ok := h.Workspaces.RunMarkerFor("7")
 				return ok && m.State == core.RunMarkerIdentified
 			})
-			if got := h.Tracker.Label("7"); got != core.StateLabelRunning {
-				t.Fatalf("label = %q before the kill, want %q — the fixture is not at the kill point", got, core.StateLabelRunning)
-			}
+			// waitRunning answers about the record; the tracker projection it owes is
+			// asynchronous. The projected label is the kill-point fact this fixture
+			// preserves across restart, so wait for that fact rather than sampling the
+			// effects goroutine mid-turn.
+			h.waitFor("the running projection before the kill", func() bool {
+				return h.Tracker.Label("7") == core.StateLabelRunning
+			})
 			base := h.Workspaces.Prepares("7")[0].BaseSHA
 
 			// The kill, in two steps, because they are two events and their order is
@@ -159,7 +163,7 @@ func TestAKilledDaemonRecoversAndConverges(t *testing.T) {
 					t.Errorf("marker = %+v (present=%v); only proof of absence removes one (SPEC §9.10)", m, ok)
 				}
 
-				// And it converges once the group is confirmed gone, with no human —
+				// And it converges once the domain is confirmed quiet, with no human —
 				// which is the reason §9.10 waits rather than parking.
 				//
 				// The run ends first and the probe answers afterwards, in that order:
@@ -167,7 +171,7 @@ func TestAKilledDaemonRecoversAndConverges(t *testing.T) {
 				// would describe two worlds at once, and a scenario built on it would
 				// be resuming into a workspace something is still writing.
 				endAgent(t, agent)
-				h.Prober.set(groupGone)
+				h.Prober.set(domainQuiet)
 			} else if m, ok := h.Workspaces.RunMarkerFor("7"); ok {
 				// The other side of the same rule: a marker comes off exactly when
 				// its run is proved gone, and recovery proved it just now. Leaving it
@@ -235,7 +239,7 @@ func TestAKilledDaemonRecoversAndConverges(t *testing.T) {
 	}
 }
 
-// endAgent ends a run and refuses to go on until its group is quiet.
+// endAgent ends a run and refuses to go on until its domain is quiet.
 //
 // The check is a precondition, not a test of the fake: every caller's next act is
 // to let a prober report that group as gone, and a probe answering "unconfirmed"
@@ -299,7 +303,7 @@ func TestARestartFinishesTheProjectionItDiedInsideOf(t *testing.T) {
 			name: "after the assignment landed and before pending is durable",
 			arrange: func(h *scenario) {
 				h.Tracker.SetPR("ben/issue-7", core.PR{
-					Number: 51, URL: resumedPR, State: "open", Branch: "ben/issue-7",
+					Number: 51, URL: resumedPR, State: "open", Branch: "ben/issue-7", BaseBranch: "main",
 				})
 				// §9.5's content read is what stands between a verified claim and the
 				// first projection, and a read that failed is retried with the claim
@@ -340,7 +344,7 @@ func TestARestartFinishesTheProjectionItDiedInsideOf(t *testing.T) {
 			name: "after pending is durable and before ben:claimed",
 			arrange: func(h *scenario) {
 				h.Tracker.SetPR("ben/issue-7", core.PR{
-					Number: 51, URL: resumedPR, State: "open", Branch: "ben/issue-7",
+					Number: 51, URL: resumedPR, State: "open", Branch: "ben/issue-7", BaseBranch: "main",
 				})
 				h.Tracker.FailLabel = func(_ string, label core.StateLabel) error {
 					if label == core.StateLabelClaimed {
@@ -375,7 +379,7 @@ func TestARestartFinishesTheProjectionItDiedInsideOf(t *testing.T) {
 			name: "mid-done: the labels are cleared and the publish comment is not posted",
 			arrange: func(h *scenario) {
 				h.Tracker.SetPR("ben/issue-7", core.PR{
-					Number: 52, URL: resumedPR, State: "open", Branch: "ben/issue-7",
+					Number: 52, URL: resumedPR, State: "open", Branch: "ben/issue-7", BaseBranch: "main",
 				})
 				commentLost.Store(true)
 				h.Tracker.FailComment = func(_ string, m core.Milestone) error {
@@ -507,13 +511,30 @@ func TestARestartFinishesTheProjectionItDiedInsideOf(t *testing.T) {
 			window: func(t *testing.T, h *scenario) {
 				// A retryable failure leaves the loop's own ben:claimed standing with
 				// no run in flight, which is the state a park decision would be taken
-				// from — a §9.6 re-fetch that found content drift, say.
-				h.settle("7", orchestrator.StateBackoff)
-				if got := h.Tracker.Label("7"); got != core.StateLabelClaimed {
-					t.Fatalf("label = %q, want %q — the fixture needs a projection to interrupt", got, core.StateLabelClaimed)
-				}
-				if m, ok := h.Workspaces.RunMarkerFor("7"); ok {
-					t.Fatalf("marker = %+v; the attempt's marker should have been cleared when its run was confirmed gone", m)
+				// from — a §9.6 re-fetch that found content drift, say. Wait passively
+				// on the append-only transition: settle advances the manual poll clock,
+				// which can fire the retry before this crash window has been built.
+				h.waitFor("the first attempt's backoff transition", func() bool {
+					return h.reached("7", orchestrator.StateBackoff)
+				})
+				// The transition answers about the *record*, and both facts this fixture is
+				// built on are behind it: the projection is a serial effect the
+				// record's arrival owed, and the marker clear runs in a goroutine of
+				// its own (orchestrator/marker.go). Reading either the instant the
+				// state lands samples the daemon mid-turn — which is #276, and is
+				// what put `label = "running", want "claimed"` in CI. Waiting on the
+				// label *is* the acknowledgement here: the effect has landed on the
+				// tracker, which is the only thing InterruptStateLabels below can
+				// build on.
+				h.waitFor("ben:claimed on issue 7 — the fixture needs a projection to interrupt", func() bool {
+					return h.Tracker.Label("7") == core.StateLabelClaimed
+				})
+				h.waitFor("the attempt's run marker to be cleared, which its run being confirmed gone owes", func() bool {
+					_, ok := h.Workspaces.RunMarkerFor("7")
+					return !ok
+				})
+				if n := h.dispatches("7"); n != 1 {
+					t.Fatalf("prepared %d workspaces before the crash window, want the first attempt only", n)
 				}
 
 				// The park's first write lands and its second does not.

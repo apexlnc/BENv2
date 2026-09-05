@@ -1145,3 +1145,74 @@ func TestReloadRefusesToChangeTheDeploymentDeclaration(t *testing.T) {
 	atomicSave(t, path, changedPrompt)
 	waitFor(t, "the block to lift once the file agrees again", func() bool { return w.Snapshot().Blocked == nil })
 }
+
+// The substrate declaration is process-lifetime too (#194), for a reason of its
+// own: outstanding claims hold sandbox ids, run bindings and event cursors
+// addressed against the backend they were dispatched to.
+func TestReloadRefusesToChangeTheSubstrateDeclaration(t *testing.T) {
+	rec := &reloadRecorder{}
+	path := writeWorkflow(t, changedPrompt)
+	w, err := Watch(context.Background(), path, WatchOptions[*testRuntime]{Debounce: testDebounce, BuildRuntime: rec.build})
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	defer w.Close() //nolint:errcheck // Close is idempotent
+	good := w.Snapshot()
+	if good.Definition.Config.Substrate.Kind != SubstrateKindLocal {
+		t.Fatalf("fixture declares %q; this test needs a known starting substrate", good.Definition.Config.Substrate.Kind)
+	}
+
+	atomicSave(t, path, strings.Replace(changedPrompt, "agent:\n", `credential_sources:
+  airlock:
+    kind: static
+    value: $AIRLOCK_TOKEN
+substrate:
+  kind: airlock
+  airlock:
+    base_url: https://airlock.internal
+    profile: ben-agent
+    auth_source: airlock
+agent:
+`, 1))
+	waitFor(t, "the substrate change to block dispatch", func() bool { return w.Snapshot().Blocked != nil })
+
+	if !errors.Is(w.Snapshot().Blocked, ErrSubstrateChanged) {
+		t.Errorf("blocked with %v, want ErrSubstrateChanged", w.Snapshot().Blocked)
+	}
+	if got := w.Snapshot(); got.Definition != good.Definition {
+		t.Error("a changed substrate declaration was adopted")
+	}
+	if msg := w.Snapshot().Blocked.Error(); !strings.Contains(msg, "local") || !strings.Contains(msg, "airlock") {
+		t.Errorf("refusal %q does not name both declarations", msg)
+	}
+
+	// Putting it back is the transient-failure case, exactly as above.
+	atomicSave(t, path, changedPrompt)
+	waitFor(t, "the block to lift once the file agrees again", func() bool { return w.Snapshot().Blocked == nil })
+}
+
+// The credential definition is part of the process-lifetime substrate
+// identity. Keeping auth_source's name unchanged must not smuggle a different
+// authority into the already-constructed backend on reload.
+func TestReloadRefusesToChangeTheSubstrateCredentialDefinition(t *testing.T) {
+	t.Setenv("TRACKER_PAT", "tracker-secret")
+	rec := &reloadRecorder{}
+	path := writeWorkflow(t, validAirlock)
+	w, err := Watch(context.Background(), path, WatchOptions[*testRuntime]{Debounce: testDebounce, BuildRuntime: rec.build})
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	defer w.Close() //nolint:errcheck // Close is idempotent
+	good := w.Snapshot()
+
+	changed := strings.Replace(validAirlock, "value: $AIRLOCK_TOKEN", "value: $OTHER_AIRLOCK_TOKEN", 1)
+	atomicSave(t, path, changed)
+	waitFor(t, "the substrate credential change to block dispatch", func() bool { return w.Snapshot().Blocked != nil })
+
+	if !errors.Is(w.Snapshot().Blocked, ErrSubstrateChanged) {
+		t.Errorf("blocked with %v, want ErrSubstrateChanged", w.Snapshot().Blocked)
+	}
+	if got := w.Snapshot(); got.Definition != good.Definition || got.Runtime != good.Runtime {
+		t.Error("a changed substrate credential definition was adopted")
+	}
+}

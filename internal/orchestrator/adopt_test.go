@@ -32,6 +32,19 @@ func TestAdoptIdentityRefusesWhileWorkIsOutstanding(t *testing.T) {
 		{"a held claim", func(o *Orchestrator) {
 			o.held["1"] = &heldClaim{issue: fake.Issue("1", epoch), cycleAnchor: 1}
 		}, false},
+		{
+			// An ended workspace cycle owing its disposal, and the only one of these
+			// three that can be outstanding with neither a record nor a held claim
+			// behind it (#252, cycle.go). It names a cycle address in *this*
+			// provider's store, so carrying it across an identity change would ask a
+			// different backend under a different principal to dispose an address it
+			// never issued.
+			"an ended workspace cycle's disposal", func(o *Orchestrator) {
+				o.endedCycles = map[string]*endedCycle{
+					"1": {workspace: core.Workspace{Key: "issue-1"}, why: "issue went terminal"},
+				}
+			}, false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			o, _ := idleWithSource(t, fake.NewTracker())
@@ -132,17 +145,17 @@ func TestTheQuiescenceAdvisoryRefusesWhateverTheBarrierRefuses(t *testing.T) {
 			return h
 		}},
 		{"a candidate scan that has not resolved", func(t *testing.T) *harness {
-			h := start(t, harnessOpts{runGone: groupGone})
+			h := start(t, harnessOpts{runGone: domainQuiet})
 			h.Tracker.SetFailClaimedByPrincipal(errors.New("tracker unavailable"))
-			if err := h.restart(harnessOpts{runGone: groupGone, recoverErr: true}); err == nil {
+			if err := h.restart(harnessOpts{runGone: domainQuiet, recoverErr: true}); err == nil {
 				t.Fatal("the startup scan was supposed to fail, leaving it owed")
 			}
 			return h
 		}},
 		{"a workspace §9.10 step 5 deferred", func(t *testing.T) *harness {
-			h := start(t, harnessOpts{runGone: groupGone})
+			h := start(t, harnessOpts{runGone: domainQuiet})
 			deferredResidue(t, h, "9")
-			if err := h.restart(harnessOpts{runGone: groupAlive}); err != nil {
+			if err := h.restart(harnessOpts{runGone: domainLive}); err != nil {
 				t.Fatalf("Recover: %v", err)
 			}
 			waitFor(t, "the residue to be deferred", func() bool {
@@ -212,7 +225,7 @@ func TestTheQuiescenceAdvisoryIsCurrentBeforeTheLoopStarts(t *testing.T) {
 				State:    core.RunMarkerIdentified,
 				Evidence: core.RunEvidence{Scheme: core.RunEvidenceLocal, ID: "999", Boot: "boot-1"},
 			})
-			o, _ := idleWithAdapters(t, tracker, ws, groupAlive)
+			o, _ := idleWithAdapters(t, tracker, ws, domainLive)
 			return o, true
 		}},
 	} {
@@ -247,10 +260,10 @@ func TestTheQuiescenceAdvisoryIsCurrentBeforeTheLoopStarts(t *testing.T) {
 // scan the new root, and once this process exits nothing ever looks at the old one
 // again.
 func TestAnIdentityReloadIsRefusedWhileWorkspaceCleanupIsOutstanding(t *testing.T) {
-	h := start(t, harnessOpts{runGone: groupGone})
+	h := start(t, harnessOpts{runGone: domainQuiet})
 	deferredResidue(t, h, "9")
 
-	probe := newProber(groupAlive)
+	probe := newProber(domainLive)
 	if err := h.restart(harnessOpts{runGone: probe.probe}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -276,7 +289,7 @@ func TestAnIdentityReloadIsRefusedWhileWorkspaceCleanupIsOutstanding(t *testing.
 
 	// And it is a deferral, not a refusal: the run ends, the promise is kept, and the
 	// same publication is then permitted.
-	probe.set(groupGone)
+	probe.set(domainQuiet)
 	h.tickUntil("the deferred workspace to be swept", func() bool {
 		return len(h.Workspaces.Disposals("9")) > 0
 	})
@@ -304,7 +317,7 @@ func TestAnIdentityReloadIsRefusedWhileARunMarkerRemovalIsOwed(t *testing.T) {
 	h := start(t, harnessOpts{
 		issues:      []core.Issue{fake.Issue("1", epoch)},
 		prepareGate: func() { <-ready },
-		runGone:     groupGone,
+		runGone:     domainQuiet,
 	})
 	// A launch that never happens leaves a marker describing nothing, and clearing it
 	// is what fails — so the removal stays owed while the record itself terminalizes

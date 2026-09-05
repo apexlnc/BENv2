@@ -1,0 +1,30 @@
+scenario: rewritten-evidence
+schema_version: 1
+
+step 1: start until=needs-review
+observed:
+  - issue=7 state=needs-review attempt=1 turns=0 failure=none
+  - labels=[ben-queue ben:needs-review]
+  - assignees=[ben-bot]
+  - milestones=[claimed needs-review]
+  - prepares=1 runs=1 releases=0 disposals=0
+  - detail="branch ben/issue-7 at bbbbbbbbbbbb does not descend from its claim-time base 111111111111: history was rewritten"
+decisions:
+  - queued -> claimed: selected by dispatch; claim verified by read-back
+  - claimed -> preparing: claim verified
+  - preparing -> running: worktree ready, before_run passed, agent started
+  - running -> verifying: runner reported succeeded
+  - verifying -> needs-review: branch ben/issue-7 at bbbbbbbbbbbb does not descend from its claim-time base 111111111111: history was rewritten
+effects:
+  - tracker: claim 7
+  - tracker: label 7=claimed
+  - tracker: comment 7=claimed
+  - tracker: label 7=running
+  - tracker: label 7=claimed
+  - tracker: label 7=needs-review
+  - tracker: comment 7=needs-review
+  - workspace: prepare issue=7 attempt=1 epoch=2 base=1111111111111111111111111111111111111111
+  - runner: start #1
+  - workspace: run marker write #1
+  - workspace: run marker clear #1
+next: human review or a new approval fact

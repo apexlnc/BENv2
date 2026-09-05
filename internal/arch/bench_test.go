@@ -148,6 +148,32 @@ func TestTheReachabilityCheckIsARealTrigger(t *testing.T) {
 			want: true,
 		},
 		{
+			// #243: the bridge the walk used to skip. The edge into the testdata
+			// package was built and the node never visited, so the search stopped
+			// one hop short of the measurement.
+			name: "the daemon reaching the benchmark through a testdata package",
+			files: map[string]string{
+				"cmd/ben/main.go":                 "package main\n\nimport _ \"example.com/outer/internal/x/testdata/y\"\n",
+				"internal/x/testdata/y/helper.go": "package y\n\nimport _ \"example.com/outer/internal/bench\"\n",
+				"internal/bench/cohort.go":        "package bench\n",
+			},
+			want: true,
+		},
+		{
+			// The same bridge by the route that survives the import rule above: a
+			// test file may name a testdata package, and importGraph counts test
+			// files on purpose.
+			name: "a test file bridging the daemon's own package to the benchmark",
+			files: map[string]string{
+				"cmd/ben/main.go":                 "package main\n\nimport _ \"example.com/outer/internal/x\"\n",
+				"internal/x/x.go":                 "package x\n",
+				"internal/x/x_test.go":            "package x\n\nimport _ \"example.com/outer/internal/x/testdata/y\"\n",
+				"internal/x/testdata/y/helper.go": "package y\n\nimport _ \"example.com/outer/internal/bench\"\n",
+				"internal/bench/cohort.go":        "package bench\n",
+			},
+			want: true,
+		},
+		{
 			name: "the same packages with the loop importing the state dir instead",
 			files: map[string]string{
 				"cmd/ben/main.go":               "package main\n\nimport _ \"example.com/outer/internal/orchestrator\"\n",
@@ -197,6 +223,13 @@ func moduleRelative(importPath string) (string, bool) {
 // asserting something about the loop from measurement data, which is the same
 // coupling the rule forbids, arriving by a route nobody reviews as production
 // code.
+//
+// Packages under testdata count too, for the same reason and a sharper one
+// (#243). They are importable by module path, so they are graph *nodes*, not
+// just edge targets: skipping them still built the edge into a testdata package
+// and then never visited it, which ended the search one hop short of
+// `internal/x_test.go -> internal/x/testdata/y -> internal/bench`. A helper a
+// test file may legitimately import is exactly where that bridge would sit.
 func importGraph(root string) (map[string][]string, error) {
 	graph := map[string][]string{}
 	// The synthetic trees in the trigger test use their own module path, so the
@@ -207,7 +240,7 @@ func importGraph(root string) (map[string][]string, error) {
 			return err
 		}
 		if d.IsDir() {
-			if path != root && (ignoredPackageDir(d.Name()) || isModuleRoot(path)) {
+			if path != root && (ignoredImportDir(d.Name()) || isModuleRoot(path)) {
 				return filepath.SkipDir
 			}
 			return nil

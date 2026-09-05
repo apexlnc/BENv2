@@ -86,10 +86,49 @@ func TestRenderMilestoneStatesAnUnavailableReason(t *testing.T) {
 	for _, reason := range []core.FailureReason{
 		core.FailureCrashed, core.FailureStalled, core.FailureTimeout, core.FailureRateLimited,
 		core.FailureAuth, core.FailureLaunchError, core.FailureKilled, core.FailureBudgetExceeded,
+		core.FailureCredential, core.FailureOutputOverflow,
 	} {
 		if strings.Contains(body, string(reason)) {
 			t.Errorf("body invents the §7.3 reason %q:\n%s", reason, body)
 		}
+	}
+}
+
+// The published milestone is an interface, not only a notification: #11's
+// review controller reads the pull request link out of it, from the field line
+// and never from the headline. That coupling has two halves, and this is the
+// producing one — internal/review pins the parse, and neither test can see the
+// other half drift on its own.
+//
+// The headline is deliberately *not* asserted here beyond its own test above:
+// rewording it is allowed, and must stay allowed, precisely because nothing
+// machine-readable depends on it.
+func TestPublishedMilestoneCarriesTheLinkAsAField(t *testing.T) {
+	const url = "https://github.com/acme/widgets/pull/9"
+	body, err := renderMilestone(
+		core.MilestoneComment{Milestone: core.MilestonePublished, PRURL: url},
+		"build-box/ben-1a2b3c4d", testLogin)
+	if err != nil {
+		t.Fatalf("renderMilestone: %v", err)
+	}
+
+	// The exact line shape internal/review's publishedPRLink cuts on: a
+	// `- pull request: ` prefix at the start of a line, and the URL alone
+	// after it.
+	const field = "- pull request: "
+	var found int
+	for _, line := range strings.Split(body, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), field)
+		if !ok {
+			continue
+		}
+		found++
+		if strings.TrimSpace(rest) != url {
+			t.Errorf("the field line carries %q, want the bare URL %q", rest, url)
+		}
+	}
+	if found != 1 {
+		t.Fatalf("the body carries %d %q lines, want exactly one:\n%s", found, field, body)
 	}
 }
 

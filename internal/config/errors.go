@@ -53,6 +53,51 @@ func (e *CredentialAuthorityError) Error() string {
 
 func (e *CredentialAuthorityError) Unwrap() error { return errCredentialAuthorityShared }
 
+// SubstrateCredentialError reports a workflow whose v2 backend credential is
+// also one of §10.2's two (#194).
+//
+// A separate type rather than a third pair of fields on the one above, because
+// the *argument* is different and a message that merged them would state
+// neither. The tracker↔publish refusal is about an agent rewriting its own
+// queue; this one is about the blast radius of a sandbox-provisioning
+// credential: a token that can create and delete execution environments has no
+// business also being the one that writes issues, and certainly not the one
+// handed to the agent to push with.
+// #204 widens it to a fourth and fifth identity rather than adding a second
+// type: the review controller's credential has the same shape of argument —
+// authority that must not be one of the others — and Holder is what keeps the
+// message specific about which one collided.
+type SubstrateCredentialError struct {
+	Authority string
+	// Holder is the consumer whose own identity this is: "substrate" or
+	// "review". Empty reads as "substrate" for callers that predate the field.
+	Holder string
+	// Consumer is the consumer it collides with — "tracker", "publish" or
+	// "substrate".
+	Consumer string
+	// SubstrateName and ConsumerName are the `credential_sources` entries each
+	// side named, or "" for a legacy spelling that compiled into an implicit
+	// source.
+	SubstrateName, ConsumerName string
+}
+
+func (e *SubstrateCredentialError) Error() string {
+	holder, site, why := "execution-substrate", "substrate.airlock.auth_source",
+		"a credential that can create and destroy execution environments must not also be one "+
+			"SPEC §10.2 scopes to the forge"
+	if e.Holder == "review" {
+		holder, site, why = "review-controller", "review.auth_source",
+			"the review controller may unassign the claim principal and revoke a human's required label, "+
+				"so a credential that is also one of BEN's own would let it grant itself the work it just stopped (#11)"
+	}
+	return fmt.Sprintf(
+		"%s is both the %s credential (%s) and the %s credential (%s): %s — give %s its own identity",
+		e.Authority, holder, credentialSourceSite(e.SubstrateName), e.Consumer,
+		credentialSourceSite(e.ConsumerName), why, site)
+}
+
+func (e *SubstrateCredentialError) Unwrap() error { return errCredentialAuthorityShared }
+
 func credentialSourceSite(name string) string {
 	if name == "" {
 		return "compiled from the legacy spelling"
@@ -138,6 +183,21 @@ var (
 	// have been re-launched under a different arrangement, and `attended` asserts
 	// something about a human that editing a file does not make true.
 	ErrDeploymentChanged = errors.New("the deployment declaration cannot be changed by reload")
+	// ErrSubstrateChanged refuses a reload that edits the v2 substrate
+	// declaration (#194). Process-lifetime for a reason of its own: outstanding
+	// claims hold sandbox ids, run bindings and event cursors addressed against
+	// the backend they were dispatched to, and moving the substrate under them
+	// would strand every one of those while a live agent kept running somewhere
+	// BEN had stopped looking.
+	ErrSubstrateChanged = errors.New("the substrate declaration cannot be changed by reload")
+	// ErrReviewChanged refuses a reload that edits the #204 review-controller
+	// declaration. Process-lifetime for the substrate's reason and one of its
+	// own: review work holds durable run identities and event cursors addressed
+	// against one backend and one reviewer invocation, and the controller's
+	// identity set is what makes every author check on the forge mean anything.
+	// Moving either under an in-flight round would strand it — or, worse, route
+	// on artifacts a different identity wrote.
+	ErrReviewChanged = errors.New("the review-controller declaration cannot be changed by reload")
 	// ErrWorkOutstanding is how a Barrier says "refused for now": the rebuild
 	// would change an identity the caller's outstanding work is bound to — the
 	// principal holding its claims, the root its worktrees live under — so it

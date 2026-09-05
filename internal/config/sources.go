@@ -63,9 +63,9 @@ const PublishKindSource = "source"
 //
 // The block is **not** `$VAR`-resolved, unlike a provider block. Every field a
 // source kind defines is either a non-secret literal it prints in full
-// (`octo_sts`) or a variable reference resolved per fetch (`static`), so there
-// is nothing here to resolve at load and resolving would print a secret
-// (SPEC §5.5, §5.8, amendments 3 and 5).
+// (`octo_sts`, `projected_oidc`) or a variable reference resolved per fetch
+// (`static`), so there is nothing here to resolve at load and resolving would
+// print a secret (SPEC §5.5, §5.8, amendments 3 and 5).
 type SourceConfig struct {
 	Kind  string
 	Block map[string]any
@@ -105,6 +105,18 @@ type Credentials struct {
 	// Publish is the zero value when the workflow configures no publish
 	// credential (SPEC §5.2.8), which is not an error.
 	Publish Credential
+	// Substrate authenticates BEN to a v2 execution backend (#194). The zero
+	// value under the local substrate, which is every v1 workflow.
+	Substrate Credential
+	// Review authenticates the #204 review controller. The zero value when the
+	// controller is not enabled, which is every workflow that predates it.
+	//
+	// A fifth identity rather than a reuse of the tracker's, and #11's whole
+	// safety argument rests on it: the controller may unassign the claim
+	// principal and revoke a human's required label, and a controller holding
+	// the credential that *takes* claims could grant itself the work it just
+	// stopped.
+	Review Credential
 }
 
 // TrackerBinding is the name-free reload identity of the tracker adapter
@@ -231,8 +243,62 @@ func resolveCredentials(cfg *Config, prov Provenance) error {
 	if err != nil {
 		return err
 	}
-	cfg.Credentials = Credentials{Tracker: tracker, Publish: publish}
+	substrate, err := substrateCredential(cfg, described)
+	if err != nil {
+		return err
+	}
+	reviewCred, err := reviewCredential(cfg, described)
+	if err != nil {
+		return err
+	}
+	cfg.Credentials = Credentials{
+		Tracker: tracker, Publish: publish, Substrate: substrate, Review: reviewCred,
+	}
 	return nil
+}
+
+// reviewCredential resolves the #204 review controller's credential.
+//
+// One spelling only, for substrateCredential's reason: a consumer introduced
+// after `credential_sources` inherits no legacy, and a literal or a variable
+// read at this site would be another place credentials are spelled.
+func reviewCredential(cfg *Config, described map[string]core.SourceDescriptor) (Credential, error) {
+	name := cfg.Review.AuthSource
+	if !cfg.Review.Enabled || name == "" {
+		// validateReview refuses an enabled controller with no auth source.
+		return Credential{}, nil
+	}
+	d, ok := described[name]
+	if !ok {
+		return Credential{}, unknownSourceRef("review.auth_source", name, cfg)
+	}
+	return namedCredential(name, d), nil
+}
+
+// substrateCredential resolves the v2 backend's credential (#194).
+//
+// One spelling only — a `credential_sources` entry — where the tracker and the
+// publisher each have three. That is not an omission: the legacy spellings exist
+// because §8.4 and §5.2.8 predate the section, and a new consumer inherits no
+// legacy. A literal here would be a secret in a block `config effective` prints
+// in full, and a variable read at this site would be a fourth place credentials
+// are spelled.
+//
+// The reference is resolved rather than merely validated so the §10.2 authority
+// comparison below sees it: `auth_source` naming the same entry as the tracker
+// is the failure this whole chain exists to refuse.
+func substrateCredential(cfg *Config, described map[string]core.SourceDescriptor) (Credential, error) {
+	name := cfg.Substrate.Airlock.AuthSource
+	if !cfg.Substrate.Remote() || name == "" {
+		// validateSubstrate refuses a remote substrate with no auth source; a
+		// local one has no backend to authenticate to.
+		return Credential{}, nil
+	}
+	d, ok := described[name]
+	if !ok {
+		return Credential{}, unknownSourceRef("substrate.airlock.auth_source", name, cfg)
+	}
+	return namedCredential(name, d), nil
 }
 
 // trackerCredential resolves the tracker's credential, in the order §8.4 states
@@ -402,16 +468,68 @@ var ErrCredentialAuthorityShared = errCredentialAuthorityShared
 // A shared `oidc_token_path` deliberately **loads**: it is not part of source
 // identity, and one projected service-account token federating two trust-policy
 // identities is the intended deployment.
+// The substrate credential joins the same rule (#194). Two credentials with
+// equal authority are one credential whatever they authenticate to, so a v2
+// backend token that is also the tracker's or the publisher's is refused for the
+// reason above applied to a wider blast radius: it can create and destroy
+// execution environments. The sole exception is the explicit attended-canary
+// tracker/controller concession: it already accepts one GitHub App actor for
+// both roles, and therefore may use the same minting authority as well.
 func checkAuthoritySplit(cfg *Config) error {
 	tracker, publish := cfg.Credentials.Tracker, cfg.Credentials.Publish
-	if !tracker.Configured() || !publish.Configured() || tracker.Authority != publish.Authority {
-		return nil
+	substrate := cfg.Credentials.Substrate
+	if tracker.Configured() && publish.Configured() && tracker.Authority == publish.Authority {
+		return &CredentialAuthorityError{
+			Authority:   tracker.Authority,
+			TrackerName: tracker.Name,
+			PublishName: publish.Name,
+		}
 	}
-	return &CredentialAuthorityError{
-		Authority:   tracker.Authority,
-		TrackerName: tracker.Name,
-		PublishName: publish.Name,
+	// Ordered, so a configuration with several collisions always refuses on the
+	// same one: a refusal that varied would be one an operator cannot reproduce.
+	//
+	// The review controller joins the same rule (#204) and is the sharpest case
+	// of it. #11's entire safety argument is that three identities are distinct;
+	// a controller credential equal in authority to the tracker's could take the
+	// claim it just handed back, and one equal to the substrate's could destroy
+	// the sandbox holding the work it is reviewing.
+	for _, authority := range []struct {
+		cred Credential
+		name string
+	}{
+		{substrate, "substrate"},
+		{cfg.Credentials.Review, "review"},
+	} {
+		if !authority.cred.Configured() {
+			continue
+		}
+		for _, other := range []struct {
+			consumer string
+			cred     Credential
+		}{
+			{"tracker", tracker},
+			{"publish", publish},
+			{"substrate", substrate},
+		} {
+			if other.consumer == authority.name || !other.cred.Configured() {
+				continue
+			}
+			if other.cred.Authority == authority.cred.Authority {
+				if authority.name == "review" && other.consumer == "tracker" &&
+					cfg.Review.AllowSharedTrackerController && cfg.Deployment.Mode == DeploymentAttended {
+					continue
+				}
+				return &SubstrateCredentialError{
+					Authority:     authority.cred.Authority,
+					Holder:        authority.name,
+					Consumer:      other.consumer,
+					SubstrateName: authority.cred.Name,
+					ConsumerName:  other.cred.Name,
+				}
+			}
+		}
 	}
+	return nil
 }
 
 // checkClaimAssignee refuses a bounded credential source with no configured
@@ -479,6 +597,13 @@ type Sources struct {
 	Tracker core.CredentialSource
 	// Publish is nil when the workflow configures no publish credential.
 	Publish core.CredentialSource
+	// Substrate is nil under the local substrate (#194). Narrowed by assembly
+	// to the cached surface: the backend client makes several calls per tick per
+	// claim, and an exchange per request would multiply the issuer's traffic by
+	// the daemon's — the same call the tracker's narrowing makes.
+	Substrate core.CredentialSource
+	// Review is nil when the #204 controller is not enabled.
+	Review core.CredentialSource
 }
 
 // NewSources constructs every declared named source exactly once, then selects
@@ -512,7 +637,15 @@ func (c Config) NewSources(kindFor func(string) (core.SourceKind, bool)) (Source
 	if err != nil {
 		return Sources{}, fmt.Errorf("publish credential: %w", err)
 	}
-	return Sources{Tracker: tracker, Publish: publish}, nil
+	substrate, err := c.Credentials.Substrate.newSource(named)
+	if err != nil {
+		return Sources{}, fmt.Errorf("substrate credential: %w", err)
+	}
+	reviewSource, err := c.Credentials.Review.newSource(named)
+	if err != nil {
+		return Sources{}, fmt.Errorf("review credential: %w", err)
+	}
+	return Sources{Tracker: tracker, Publish: publish, Substrate: substrate, Review: reviewSource}, nil
 }
 
 func (c Credential) newSource(named map[string]core.CredentialSource) (core.CredentialSource, error) {

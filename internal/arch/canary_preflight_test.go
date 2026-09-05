@@ -385,7 +385,9 @@ func TestCanaryPreflightGrepsForOutputTheDaemonStillEmits(t *testing.T) {
 }
 
 // goSources concatenates every non-test Go file in the module, under the same
-// scoping rules the import and markdown walks use.
+// scoping rules the markdown walk uses. Deliberately not the import walks':
+// an operator-facing marker has to come from source `go test ./...` builds, not
+// from a testdata helper.
 func goSources(t *testing.T, root string) string {
 	t.Helper()
 	var b strings.Builder

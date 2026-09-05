@@ -102,6 +102,7 @@ var conformanceCases = []conformanceCase{
 	// Outcome and liveness (SPEC §7.3, §7.4).
 	{"ExitWithoutTerminalEventIsCrashed", testCrashed, parallel},
 	{"NoStreamIsCrashedWithStderrInTranscript", testNoStream, parallel},
+	{"OversizedLineIsOutputOverflow", testOversizedLine, parallel},
 	{"StallTimeout", testStallTimeout, liveness},
 	{"AttemptTimeout", testAttemptTimeout, liveness},
 	{"ActivityResetsStallWindow", testActivityResetsStall, liveness},
@@ -112,10 +113,10 @@ var conformanceCases = []conformanceCase{
 	{"ClaimedVerdictSurvivesTheCleanupWait", testVerdictSurvivesCleanup, liveness},
 	{"ContextCancellationDiscardsRun", testContextCancel, parallel},
 
-	// Process discipline (SPEC §7.5, §9.8). Serial as a section: each of these
-	// drives a signal ladder against a real process group under a grace of a
-	// few hundred milliseconds, and the verdict is what the ladder concluded
-	// inside that grace.
+	// Harness/domain discipline (SPEC §7.5, §9.8). These use agenttest's
+	// process-group domain to exercise real processes and fault injection; the
+	// production Linux containment mechanism is proved in localdomain's own real
+	// tests. Serial because each case drives teardown under a short grace.
 	{"StopEscalatesToSIGKILL", testStopEscalates, discipline},
 	{"StopUnconfirmedWhenSignalsDoNotLand", testStopUnconfirmed, discipline},
 	{"ProbeObservesWithoutTouchingTheGroup", testProbeObservesOnly, discipline},
@@ -166,14 +167,17 @@ var conformanceCases = []conformanceCase{
 	{"RunEvidenceSurvivesInterleavedStarts", testEvidenceSurvivesInterleavedStarts, parallel},
 	{"StartMissingBinaryFailsBeforeHandle", testMissingBinary, parallel},
 	{"ReadyRefusals", testReadyRefusals, parallel},
+	{"ExecutionDomainRefusals", testExecutionDomainRefusals, parallel},
 	{"ReadyProbeEnvironmentIsRestricted", testProbeEnvRestricted, globalEnv},
 	{"ReadyIsBoundedByItsContext", testReadyBounded, liveness},
 	{"ReadyLeavesNoOrphanedProbeChild", testReadyNoOrphans, discipline},
+	{"ReadyRefusesAFloodingProbe", testReadyFloodingProbe, parallel},
 	{"BinaryInstalledAfterNewIsFoundByReady", testBinaryInstalledLater, globalEnv},
 	{"ReadyAndStartCannotDisagree", testReadyAndStartAgree, parallel},
 	{"BoundBinarySurvivesPathChange", testBoundBinarySurvivesPath, globalEnv},
 	{"RelativeBinaryIsBoundAbsolutely", testRelativeBinaryIsAbsolute, globalEnv},
 	{"ContinuationReachesTheHarness", testContinuation, parallel},
+	{"HostileContinuationIsRefusedAtBothEnds", testHostileContinuation, parallel},
 }
 
 // Run executes the whole conformance suite against one adapter. An adapter's
@@ -288,7 +292,14 @@ func testGarbageLines(t *testing.T, c Contract) {
 }
 
 // SPEC §7.5: the scanner buffer is raised well past bufio's 64 KiB default, or
-// a large tool result would look like a dead stream.
+// a large tool result would look like a dead stream. The line is *read* whole —
+// the run succeeds, and testTranscriptWholeLines has it reach the sink as one
+// write — but what the event carries of it is bounded (#235,
+// harness.MaxEventText), with the cut stated in the text.
+//
+// This case used to assert the event carried all 1 MiB. That was the unbounded
+// retention the ticket removed: between the adapter and the orchestrator's 16 KiB
+// tail sit two queues, and a queue holds whatever it is handed.
 func testBigLine(t *testing.T, c Contract) {
 	h := c.start(t, c.runner(t, scriptBigLine, nil, Options{}), c.spec(t, core.RunLimits{}))
 	evs := collect(t, h)
@@ -301,8 +312,22 @@ func testBigLine(t *testing.T, c Contract) {
 			progress = ev
 		}
 	}
-	if len(progress.Text) != bigLine {
-		t.Errorf("progress text length = %d, want %d", len(progress.Text), bigLine)
+	if progress.Type != core.EventProgress {
+		t.Fatalf("no progress event for the big line: %v", types(evs))
+	}
+	if len(progress.Text) > harness.MaxEventText {
+		t.Errorf("progress text is %d bytes, want at most %d: the event carries the line unbounded",
+			len(progress.Text), harness.MaxEventText)
+	}
+	if !strings.HasPrefix(progress.Text, strings.Repeat("x", 1024)) {
+		t.Errorf("progress text does not begin with the line's own text: %q…",
+			progress.Text[:min(len(progress.Text), 64)])
+	}
+	// Stated, not silent: the next attempt reads this text as the account of
+	// what the last one said (SPEC §9.6), and must not take a cut for the whole.
+	if !strings.Contains(progress.Text, fmt.Sprintf("of %d bytes", bigLine)) {
+		t.Errorf("the cut is not stated in the text; its tail is %q",
+			progress.Text[max(0, len(progress.Text)-120):])
 	}
 }
 
@@ -479,6 +504,75 @@ func testNoStream(t *testing.T, c Contract) {
 	if !strings.Contains(raw, `"type":"ben:stderr"`) {
 		t.Errorf("stderr should be a BEN-namespaced line, got:\n%s", raw)
 	}
+}
+
+// A line past the scanner ceiling → failed(output_overflow), claimed by the
+// adapter and non-retryable (SPEC §7.3, §7.5; #235).
+//
+// Before this case the suite drove a 1 MiB line — an order of magnitude *under*
+// the ceiling — and the classification past it was never exercised. What it
+// would have found: the scanner stops, nothing drains the pipe, the child blocks
+// on a full pipe with no activity, and the run sits until the stall window reads
+// it as `stalled` — retryable, so the orchestrator re-dispatches an agent that
+// reproduces the line deterministically and burns max_attempts on it.
+//
+// No liveness window is set here on purpose. The script never terminates on its
+// own, so the adapter's own verdict is the *only* thing that can end this run:
+// a harness that merely let the stream end would hang this case, not fail it
+// softly.
+func testOversizedLine(t *testing.T, c Contract) {
+	rec := &recordingTranscript{}
+	h := c.start(t, c.runner(t, scriptOversizedLine, nil, Options{Transcripts: rec}), c.spec(t, core.RunLimits{}))
+	evs := collect(t, h)
+	got := terminal(t, evs)
+	if got.Type != core.EventFailed || got.Reason != core.FailureOutputOverflow {
+		t.Fatalf("terminal = %+v, want failed(output_overflow)", got)
+	}
+	// The run was healthy up to the line — the started event is delivered — and
+	// nothing of the line itself was minted into an event.
+	if n := countType(evs, core.EventStarted); n != 1 {
+		t.Errorf("started events = %d, want 1: %v", n, types(evs))
+	}
+	if n := countType(evs, core.EventProgress); n != 0 {
+		t.Errorf("progress events = %d, want 0: a fragment of the oversized line was minted", n)
+	}
+	waitDone(t, h)
+	if !rec.isClosed() {
+		t.Fatal("transcript not closed when Done closed")
+	}
+
+	// The record is verbatim up to the cut and honest about the cut: the
+	// harness's lines are exactly the ones before the oversized one, a
+	// BEN-namespaced marker says where the stream was cut and why, and no
+	// fragment of the line is retained — a 10 MiB prefix ending wherever the
+	// buffer ran out is the one shape a credential can straddle unredacted.
+	var before bytes.Buffer
+	c.Fake.Init(&before)
+	raw := rec.text()
+	if got, want := harnessLines(raw), splitLines(before.String()); !slices.Equal(got, want) {
+		t.Errorf("harness lines in the transcript = %d lines, want exactly the ones before the cut (%d):\n%s",
+			len(got), len(want), excerptLines(got))
+	}
+	if !strings.Contains(raw, `"type":"ben:truncated"`) {
+		t.Errorf("transcript carries no truncation marker:\n%s", excerptLines(splitLines(raw)))
+	}
+	if strings.Contains(raw, strings.Repeat("x", 256)) {
+		t.Error("transcript retains a fragment of the oversized line")
+	}
+}
+
+// excerptLines renders transcript lines for a failure message without the
+// message becoming the transcript.
+func excerptLines(lines []string) string {
+	var b strings.Builder
+	for _, line := range lines {
+		if len(line) > 160 {
+			line = line[:160] + "…"
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // Silence past the stall window → failed(stalled), and the adapter — which owns
@@ -870,9 +964,9 @@ func testStopUnconfirmed(t *testing.T, c Contract) {
 	waitDone(t, h)
 }
 
-// Only ESRCH proves a process group is gone. EPERM says the opposite — it
-// exists and we may not signal it — and reading any error as "gone" reports a
-// confirmed termination over a live process (SPEC §9.8).
+// In the process-backed test domain, only ESRCH proves its group gone. EPERM
+// says the opposite — it exists and we may not signal it — and reading any
+// error as "gone" reports confirmed termination over a live process.
 func testStopProbeDenied(t *testing.T, c Contract) {
 	r := c.runner(t, scriptSurvivor, nil, Options{
 		Timings: harness.Timings{StopGrace: 100 * time.Millisecond},
@@ -983,8 +1077,8 @@ func testKilledAfterTerminal(t *testing.T, c Contract) {
 	waitDone(t, h)
 }
 
-// The harness's production default must address the process group, not only
-// its leader (SPEC §7.5). This is deliberately independent of
+// The process-backed contract domain's default must address the process group,
+// not only its leader. This is deliberately independent of
 // testDescendantsDieFirst: that case wraps SignalGroup to order a liveness
 // ladder behind the fixture's registration, so it proves the wrapped sender
 // rather than the nil Signal path Start binds in production.
@@ -1009,7 +1103,7 @@ func testDefaultSignalReachesDescendants(t *testing.T, c Contract) {
 		t.Errorf("Stop = %v, want confirmed", got)
 	}
 	if aliveNow(pid) {
-		t.Errorf("grandchild %d survived Stop: the production default signalled only the leader", pid)
+		t.Errorf("grandchild %d survived Stop: the test domain signalled only the leader", pid)
 	}
 	if got := terminal(t, collect(t, h)); got.Type != core.EventFailed || got.Reason != core.FailureKilled {
 		t.Errorf("terminal = %+v, want failed(killed)", got)
@@ -1077,7 +1171,7 @@ func testDescendantsDieFirst(t *testing.T, c Contract) {
 		Timings: harness.Timings{StopGrace: 2 * time.Second},
 		Signal: func(pgid int, sig syscall.Signal) error {
 			<-registered
-			return harness.SignalGroup(pgid, sig)
+			return SignalGroup(pgid, sig)
 		},
 	})
 	h := c.start(t, r, c.spec(t, core.RunLimits{StallTimeout: descendantStall}))
@@ -2267,6 +2361,22 @@ func testReadyRefusals(t *testing.T, c Contract) {
 	}
 }
 
+func testExecutionDomainRefusals(t *testing.T, c Contract) {
+	cause := errors.New("test execution domain unavailable")
+	r := c.runner(t, scriptSuccess, nil, Options{Domain: refusingDomain{err: cause}})
+
+	if err := r.Ready(context.Background()); !errors.Is(err, c.Errors.ExecutionDomain) || !errors.Is(err, cause) {
+		t.Errorf("Ready = %v, want %v wrapping %v", err, c.Errors.ExecutionDomain, cause)
+	}
+	h, err := r.Start(context.Background(), c.spec(t, core.RunLimits{}))
+	if !errors.Is(err, c.Errors.ExecutionDomain) || !errors.Is(err, cause) {
+		t.Errorf("Start = %v, want %v wrapping %v", err, c.Errors.ExecutionDomain, cause)
+	}
+	if h != nil {
+		t.Error("Start returned a handle alongside an execution-domain refusal")
+	}
+}
+
 // A harness the daemon merely *validates* must not be handed the daemon's
 // secrets: every readiness probe runs with the same restricted environment as a
 // real attempt (SPEC §7.6).
@@ -2340,6 +2450,25 @@ func testReadyNoOrphans(t *testing.T, c Contract) {
 	defer syscall.Kill(pid, syscall.SIGKILL) // never leak it, whatever the outcome
 	if aliveNow(pid) {
 		t.Errorf("probe child %d outlived Ready", pid)
+	}
+}
+
+// A probe that floods its output is refused, not read (#235). The fake prints
+// the answer the adapter looks for *first*, so a refusal here is the bound
+// speaking and not a missing marker: the head of the output is exactly what
+// would have passed. And the refusal quotes an excerpt, never the flood — a
+// startup error is read by an operator.
+func testReadyFloodingProbe(t *testing.T, c Contract) {
+	r := c.runner(t, "", map[string]string{ProbeEnv: "flood"}, Options{})
+	err := r.Ready(context.Background())
+	if !errors.Is(err, c.Errors.Binary) {
+		t.Fatalf("Ready = %v, want %v", err, c.Errors.Binary)
+	}
+	if !errors.Is(err, harness.ErrProbeOutput) {
+		t.Errorf("Ready = %v, want it to carry harness.ErrProbeOutput: the flood is the reason", err)
+	}
+	if n := len(err.Error()); n > 1024 {
+		t.Errorf("the refusal is %d bytes: it embeds the probe's output rather than an excerpt", n)
 	}
 }
 
@@ -2497,6 +2626,55 @@ func testContinuation(t *testing.T, c Contract) {
 	}
 }
 
+// The resume token is the one argv element the *agent* chooses (#233). It is
+// minted from the child's own JSON stream and appended to the next attempt's
+// argv, and the two ends are far enough apart — a translator, a state file, a
+// dispatch — that an adapter checking only the convenient one still hands the
+// harness a flag it selected for itself.
+//
+// So both ends are asserted here, of every adapter, against a real process. The
+// halves are independent by construction: the second token never passes through
+// the translator at all, which is exactly the case a state file written by an
+// older build presents.
+func testHostileContinuation(t *testing.T, c Contract) {
+	r := c.runner(t, scriptUntrustedID, nil, Options{})
+	if !r.Capabilities().Resume {
+		t.Skip("adapter declares no resume; there is no token to mint (see Capabilities)")
+	}
+
+	// The minting end. The harness announces an identity that is a flag rather
+	// than a session id, and the attempt is otherwise healthy — and must stay
+	// healthy: a line the adapter will not read is activity like any other
+	// (SPEC §7.2), so refusing it costs the resume and nothing else.
+	evs := collect(t, c.start(t, r, c.spec(t, core.RunLimits{})))
+	want := []core.EventType{core.EventHeartbeat, core.EventProgress}
+	if r.Capabilities().Usage {
+		want = append(want, core.EventUsage)
+	}
+	want = append(want, core.EventSucceeded)
+	if got := types(evs); !slices.Equal(got, want) {
+		t.Fatalf("events = %v, want %v: the announcement is activity, not a start", got, want)
+	}
+	for _, e := range evs {
+		if e.Continuation != "" || e.SessionID != "" {
+			t.Errorf("event %+v carries an identity minted from %q", e, HostileSessionID)
+		}
+	}
+
+	// The argv end. A refusal, so no process exists to reason about
+	// (SPEC §7.3): the adapter owes this wherever it builds an argv, not only
+	// where it happens to have translated a line.
+	spec := c.spec(t, core.RunLimits{})
+	spec.Continuation = HostileSessionID
+	h, err := c.runner(t, scriptSuccess, nil, Options{}).Start(context.Background(), spec)
+	if !errors.Is(err, c.Errors.Continuation) {
+		t.Fatalf("Start with a flag-shaped continuation = %v, want %v", err, c.Errors.Continuation)
+	}
+	if h != nil {
+		t.Error("Start returned a handle alongside its refusal")
+	}
+}
+
 // --- helpers ---
 
 // block builds the provider block for a scripted run: this test binary as the
@@ -2516,6 +2694,9 @@ func (c Contract) block(t *testing.T, script string, extra map[string]string) ma
 func (c Contract) newRunner(t *testing.T, block map[string]any, opts Options) core.AgentRunner {
 	t.Helper()
 	opts.Timings = suiteTimings(opts.Timings)
+	if opts.Domain == nil {
+		opts.Domain = processDomain{signal: opts.Signal}
+	}
 	return c.New(t, block, opts)
 }
 

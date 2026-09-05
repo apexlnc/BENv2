@@ -57,7 +57,8 @@ type Workspaces interface {
 	// pin before the current base is installed.
 	PrepareClaim(ctx context.Context, issue core.Issue, attempt int, epoch int64) (core.Workspace, core.LocalBranchFacts, error)
 	// ClaimBase reads the closed provider state without preparing or running
-	// hooks; recovery gates §9.7 on it.
+	// hooks; recovery gates §9.7 on it. ErrClaimTargetUnrecorded may carry the
+	// validated legacy epoch/base needed only to retry a later-epoch upgrade.
 	ClaimBase(ctx context.Context, issue core.Issue) (core.ClaimBase, error)
 	// AbandonPendingClaimBase rolls an unfinished transition back to its
 	// outgoing pin, or to absence when it had none. The loop calls it only after
@@ -99,7 +100,7 @@ type Workspaces interface {
 	ListWorkspaces(ctx context.Context) ([]core.WorkspaceRef, error)
 
 	// ResolveWorkspace names the workspace an issue's work lives in and reports
-	// its pinned claim epoch/base pair, preparing nothing.
+	// its pinned claim epoch/base/target tuple, preparing nothing.
 	//
 	// Recovery needs it because §9.7's evidence question has to be asked *before*
 	// a verdict says an attempt is owed, and Prepare would run this attempt's
@@ -120,6 +121,63 @@ type Workspaces interface {
 // and one that does not is unaffected.
 type afterRunner interface {
 	AfterRun(ctx context.Context, ws core.Workspace)
+}
+
+// workspaceLifecycleCompleter is the optional remote-substrate retention
+// surface. SPEC §6.1's locked local seam distinguishes only dispose/keep; a
+// backend allocation policy additionally distinguishes an actual failed claim,
+// tracker revocation, and process shutdown. A local provider does not implement
+// these methods and keeps its existing behavior unchanged.
+// It is also what tells a held claim whether its workspace outlived the claim,
+// and so whether the end of the *workspace cycle* still owes a disposal (#252,
+// heldWorkspace). CompleteRevocation is what that route calls, on the same two
+// tracker facts a running claim's revocation is: the required labels removed, or
+// the issue gone terminal. Two requirements on it follow from being retried off
+// a held record rather than off a run record — it MUST be idempotent, because a
+// lost response, a restart and a repeated sweep all replay it, and it MUST NOT
+// report success until the backend has confirmed the disposal, because `nil` is
+// where the caller stops owing it.
+type workspaceLifecycleCompleter interface {
+	CompleteFailure(ctx context.Context, ws core.Workspace) error
+	CompleteShutdown(ctx context.Context, ws core.Workspace) error
+	// CompleteEndedCycle disposes the workspace cycle the caller names by address,
+	// and MUST refuse any other — including an empty one, which names nothing.
+	// A cycle record is keyed per issue and outlives every cycle under it, so a
+	// completion resolved by key alone would apply to whichever cycle occupies it,
+	// and after a revocation and a reapproval that is live work.
+	//
+	// A provider may additionally accept an address from endedCycleSource: that
+	// address is backed by its own durable obligation and never resolved through
+	// the current cycle record (#266).
+	CompleteEndedCycle(ctx context.Context, ws core.Workspace) error
+}
+
+// endedCycleSource enumerates independently durable end-of-cycle obligations.
+// It is discovered with workspaceLifecycleCompleter: local worktrees do not
+// outlive successful claims and therefore have neither surface.
+type endedCycleSource interface {
+	EndedCycles(ctx context.Context) ([]core.WorkspaceRef, error)
+}
+
+// cycleApprovalSource reports which standing approval a provider's retained
+// workspace cycle is anchored to (SPEC §6.7).
+//
+// It exists because current labels cannot show a remove-and-reapply: the required
+// set is complete again by the time the sweep looks, while the sandbox the claim
+// published from has become unreachable — the new application is a new approval,
+// and it selects a different cycle address. The moved id is the only evidence.
+//
+// A *read*, and the comparison stays with the loop, which has just read the change
+// log for its own purposes. The other direction — the loop remembering an approval
+// — is what an earlier version of #252 did, and a withdrawal that happened before
+// the claim was converted made it remember the new approval beside the old
+// sandbox: a comparison that could only ever answer "unchanged".
+//
+// Discovered, for afterRunner's reason and with a second consequence: a provider
+// whose workspaces do not outlive their claims is never asked, and so cannot have
+// its behaviour changed by any of this.
+type cycleApprovalSource interface {
+	CycleApproval(ctx context.Context, issue core.Issue) (int64, error)
 }
 
 // contentApprovalSource is §9.5's content read, discovered on the tracker the
